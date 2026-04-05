@@ -15,6 +15,7 @@ from mini_bdx_runtime.antennas import Antennas
 from mini_bdx_runtime.projector import Projector
 from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
+from mini_bdx_runtime.state_server import StateServer
 
 import os
 
@@ -35,9 +36,18 @@ class RLWalk:
         save_obs=False,
         replay_obs=None,
         cutoff_frequency=None,
+        enable_streaming=False,
+        streaming_port=8765,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
+
+        self.enable_streaming = enable_streaming
+        self.state_server = None
+        if self.enable_streaming:
+            self.state_server = StateServer(port=streaming_port)
+            self.state_server.start()
+            print(f"State server started on port {streaming_port}")
 
         self.commands = commands
         self.pitch_bias = pitch_bias
@@ -316,6 +326,37 @@ class RLWalk:
 
                 self.hwi.set_position_all(action_dict)
 
+                if self.state_server is not None:
+                    dof_pos = self.hwi.get_present_positions(
+                        ignore=["left_antenna", "right_antenna"]
+                    )
+                    dof_vel = self.hwi.get_present_velocities(
+                        ignore=["left_antenna", "right_antenna"]
+                    )
+                    imu_data = self.imu.get_data()
+                    feet = self.feet_contacts.get()
+                    joint_names = [
+                        k for k in self.hwi.joints.keys()
+                        if "antenna" not in k
+                    ]
+                    self.state_server.broadcast({
+                        "timestamp": time.time(),
+                        "joint_positions": dict(zip(joint_names, [float(p) for p in dof_pos])) if dof_pos is not None else {},
+                        "joint_velocities": dict(zip(joint_names, [float(v) for v in dof_vel])) if dof_vel is not None else {},
+                        "motor_targets": dict(zip(joint_names, [float(m) for m in self.motor_targets])),
+                        "imu": {
+                            "quaternion": imu_data.get("quaternion", [0, 0, 0, 1]),
+                            "gyro": [float(g) for g in imu_data["gyro"]],
+                            "accelero": [float(a) for a in imu_data["accelero"]],
+                        },
+                        "feet_contacts": {
+                            "left": bool(feet[0]),
+                            "right": bool(feet[1]),
+                        },
+                        "paused": self.paused,
+                        "fps": self.control_freq,
+                    })
+
                 i += 1
 
                 took = time.time() - t
@@ -328,6 +369,8 @@ class RLWalk:
                 time.sleep(max(0, 1 / self.control_freq - took))
 
         except KeyboardInterrupt:
+            if self.state_server is not None:
+                self.state_server.stop()
             if self.duck_config.antennas:
                 self.antennas.stop()
             if self.duck_config.eyes:
@@ -379,6 +422,18 @@ if __name__ == "__main__":
         help="replay the observations from a previous run (can be from the robot or from mujoco)",
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
+    parser.add_argument(
+        "--enable_streaming",
+        action="store_true",
+        default=False,
+        help="Enable WebSocket state streaming for TNKR dashboard",
+    )
+    parser.add_argument(
+        "--streaming_port",
+        type=int,
+        default=8765,
+        help="WebSocket port for state streaming (default: 8765)",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -395,6 +450,8 @@ if __name__ == "__main__":
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
+        enable_streaming=args.enable_streaming,
+        streaming_port=args.streaming_port,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

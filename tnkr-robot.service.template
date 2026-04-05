@@ -1,0 +1,15 @@
+[Unit]
+Description=TNKR Robot Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=TNKR_USER
+WorkingDirectory=TNKR_INSTALL_DIR
+ExecStart=TNKR_INSTALL_DIR/.venv/bin/python scripts/tnkr_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

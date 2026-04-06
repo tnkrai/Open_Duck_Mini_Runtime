@@ -193,10 +193,19 @@ if [ ! -d "$INSTALL_DIR/.venv" ]; then
     stop_spinner true "Python environment created"
 fi
 
-start_spinner "Installing packages 📦 (this may take a few minutes)..."
+echo -e "  ${CYAN}⠋${RESET} ${DIM}Installing packages 📦 (this may take a few minutes)...${RESET}"
 "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip > /dev/null 2>&1
-"$INSTALL_DIR/.venv/bin/pip" install -e . > /dev/null 2>&1
-stop_spinner true "All packages installed"
+"$INSTALL_DIR/.venv/bin/pip" install -e . 2>&1 | while IFS= read -r line; do
+    # Show collecting/downloading/installing lines as progress
+    case "$line" in
+        Collecting*|Downloading*|Installing*|Building*|Successfully*)
+            # Truncate long lines to fit terminal
+            short="${line:0:70}"
+            printf "\r  ${CYAN}⠋${RESET} ${DIM}%-72s${RESET}" "$short"
+            ;;
+    esac
+done
+printf "\r  ${CHECK} %-72s\n" "All packages installed"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Step 5: Default config

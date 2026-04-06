@@ -1,4 +1,6 @@
 .pip-tmp/
+.pip-cache/
+.setup-pip.log
 __pycache__/
 mini_bdx_runtime.egg-info/
 build

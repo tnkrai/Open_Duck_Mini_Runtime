@@ -196,13 +196,15 @@ if [ ! -d "$INSTALL_DIR/.venv" ]; then
 fi
 
 # Pip and build backends use $TMPDIR (default /tmp). On many embedded boards /tmp is a
-# small tmpfs; extracting large wheels there fails. Keep temp on the install filesystem.
-mkdir -p "$INSTALL_DIR/.pip-tmp"
+# small tmpfs; extracting/building there fails. Pip does not support --tmp-dir; use TMPDIR.
+# Wheel cache defaults to ~/.cache/pip; keep it on the install filesystem too.
+mkdir -p "$INSTALL_DIR/.pip-tmp" "$INSTALL_DIR/.pip-cache"
 export TMPDIR="$INSTALL_DIR/.pip-tmp"
+export PIP_CACHE_DIR="$INSTALL_DIR/.pip-cache"
 
 echo -e "  ${CYAN}⠋${RESET} ${DIM}Installing packages 📦 (this may take a few minutes)...${RESET}"
-"$INSTALL_DIR/.venv/bin/pip" install --upgrade pip --tmp-dir "$INSTALL_DIR/.pip-tmp" > /dev/null 2>&1
-"$INSTALL_DIR/.venv/bin/pip" install -e . --tmp-dir "$INSTALL_DIR/.pip-tmp" 2>&1 | while IFS= read -r line; do
+"$INSTALL_DIR/.venv/bin/pip" install --upgrade pip > /dev/null 2>&1
+"$INSTALL_DIR/.venv/bin/pip" install -e . 2>&1 | while IFS= read -r line; do
     # Show collecting/downloading/installing lines as progress
     case "$line" in
         Collecting*|Downloading*|Installing*|Building*|Successfully*)

@@ -11,6 +11,36 @@ SERVICE_NAME="tnkr-robot"
 SERVER_PORT=8000
 TOTAL_STEPS=6
 
+# ── Clean flag ────────────────────────────────────────────────────────────────
+
+if [ "$1" = "--clean" ]; then
+    echo ""
+    echo -e "\033[1;33m  Cleaning previous installation...\033[0m"
+    echo ""
+
+    # Stop and remove systemd service
+    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/tnkr-robot.service
+    sudo systemctl daemon-reload 2>/dev/null || true
+    echo -e "  \033[0;32m✓\033[0m Service removed"
+
+    # Remove runtime directory (venv + repo)
+    if [ -d "$INSTALL_DIR" ]; then
+        rm -rf "$INSTALL_DIR"
+        echo -e "  \033[0;32m✓\033[0m Runtime directory removed"
+    fi
+
+    # Remove config
+    if [ -f "$CONFIG_FILE" ]; then
+        rm -f "$CONFIG_FILE"
+        echo -e "  \033[0;32m✓\033[0m Config file removed"
+    fi
+
+    echo -e "  \033[0;32m✓\033[0m Clean complete — running fresh install"
+    echo ""
+fi
+
 # ── Colors & Symbols ─────────────────────────────────────────────────────────
 
 BOLD='\033[1m'

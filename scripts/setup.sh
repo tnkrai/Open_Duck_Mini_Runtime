@@ -14,6 +14,7 @@ TOTAL_STEPS=6
 # ── Clean flag ────────────────────────────────────────────────────────────────
 
 if [ "$1" = "--clean" ]; then
+    cd "$HOME"
     echo ""
     echo -e "\033[1;33m  Cleaning previous installation...\033[0m"
     echo ""
@@ -143,8 +144,8 @@ start_spinner "Updating package lists..."
 sudo apt-get update -qq > /dev/null 2>&1
 stop_spinner true "Package lists updated"
 
-start_spinner "Installing git, python3, venv..."
-sudo apt-get install -y -qq git python3-pip python3-venv > /dev/null 2>&1
+start_spinner "Installing git, python3, venv, cargo..."
+sudo apt-get install -y -qq git python3-pip python3-venv cargo > /dev/null 2>&1
 stop_spinner true "Dependencies installed"
 
 # ══════════════════════════════════════════════════════════════════════════════

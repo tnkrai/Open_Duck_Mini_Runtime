@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -194,9 +195,14 @@ if [ ! -d "$INSTALL_DIR/.venv" ]; then
     stop_spinner true "Python environment created"
 fi
 
+# Pip and build backends use $TMPDIR (default /tmp). On many embedded boards /tmp is a
+# small tmpfs; extracting large wheels there fails. Keep temp on the install filesystem.
+mkdir -p "$INSTALL_DIR/.pip-tmp"
+export TMPDIR="$INSTALL_DIR/.pip-tmp"
+
 echo -e "  ${CYAN}⠋${RESET} ${DIM}Installing packages 📦 (this may take a few minutes)...${RESET}"
-"$INSTALL_DIR/.venv/bin/pip" install --upgrade pip > /dev/null 2>&1
-"$INSTALL_DIR/.venv/bin/pip" install -e . 2>&1 | while IFS= read -r line; do
+"$INSTALL_DIR/.venv/bin/pip" install --upgrade pip --tmp-dir "$INSTALL_DIR/.pip-tmp" > /dev/null 2>&1
+"$INSTALL_DIR/.venv/bin/pip" install -e . --tmp-dir "$INSTALL_DIR/.pip-tmp" 2>&1 | while IFS= read -r line; do
     # Show collecting/downloading/installing lines as progress
     case "$line" in
         Collecting*|Downloading*|Installing*|Building*|Successfully*)

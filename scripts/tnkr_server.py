@@ -85,6 +85,16 @@ class DuckConfigModel(BaseModel):
     joints_offsets: dict = {}
 
 
+class CommandRequest(BaseModel):
+    commands: list[float]
+    buttons: dict = {}
+    left_trigger: float = 0.0
+    right_trigger: float = 0.0
+
+
+COMMAND_FILE = "/dev/shm/tnkr_remote_commands.json"
+
+
 # ── App setup ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -461,6 +471,12 @@ def stop_walk_process():
             walk_process.kill()
         walk_process = None
 
+    # Clean up remote command file
+    try:
+        os.remove(COMMAND_FILE)
+    except FileNotFoundError:
+        pass
+
 
 @app.post("/api/walk/start")
 def walk_start():
@@ -492,6 +508,7 @@ def walk_start():
             "--onnx_model_path", onnx_path,
             "--enable_streaming",
             "--streaming_port", "8765",
+            "--remote",
         ],
         cwd=str(SCRIPTS_DIR),
     )
@@ -509,6 +526,26 @@ def walk_stop():
         return {"success": True, "message": "Walk was not running"}
 
     stop_walk_process()
+    return {"success": True}
+
+
+# ── Remote Commands ──────────────────────────────────────────────────────────
+
+@app.post("/api/commands")
+def send_commands(req: CommandRequest):
+    """Write remote commands for the walk script to consume."""
+    data = {
+        "commands": req.commands[:7],
+        "buttons": req.buttons,
+        "left_trigger": req.left_trigger,
+        "right_trigger": req.right_trigger,
+        "timestamp": time.time(),
+    }
+    # Atomic write: write to temp, rename
+    tmp_path = COMMAND_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp_path, COMMAND_FILE)
     return {"success": True}
 
 

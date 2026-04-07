@@ -32,6 +32,7 @@ class RLWalk:
         pid=[30, 0, 0],
         action_scale=0.25,
         commands=False,
+        remote=False,
         pitch_bias=0,
         save_obs=False,
         replay_obs=None,
@@ -105,8 +106,13 @@ class RLWalk:
         self.paused = self.duck_config.start_paused
 
         self.command_freq = 20  # hz
+        self.remote = remote
         if self.commands:
-            self.xbox_controller = XBoxController(self.command_freq)
+            if self.remote:
+                from mini_bdx_runtime.remote_controller import RemoteController
+                self.xbox_controller = RemoteController(self.command_freq)
+            else:
+                self.xbox_controller = XBoxController(self.command_freq)
 
         # Reference motion, but we only really need the length of one phase
         # TODO
@@ -421,6 +427,12 @@ if __name__ == "__main__":
         default=None,
         help="replay the observations from a previous run (can be from the robot or from mujoco)",
     )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        default=False,
+        help="Use remote commands from TNKR dashboard instead of Xbox controller",
+    )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
     parser.add_argument(
         "--enable_streaming",
@@ -446,6 +458,7 @@ if __name__ == "__main__":
         pid=pid,
         control_freq=args.control_freq,
         commands=args.commands,
+        remote=args.remote,
         pitch_bias=args.pitch_bias,
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,

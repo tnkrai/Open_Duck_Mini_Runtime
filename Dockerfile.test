@@ -1,0 +1,56 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Test environment for setup.sh
+#
+#  Simulates a Raspberry Pi OS (Debian Bookworm, aarch64) environment.
+#  Hardware-specific commands (raspi-config, dphys-swapfile) are stubbed.
+#
+#  Build:  docker build --platform linux/arm64 -t tnkr-setup-test -f Dockerfile.test .
+#  Run:    docker run --platform linux/arm64 --rm tnkr-setup-test
+# ──────────────────────────────────────────────────────────────────────────────
+
+FROM --platform=linux/arm64 debian:bookworm-slim
+
+# Install base packages that setup.sh expects to already have or will install
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sudo curl git python3 python3-pip python3-venv \
+    cargo procps ca-certificates \
+    libsdl2-dev libsdl2-mixer-dev libsdl2-image-dev libsdl2-ttf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user (simulates the pi user)
+RUN useradd -m -s /bin/bash piuser && \
+    echo "piuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Stub: dphys-swapfile (no real swap in Docker)
+RUN printf '#!/bin/bash\necho "STUB: dphys-swapfile $*"\n' > /usr/sbin/dphys-swapfile && \
+    chmod +x /usr/sbin/dphys-swapfile && \
+    echo "CONF_SWAPSIZE=100" > /etc/dphys-swapfile
+
+# Stub: raspi-config (not available in Docker)
+RUN printf '#!/bin/bash\necho "STUB: raspi-config $*"\n' > /usr/bin/raspi-config && \
+    chmod +x /usr/bin/raspi-config
+
+# Stub: udevadm (not functional in Docker)
+RUN printf '#!/bin/bash\necho "STUB: udevadm $*"\n' > /usr/bin/udevadm-stub && \
+    chmod +x /usr/bin/udevadm-stub
+
+# Stub: systemctl (no systemd in Docker)
+RUN printf '#!/bin/bash\n# Stub systemctl for Docker testing\ncase "$1" in\n  is-active) exit 1 ;;\n  daemon-reload|enable|disable|start|stop|restart) echo "STUB: systemctl $*" ;;\n  *) echo "STUB: systemctl $*" ;;\nesac\n' > /usr/local/bin/systemctl && \
+    chmod +x /usr/local/bin/systemctl
+
+# Simulate /proc/device-tree/model for Pi detection
+RUN mkdir -p /tmp/device-tree && \
+    printf "Raspberry Pi Zero 2 W Rev 1.0\0" > /tmp/device-tree/model
+
+# Piwheels config for ARM
+RUN printf '[global]\nextra-index-url=https://www.piwheels.org/simple\n' > /etc/pip.conf
+
+USER piuser
+WORKDIR /home/piuser
+
+# Copy only what's needed for testing
+COPY --chown=piuser:piuser scripts/setup.sh /home/piuser/test-setup.sh
+COPY --chown=piuser:piuser example_config.json /home/piuser/example_config.json
+
+# Default: run the setup script
+CMD ["bash", "/home/piuser/test-setup.sh"]

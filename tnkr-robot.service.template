@@ -2,14 +2,23 @@
 Description=TNKR Robot Server
 After=network-online.target
 Wants=network-online.target
+# Crash-loop prevention: max 5 restarts in 5 minutes, then stop
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=TNKR_USER
 WorkingDirectory=TNKR_INSTALL_DIR
 ExecStart=TNKR_INSTALL_DIR/.venv/bin/python scripts/tnkr_server.py
-Restart=always
-RestartSec=5
+# Only restart on failure, not clean exit
+Restart=on-failure
+RestartSec=10
+# Memory limits for 512MB Pi Zero 2W (leaves ~128MB for OS)
+MemoryHigh=256M
+MemoryMax=384M
+# Ensure Python output is visible in journalctl immediately
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

@@ -52,5 +52,5 @@ WORKDIR /home/piuser
 COPY --chown=piuser:piuser scripts/setup.sh /home/piuser/test-setup.sh
 COPY --chown=piuser:piuser example_config.json /home/piuser/example_config.json
 
-# Default: run the setup script
-CMD ["bash", "/home/piuser/test-setup.sh"]
+# Default: run the setup script in test mode (skips hardware-only packages)
+CMD ["bash", "/home/piuser/test-setup.sh", "--test"]

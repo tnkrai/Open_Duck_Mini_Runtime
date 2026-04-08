@@ -52,6 +52,7 @@ DOT="${DIM}·${RESET}"
 SPINNER_PID=""
 ORIGINAL_SWAP_SIZE=""
 SWAP_EXPANDED=false
+TEST_MODE=false
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -387,22 +388,36 @@ do_pip_core() {
 
     echo "  ${DIM}Installing core packages (pre-built wheels where possible)...${RESET}"
 
-    # Install packages directly — NO pipe, so errors are visible and exit code works
-    "$PIP" install --no-cache-dir --prefer-binary \
-        "numpy>=1.26.4" \
-        "onnxruntime>=1.18.1" \
-        "adafruit-circuitpython-bno055>=5.4.13" \
-        "websockets>=12.0" \
-        "fastapi>=0.115.0" \
-        "uvicorn>=0.30.0" \
-        "pydantic>=2.0.0" \
-        "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215" \
-        2>&1 | tail -5
+    if [ "$TEST_MODE" = "true" ]; then
+        # Test mode: skip hardware-specific packages that can't install in Docker
+        "$PIP" install --no-cache-dir --prefer-binary \
+            "numpy>=1.26.4" \
+            "websockets>=12.0" \
+            "fastapi>=0.115.0" \
+            "uvicorn>=0.30.0" \
+            "pydantic>=2.0.0" \
+            2>&1 | tail -5
 
-    # Verify critical imports
-    "$INSTALL_DIR/.venv/bin/python" -c \
-        "import numpy; import onnxruntime; import fastapi; print('Core packages verified')" \
-        || die "Core package verification failed — check log at $LOG_FILE"
+        "$INSTALL_DIR/.venv/bin/python" -c \
+            "import numpy; import fastapi; print('Core packages verified (test mode)')" \
+            || die "Core package verification failed — check log at $LOG_FILE"
+    else
+        # Install packages directly — NO pipe, so errors are visible and exit code works
+        "$PIP" install --no-cache-dir --prefer-binary \
+            "numpy>=1.26.4" \
+            "onnxruntime>=1.18.1" \
+            "adafruit-circuitpython-bno055>=5.4.13" \
+            "websockets>=12.0" \
+            "fastapi>=0.115.0" \
+            "uvicorn>=0.30.0" \
+            "pydantic>=2.0.0" \
+            "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215" \
+            2>&1 | tail -5
+
+        "$INSTALL_DIR/.venv/bin/python" -c \
+            "import numpy; import onnxruntime; import fastapi; print('Core packages verified')" \
+            || die "Core package verification failed — check log at $LOG_FILE"
+    fi
 
     info "Core packages installed and verified"
 }
@@ -410,6 +425,11 @@ do_pip_core() {
 # ── Step 9: rustypot (Rust compilation — the slow step) ──────────────────────
 
 do_pip_rustypot() {
+    if [ "$TEST_MODE" = "true" ]; then
+        info "Skipping rustypot (test mode)"
+        return 0
+    fi
+
     setup_pip_env
 
     echo ""
@@ -432,18 +452,27 @@ do_pip_rustypot() {
 do_pip_optional() {
     setup_pip_env
 
-    echo "  ${DIM}Installing optional packages (non-fatal if they fail)...${RESET}"
+    if [ "$TEST_MODE" = "true" ]; then
+        echo "  ${DIM}Installing optional packages (test mode — lightweight only)...${RESET}"
+        "$PIP" install --no-cache-dir --prefer-binary \
+            "openai>=1.70.0" \
+            2>&1 | tail -5 || {
+            warn "Some optional packages failed"
+        }
+    else
+        echo "  ${DIM}Installing optional packages (non-fatal if they fail)...${RESET}"
 
-    # scipy — only needed by imu.py (not raw_imu.py which the walk script uses)
-    # pygame — only needed for Xbox controller (not remote mode from dashboard)
-    # openai — not used by walk script or server currently
-    "$PIP" install --no-cache-dir --prefer-binary \
-        "scipy>=1.15.1" \
-        "pygame>=2.6.0" \
-        "openai>=1.70.0" \
-        2>&1 | tail -10 || {
-        warn "Some optional packages failed — robot will still work in remote mode"
-    }
+        # scipy — only needed by imu.py (not raw_imu.py which the walk script uses)
+        # pygame — only needed for Xbox controller (not remote mode from dashboard)
+        # openai — not used by walk script or server currently
+        "$PIP" install --no-cache-dir --prefer-binary \
+            "scipy>=1.15.1" \
+            "pygame>=2.6.0" \
+            "openai>=1.70.0" \
+            2>&1 | tail -10 || {
+            warn "Some optional packages failed — robot will still work in remote mode"
+        }
+    fi
 
     # Install the project itself in editable mode (deps already handled above)
     cd "$INSTALL_DIR"
@@ -534,6 +563,16 @@ print_success() {
 
 main() {
     # ── Parse flags ───────────────────────────────────────────────────────
+    for arg in "$@"; do
+        case "$arg" in
+            --test) TEST_MODE=true ;;
+        esac
+    done
+
+    if [ "$TEST_MODE" = "true" ]; then
+        warn "Test mode — hardware packages (onnxruntime, rustypot, adafruit) will be skipped"
+    fi
+
     if [ "${1:-}" = "--clean" ]; then
         cd "$HOME"
         echo ""

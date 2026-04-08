@@ -478,8 +478,12 @@ def stop_walk_process():
         pass
 
 
+class WalkStartRequest(BaseModel):
+    sessionToken: str | None = None
+
+
 @app.post("/api/walk/start")
-def walk_start():
+def walk_start(body: WalkStartRequest = WalkStartRequest()):
     """Start the walk script with streaming enabled."""
     global walk_process
 
@@ -501,17 +505,20 @@ def walk_start():
     venv_python = sys.executable
     walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
 
-    walk_process = subprocess.Popen(
-        [
-            venv_python,
-            walk_script,
-            "--onnx_model_path", onnx_path,
-            "--enable_streaming",
-            "--streaming_port", "8765",
-            "--remote",
-        ],
-        cwd=str(SCRIPTS_DIR),
-    )
+    cmd = [
+        venv_python,
+        walk_script,
+        "--onnx_model_path", onnx_path,
+        "--enable_streaming",
+        "--streaming_port", "8765",
+        "--remote",
+    ]
+
+    # If a session token is provided, enable cloud telemetry relay
+    if body.sessionToken:
+        cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
+
+    walk_process = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
 
     return {"success": True, "pid": walk_process.pid}
 

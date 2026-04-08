@@ -39,6 +39,7 @@ class RLWalk:
         cutoff_frequency=None,
         enable_streaming=False,
         streaming_port=8765,
+        cloud_channel=None,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
@@ -49,6 +50,12 @@ class RLWalk:
             self.state_server = StateServer(port=streaming_port)
             self.state_server.start()
             print(f"State server started on port {streaming_port}")
+
+        self.cloud_publisher = None
+        if cloud_channel:
+            from mini_bdx_runtime.cloud_publisher import CloudPublisher
+            self.cloud_publisher = CloudPublisher(cloud_channel)
+            self.cloud_publisher.start()
 
         self.commands = commands
         self.pitch_bias = pitch_bias
@@ -345,7 +352,7 @@ class RLWalk:
                         k for k in self.hwi.joints.keys()
                         if "antenna" not in k
                     ]
-                    self.state_server.broadcast({
+                    state_snapshot = {
                         "timestamp": time.time(),
                         "joint_positions": dict(zip(joint_names, [float(p) for p in dof_pos])) if dof_pos is not None else {},
                         "joint_velocities": dict(zip(joint_names, [float(v) for v in dof_vel])) if dof_vel is not None else {},
@@ -361,7 +368,11 @@ class RLWalk:
                         },
                         "paused": self.paused,
                         "fps": self.control_freq,
-                    })
+                    }
+                    self.state_server.broadcast(state_snapshot)
+
+                    if self.cloud_publisher is not None:
+                        self.cloud_publisher.publish(state_snapshot)
 
                 i += 1
 
@@ -375,6 +386,8 @@ class RLWalk:
                 time.sleep(max(0, 1 / self.control_freq - took))
 
         except KeyboardInterrupt:
+            if self.cloud_publisher is not None:
+                self.cloud_publisher.stop()
             if self.state_server is not None:
                 self.state_server.stop()
             if self.duck_config.antennas:
@@ -446,6 +459,12 @@ if __name__ == "__main__":
         default=8765,
         help="WebSocket port for state streaming (default: 8765)",
     )
+    parser.add_argument(
+        "--cloud_channel",
+        type=str,
+        default=None,
+        help="Supabase Broadcast channel name for cloud telemetry relay",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -465,6 +484,7 @@ if __name__ == "__main__":
         cutoff_frequency=args.cutoff_frequency,
         enable_streaming=args.enable_streaming,
         streaming_port=args.streaming_port,
+        cloud_channel=args.cloud_channel,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

@@ -514,9 +514,10 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
         "--remote",
     ]
 
-    # If a session token is provided, enable cloud telemetry relay
+    # If a session token is provided, enable cloud telemetry + command relay
     if body.sessionToken:
         cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
+        cmd.extend(["--cloud_commands_channel", f"robot-commands-{body.sessionToken}"])
 
     walk_process = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
 

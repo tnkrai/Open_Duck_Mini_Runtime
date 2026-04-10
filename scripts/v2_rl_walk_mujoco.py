@@ -40,6 +40,7 @@ class RLWalk:
         enable_streaming=False,
         streaming_port=8765,
         cloud_channel=None,
+        cloud_commands_channel=None,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
@@ -56,6 +57,12 @@ class RLWalk:
             from mini_bdx_runtime.cloud_publisher import CloudPublisher
             self.cloud_publisher = CloudPublisher(cloud_channel)
             self.cloud_publisher.start()
+
+        self.cloud_command_receiver = None
+        if cloud_commands_channel and remote:
+            from mini_bdx_runtime.cloud_command_receiver import CloudCommandReceiver
+            self.cloud_command_receiver = CloudCommandReceiver(cloud_commands_channel)
+            self.cloud_command_receiver.start()
 
         self.commands = commands
         self.pitch_bias = pitch_bias
@@ -386,6 +393,8 @@ class RLWalk:
                 time.sleep(max(0, 1 / self.control_freq - took))
 
         except KeyboardInterrupt:
+            if self.cloud_command_receiver is not None:
+                self.cloud_command_receiver.stop()
             if self.cloud_publisher is not None:
                 self.cloud_publisher.stop()
             if self.state_server is not None:
@@ -465,6 +474,12 @@ if __name__ == "__main__":
         default=None,
         help="Supabase Broadcast channel name for cloud telemetry relay",
     )
+    parser.add_argument(
+        "--cloud_commands_channel",
+        type=str,
+        default=None,
+        help="Supabase Broadcast channel name for cloud command relay",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -485,6 +500,7 @@ if __name__ == "__main__":
         enable_streaming=args.enable_streaming,
         streaming_port=args.streaming_port,
         cloud_channel=args.cloud_channel,
+        cloud_commands_channel=args.cloud_commands_channel,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

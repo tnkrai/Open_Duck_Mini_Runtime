@@ -6,10 +6,15 @@ import random
 
 class Sounds:
     def __init__(self, volume=1.0, sound_directory="./"):
-        pygame.mixer.init()
-        pygame.mixer.music.set_volume(volume)
         self.sounds = {}
         self.ok = True
+        try:
+            pygame.mixer.init()
+            pygame.mixer.music.set_volume(volume)
+        except pygame.error as e:
+            print(f"[Sounds] Audio init failed (no audio device?): {e}")
+            self.ok = False
+            return
         try:
             for file in os.listdir(sound_directory):
                 if file.endswith(".wav"):

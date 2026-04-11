@@ -13,7 +13,9 @@ import numpy as np
 from mini_bdx_runtime.buttons import Buttons
 
 COMMAND_FILE = "/dev/shm/tnkr_remote_commands.json"
-STALE_TIMEOUT = 0.5  # seconds — zero commands if no fresh data
+# Zero commands if no NEW data arrives within this window.
+# Must be long enough to survive HTTP round-trip jitter.
+NO_UPDATE_TIMEOUT = 2.0
 
 
 class RemoteController:
@@ -23,50 +25,46 @@ class RemoteController:
         self.last_commands = np.zeros(7)
         self.last_left_trigger = 0.0
         self.last_right_trigger = 0.0
+        self._last_seen_ts = 0.0  # track last file timestamp we processed
+        self._last_update_time = time.time()  # wall clock of last new data
 
-    def _read_commands(self):
-        """Read latest commands from the shared file."""
+    def get_last_command(self):
         try:
             with open(COMMAND_FILE, "r") as f:
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            return None
+            data = None
 
-        # Check staleness
-        ts = data.get("timestamp", 0)
-        if time.time() - ts > STALE_TIMEOUT:
-            return None
+        if data is not None:
+            file_ts = data.get("timestamp", 0)
+            if file_ts != self._last_seen_ts:
+                # New data arrived — update everything
+                self._last_seen_ts = file_ts
+                self._last_update_time = time.time()
 
-        return data
+                cmds = data.get("commands", [0.0] * 7)
+                self.last_commands = np.array(cmds[:7], dtype=float)
 
-    def get_last_command(self):
-        data = self._read_commands()
+                btns = data.get("buttons", {})
+                self.buttons.update(
+                    btns.get("A", False),
+                    btns.get("B", False),
+                    btns.get("X", False),
+                    btns.get("Y", False),
+                    btns.get("LB", False),
+                    btns.get("RB", False),
+                    btns.get("dpad_up", False),
+                    btns.get("dpad_down", False),
+                )
 
-        if data is None:
-            # Stale or missing — return zeros (safe stop)
+                self.last_left_trigger = float(data.get("left_trigger", 0.0))
+                self.last_right_trigger = float(data.get("right_trigger", 0.0))
+
+        # If no new data for too long, zero out (safe stop)
+        if time.time() - self._last_update_time > NO_UPDATE_TIMEOUT:
             self.last_commands = np.zeros(7)
-            btns = data if data else {}
-            self.buttons.update(False, False, False, False, False, False, False, False)
             self.last_left_trigger = 0.0
             self.last_right_trigger = 0.0
-        else:
-            cmds = data.get("commands", [0.0] * 7)
-            self.last_commands = np.array(cmds[:7], dtype=float)
-
-            btns = data.get("buttons", {})
-            self.buttons.update(
-                btns.get("A", False),
-                btns.get("B", False),
-                btns.get("X", False),
-                btns.get("Y", False),
-                btns.get("LB", False),
-                btns.get("RB", False),
-                btns.get("dpad_up", False),
-                btns.get("dpad_down", False),
-            )
-
-            self.last_left_trigger = float(data.get("left_trigger", 0.0))
-            self.last_right_trigger = float(data.get("right_trigger", 0.0))
 
         return (
             self.last_commands,

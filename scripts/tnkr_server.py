@@ -15,7 +15,7 @@ import time
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Lock
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,6 +94,7 @@ class CommandRequest(BaseModel):
 
 
 COMMAND_FILE = "/dev/shm/tnkr_remote_commands.json"
+_command_file_lock = Lock()
 
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -544,6 +545,7 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
         "--enable_streaming",
         "--streaming_port", "8765",
         "--remote",
+        "--commands",
     ]
 
     # If a session token is provided, enable cloud telemetry + command relay
@@ -581,11 +583,12 @@ def send_commands(req: CommandRequest):
         "right_trigger": req.right_trigger,
         "timestamp": time.time(),
     }
-    # Atomic write: write to temp, rename
-    tmp_path = COMMAND_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp_path, COMMAND_FILE)
+    # Atomic write: write to temp, rename (locked to prevent race condition)
+    with _command_file_lock:
+        tmp_path = COMMAND_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, COMMAND_FILE)
     return {"success": True}
 
 

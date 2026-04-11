@@ -138,17 +138,33 @@ class RLWalk:
             self.duck_config.phase_frequency_factor_offset
         )
 
-        # Optional expression features
+        # Optional expression features — failures must never prevent walking
         if self.duck_config.eyes:
-            self.eyes = Eyes()
+            try:
+                self.eyes = Eyes()
+            except Exception as e:
+                print(f"[Expression] Eyes init failed, disabling: {e}")
+                self.duck_config.eyes = False
         if self.duck_config.projector:
-            self.projector = Projector()
+            try:
+                self.projector = Projector()
+            except Exception as e:
+                print(f"[Expression] Projector init failed, disabling: {e}")
+                self.duck_config.projector = False
         if self.duck_config.speaker:
-            self.sounds = Sounds(
-                volume=1.0, sound_directory="../mini_bdx_runtime/assets/"
-            )
+            try:
+                self.sounds = Sounds(
+                    volume=1.0, sound_directory="../mini_bdx_runtime/assets/"
+                )
+            except Exception as e:
+                print(f"[Expression] Sounds init failed, disabling: {e}")
+                self.duck_config.speaker = False
         if self.duck_config.antennas:
-            self.antennas = Antennas()
+            try:
+                self.antennas = Antennas()
+            except Exception as e:
+                print(f"[Expression] Antennas init failed, disabling: {e}")
+                self.duck_config.antennas = False
 
     def get_obs(self):
 

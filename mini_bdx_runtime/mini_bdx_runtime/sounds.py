@@ -11,8 +11,8 @@ class Sounds:
         try:
             pygame.mixer.init()
             pygame.mixer.music.set_volume(volume)
-        except pygame.error as e:
-            print(f"[Sounds] Audio init failed (no audio device?): {e}")
+        except Exception as e:
+            print(f"[Sounds] Audio init failed: {e}")
             self.ok = False
             return
         try:

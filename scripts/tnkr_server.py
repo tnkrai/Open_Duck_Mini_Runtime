@@ -17,9 +17,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Thread
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 
 # ── Runtime imports (available after pip install -e .) ────────────────────────
@@ -106,6 +107,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TNKR Robot Server", lifespan=lifespan)
 
+
+class PrivateNetworkMiddleware(BaseHTTPMiddleware):
+    """Handle Chrome's Private Network Access preflight requests.
+
+    HTTPS pages accessing local network devices trigger a preflight with
+    Access-Control-Request-Private-Network: true. The server must respond
+    with Access-Control-Allow-Private-Network: true or Chrome blocks it.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if (
+            request.method == "OPTIONS"
+            and request.headers.get("access-control-request-private-network") == "true"
+        ):
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Private-Network": "true",
+                },
+            )
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
+
+# PrivateNetworkMiddleware must be added first (outermost) so it handles
+# preflight OPTIONS before CORSMiddleware can reject them.
+app.add_middleware(PrivateNetworkMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

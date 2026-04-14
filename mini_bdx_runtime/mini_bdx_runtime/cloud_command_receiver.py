@@ -16,9 +16,13 @@ import os
 import time
 import threading
 
-# Same Supabase credentials as CloudPublisher — public anon key by design.
-SUPABASE_URL = "https://tgnpbzomdnfodlsacprn.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRnbnBiem9tZG5mb2Rsc2FjcHJuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MjY3NTI4NjMsImV4cCI6MjA0MjMyODg2M30.ZLv4dEMaRab3bGKqDmN-iWK-o49cOadPXQBjfJAFdVk"
+# Default Supabase credentials — the anon key is public by design (same as
+# embedding in frontend JS).  Override via env vars for self-hosted setups.
+_DEFAULT_SUPABASE_URL = "https://ahmocgtnahrabokouiki.supabase.co"
+_DEFAULT_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFobW9jZ3RuYWhyYWJva291aWtpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM1MTcxNTEsImV4cCI6MjA3OTA5MzE1MX0._KjbMvf10TlyuDvHLfaXDTejX1tXXy9G-Uvcxn6IEus"
+
+SUPABASE_URL = os.environ.get("TNKR_SUPABASE_URL", _DEFAULT_SUPABASE_URL)
+SUPABASE_KEY = os.environ.get("TNKR_SUPABASE_KEY", _DEFAULT_SUPABASE_KEY)
 
 COMMAND_FILE = "/dev/shm/tnkr_remote_commands.json"
 
@@ -64,7 +68,7 @@ class CloudCommandReceiver:
             elif err:
                 print(f"[CloudCommandReceiver] Subscribe error: {err}")
 
-        async def on_command(payload):
+        def on_command(payload):
             """Write received command to /dev/shm for RemoteController to read."""
             try:
                 data = payload.get("payload", {})

@@ -1,3 +1,4 @@
+import signal
 import time
 import pickle
 
@@ -243,6 +244,11 @@ class RLWalk:
         return freq
 
     def run(self):
+        # Convert SIGTERM to SystemExit so the finally block runs cleanup
+        def handle_sigterm(signum, frame):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+
         i = 0
         try:
             print("Starting")
@@ -408,7 +414,10 @@ class RLWalk:
                     )
                 time.sleep(max(0, 1 / self.control_freq - took))
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            # Clean up cloud connections
             if self.cloud_command_receiver is not None:
                 self.cloud_command_receiver.stop()
             if self.cloud_publisher is not None:
@@ -423,9 +432,15 @@ class RLWalk:
                 self.projector.stop()
             self.feet_contacts.stop()
 
-        if self.save_obs:
-            pickle.dump(self.saved_obs, open("robot_saved_obs.pkl", "wb"))
-        print("TURNING OFF")
+            # Disable torque so the robot goes limp
+            try:
+                self.hwi.turn_off()
+            except Exception:
+                pass
+
+            if self.save_obs:
+                pickle.dump(self.saved_obs, open("robot_saved_obs.pkl", "wb"))
+            print("TURNING OFF")
 
 
 if __name__ == "__main__":

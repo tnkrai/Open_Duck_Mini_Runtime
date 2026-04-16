@@ -3,11 +3,12 @@ TNKR Robot Server
 
 HTTP API server for the Open Duck Mini robot. Exposes motor check,
 calibration, config management, and walk control endpoints.
-Runs alongside the WebSocket StateServer for live data streaming.
+Telemetry is streamed via Supabase Realtime broadcast channels.
 """
 
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -151,7 +152,9 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    machine = platform.machine()  # 'aarch64' / 'armv7l' on Pi, 'x86_64' / 'arm64' on Mac
+    is_pi = machine in ("aarch64", "armv7l")
+    return {"status": "ok", "is_pi": is_pi, "platform": machine}
 
 
 # ── Motor Check ───────────────────────────────────────────────────────────────

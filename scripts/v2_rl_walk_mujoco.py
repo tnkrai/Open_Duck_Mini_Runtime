@@ -16,7 +16,7 @@ from mini_bdx_runtime.antennas import Antennas
 from mini_bdx_runtime.projector import Projector
 from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
-from mini_bdx_runtime.state_server import StateServer
+# StateServer removed — telemetry is now Supabase-only via CloudPublisher
 
 import os
 
@@ -38,20 +38,11 @@ class RLWalk:
         save_obs=False,
         replay_obs=None,
         cutoff_frequency=None,
-        enable_streaming=False,
-        streaming_port=8765,
         cloud_channel=None,
         cloud_commands_channel=None,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
-
-        self.enable_streaming = enable_streaming
-        self.state_server = None
-        if self.enable_streaming:
-            self.state_server = StateServer(port=streaming_port)
-            self.state_server.start()
-            print(f"State server started on port {streaming_port}")
 
         self.cloud_publisher = None
         if cloud_channel:
@@ -368,7 +359,7 @@ class RLWalk:
 
                 self.hwi.set_position_all(action_dict)
 
-                if self.state_server is not None:
+                if self.cloud_publisher is not None:
                     dof_pos = self.hwi.get_present_positions(
                         ignore=["left_antenna", "right_antenna"]
                     )
@@ -398,10 +389,7 @@ class RLWalk:
                         "paused": self.paused,
                         "fps": self.control_freq,
                     }
-                    self.state_server.broadcast(state_snapshot)
-
-                    if self.cloud_publisher is not None:
-                        self.cloud_publisher.publish(state_snapshot)
+                    self.cloud_publisher.publish(state_snapshot)
 
                 i += 1
 
@@ -422,8 +410,6 @@ class RLWalk:
                 self.cloud_command_receiver.stop()
             if self.cloud_publisher is not None:
                 self.cloud_publisher.stop()
-            if self.state_server is not None:
-                self.state_server.stop()
             if self.duck_config.antennas:
                 self.antennas.stop()
             if self.duck_config.eyes:
@@ -488,18 +474,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
     parser.add_argument(
-        "--enable_streaming",
-        action="store_true",
-        default=False,
-        help="Enable WebSocket state streaming for TNKR dashboard",
-    )
-    parser.add_argument(
-        "--streaming_port",
-        type=int,
-        default=8765,
-        help="WebSocket port for state streaming (default: 8765)",
-    )
-    parser.add_argument(
         "--cloud_channel",
         type=str,
         default=None,
@@ -528,8 +502,6 @@ if __name__ == "__main__":
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
-        enable_streaming=args.enable_streaming,
-        streaming_port=args.streaming_port,
         cloud_channel=args.cloud_channel,
         cloud_commands_channel=args.cloud_commands_channel,
     )

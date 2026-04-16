@@ -35,6 +35,7 @@ class CloudPublisher:
         self._thread = None
         self._ready = threading.Event()
         self._running = False
+        self._publish_count = 0
 
     def start(self):
         """Start the background async event loop and connect to Supabase."""
@@ -61,10 +62,11 @@ class CloudPublisher:
 
         def on_subscribe(status, err):
             if status == RealtimeSubscribeStates.SUBSCRIBED:
-                print(f"[CloudPublisher] Subscribed to {self.channel_name}")
+                print(f"[CloudPublisher] ✓ Subscribed to channel: {self.channel_name}")
+                print(f"[CloudPublisher] ✓ Ready to broadcast at {1.0/self.min_interval:.0f} Hz")
                 self._ready.set()
             elif err:
-                print(f"[CloudPublisher] Subscribe error: {err}")
+                print(f"[CloudPublisher] ✗ Subscribe error: {err}")
 
         await self._channel.subscribe(on_subscribe)
 
@@ -89,6 +91,9 @@ class CloudPublisher:
                     self._channel.send_broadcast("state", state),
                     self._loop,
                 )
+                self._publish_count += 1
+                if self._publish_count % 50 == 1:
+                    print(f"[CloudPublisher] Sent frame #{self._publish_count} to {self.channel_name}")
             except Exception:
                 pass  # fire-and-forget — robot must never stall on network
 

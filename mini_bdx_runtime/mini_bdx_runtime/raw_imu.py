@@ -1,3 +1,24 @@
+"""
+Raw IMU driver for the BNO055 sensor.
+
+Provides raw gyroscope and accelerometer readings (as opposed to imu.py which
+provides fused quaternion orientation).  Runs a background thread that polls
+the sensor at a configurable frequency and exposes the latest reading via
+get_data().
+
+Calibration flow (calibrate=True):
+  1. Switch to NDOF_MODE (uses all sensors for full calibration).
+  2. Block until the BNO055 reports fully calibrated on all subsystems
+     (calibration_status returns (3, 3, 3, 3) for sys, gyro, accel, mag).
+  3. Read the computed offsets for accelerometer, gyroscope, and magnetometer.
+  4. Save offsets to 'imu_calib_data.pkl' and exit.
+
+Normal operation (calibrate=False):
+  - If 'imu_calib_data.pkl' exists, load saved offsets, briefly enter
+    CONFIG_MODE to write them into the sensor, then switch back to NDOF_MODE.
+  - If no calibration file exists, run uncalibrated (offsets default to zero).
+"""
+
 import adafruit_bno055
 import board
 import busio
@@ -18,15 +39,20 @@ class Imu:
         self.sampling_freq = sampling_freq
         self.calibrate = calibrate
 
+        # Initialize I2C bus and BNO055 sensor
         i2c = busio.I2C(board.SCL, board.SDA)
         self.imu = adafruit_bno055.BNO055_I2C(i2c)
 
-        # self.imu.mode = adafruit_bno055.IMUPLUS_MODE
-        # self.imu.mode = adafruit_bno055.ACCGYRO_MODE
-        # self.imu.mode = adafruit_bno055.GYRONLY_MODE
+        # NDOF_MODE fuses accel + gyro + magnetometer for absolute orientation.
+        # Other modes are available but commented out for reference.
         self.imu.mode = adafruit_bno055.NDOF_MODE
-        # self.imu.mode = adafruit_bno055.NDOF_FMC_OFF_MODE
+        print("[IMU MODE]: NDOF_MODE (startup)")
 
+        # Remap physical axes to match the robot's coordinate frame.
+        # The BNO055 has a default axis orientation that may not match how
+        # the sensor is physically mounted on the robot.  The remap swaps
+        # X<->Y and flips sign bits depending on whether the board is
+        # mounted upside-down.
         if upside_down:
             self.imu.axis_remap = (
                 adafruit_bno055.AXIS_REMAP_Y,
@@ -47,18 +73,35 @@ class Imu:
                 adafruit_bno055.AXIS_REMAP_POSITIVE,
             )
 
+        # --- Calibration mode: block until fully calibrated, save offsets, exit ---
         if self.calibrate:
             self.imu.mode = adafruit_bno055.NDOF_MODE
             calibrated = self.imu.calibrated
             while not calibrated:
+                # calibration_status returns a tuple (sys, gyro, accel, mag)
+                # each ranging from 0 (uncalibrated) to 3 (fully calibrated).
                 print("Calibration status: ", self.imu.calibration_status)
                 print("Calibrated : ", self.imu.calibrated)
                 calibrated = self.imu.calibrated
                 time.sleep(0.1)
             print("CALIBRATION DONE")
-            offsets_accelerometer = self.imu.offsets_accelerometer
-            offsets_gyroscope = self.imu.offsets_gyroscope
-            offsets_magnetometer = self.imu.offsets_magnetometer
+
+            # Read the computed sensor offsets, retrying until all are valid.
+            # The sensor registers may not be ready immediately after
+            # calibration completes, so we poll until we get real values.
+            # Keep reading until all three return real values.
+            while True:
+                offsets_accelerometer = self.imu.offsets_accelerometer
+                offsets_gyroscope = self.imu.offsets_gyroscope
+                offsets_magnetometer = self.imu.offsets_magnetometer
+                if (
+                    offsets_accelerometer is not None
+                    and offsets_gyroscope is not None
+                    and offsets_magnetometer is not None
+                ):
+                    break
+                print("Waiting for offset registers to be ready...")
+                time.sleep(0.1)
 
             imu_calib_data = {
                 "offsets_accelerometer": offsets_accelerometer,
@@ -73,15 +116,22 @@ class Imu:
             print("Saved", "imu_calib_data.pkl")
             exit()
 
+        # --- Normal mode: restore saved calibration offsets if available ---
         if os.path.exists("imu_calib_data.pkl"):
             imu_calib_data = pickle.load(open("imu_calib_data.pkl", "rb"))
+            # Must enter CONFIG_MODE to write offset registers.
+            # Wait 600ms after each mode switch — the BNO055 datasheet
+            # specifies this as the time needed for the sensor to be ready.
             self.imu.mode = adafruit_bno055.CONFIG_MODE
-            time.sleep(0.1)
+            print("[IMU MODE]: CONFIG_MODE (writing saved offsets)")
+            time.sleep(0.05)
             self.imu.offsets_accelerometer = imu_calib_data["offsets_accelerometer"]
             self.imu.offsets_gyroscope = imu_calib_data["offsets_gyroscope"]
             self.imu.offsets_magnetometer = imu_calib_data["offsets_magnetometer"]
+            # Switch back to operating mode after writing offsets
             self.imu.mode = adafruit_bno055.NDOF_MODE
-            time.sleep(0.1)
+            print("[IMU MODE]: NDOF_MODE (offsets loaded, ready)")
+            time.sleep(0.6)
         else:
             print("imu_calib_data.pkl not found")
             print("Imu is running uncalibrated")
@@ -90,7 +140,6 @@ class Imu:
 
         # self.tare_x()
 
-        self.last_imu_data = [0, 0, 0, 0]
         self.last_imu_data = {
             "gyro": [0, 0, 0],
             "accelero": [0, 0, 0],
@@ -99,6 +148,12 @@ class Imu:
         Thread(target=self.imu_worker, daemon=True).start()
 
     def tare_x(self):
+        """Compute a static X-axis accelerometer offset (tare).
+
+        Collects 100 samples and waits until the standard deviation is
+        below 0.05 (i.e. the robot is stationary), then stores the mean
+        as self.x_offset to subtract from future readings.
+        """
         print("Taring x ...")
         x_values = []
         num_values = 100
@@ -121,20 +176,33 @@ class Imu:
             time.sleep(0.01)
 
     def imu_worker(self):
+        """Background thread: polls gyro and accelerometer at sampling_freq.
+
+        Reads raw gyroscope and accelerometer values from the BNO055,
+        applies the X-axis tare offset, and pushes the result into a
+        single-slot queue for consumption by get_data().
+        """
         while True:
             s = time.time()
             try:
-                gyro = np.array(self.imu.gyro).copy()
-                accelero = np.array(self.imu.acceleration).copy()
+                # Read raw tuples first so we can check for None before
+                # wrapping in np.array (which would hide the None values).
+                raw_gyro = self.imu.gyro
+                raw_accelero = self.imu.acceleration
             except Exception as e:
                 print("[IMU]:", e)
                 continue
 
-            if gyro is None or accelero is None:
+            # Skip this reading if the sensor returned None for any axis
+            if raw_gyro is None or raw_accelero is None:
+                print("[IMU SKIP]: entire reading was None (sensor not ready)")
+                continue
+            if None in raw_gyro or None in raw_accelero:
+                print(f"[IMU SKIP]: partial None — gyro={raw_gyro}, accel={raw_accelero}")
                 continue
 
-            if gyro.any() is None or accelero.any() is None:
-                continue
+            gyro = np.array(raw_gyro).copy()
+            accelero = np.array(raw_accelero).copy()
 
             accelero[0] -= self.x_offset
 
@@ -148,6 +216,11 @@ class Imu:
             time.sleep(max(0, 1 / self.sampling_freq - took))
 
     def get_data(self):
+        """Return the most recent IMU reading (non-blocking).
+
+        Returns a dict with 'gyro' and 'accelero' keys.  If no new data
+        is available from the worker thread, returns the previous reading.
+        """
         try:
             self.last_imu_data = self.imu_queue.get(False)  # non blocking
         except Exception:

@@ -545,8 +545,6 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
         venv_python,
         walk_script,
         "--onnx_model_path", onnx_path,
-        "--enable_streaming",
-        "--streaming_port", "8765",
         "--remote",
         "--commands",
     ]

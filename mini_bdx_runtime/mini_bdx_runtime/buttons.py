@@ -3,28 +3,15 @@ import time
 
 class Button:
     def __init__(self):
-        self.last_pressed_time = time.time()
-        self.timeout = 0.2
         self.is_pressed = False
         self.triggered = False
-        self.released = True
+        self._prev_pressed = False
 
     def update(self, value):
-        if self.is_pressed and not value:
-            self.released = True
+        # Trigger only on the rising edge: was not pressed, now is pressed
+        self.triggered = value and not self._prev_pressed
+        self._prev_pressed = value
         self.is_pressed = value
-        if (
-            self.released
-            and self.is_pressed
-            and (time.time() - self.last_pressed_time > self.timeout)
-        ):
-            self.triggered = True
-            self.last_pressed_time = time.time()
-        else:
-            self.triggered = False
-
-        if self.is_pressed:
-            self.released = False
 
 
 class Buttons:

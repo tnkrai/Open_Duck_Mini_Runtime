@@ -27,6 +27,7 @@ class RemoteController:
         self.last_right_trigger = 0.0
         self._last_seen_ts = 0.0  # track last file timestamp we processed
         self._last_update_time = time.time()  # wall clock of last new data
+        self._last_btns = {}  # last known button state for edge detection
 
     def get_last_command(self):
         try:
@@ -45,20 +46,22 @@ class RemoteController:
                 cmds = data.get("commands", [0.0] * 7)
                 self.last_commands = np.array(cmds[:7], dtype=float)
 
-                btns = data.get("buttons", {})
-                self.buttons.update(
-                    btns.get("A", False),
-                    btns.get("B", False),
-                    btns.get("X", False),
-                    btns.get("Y", False),
-                    btns.get("LB", False),
-                    btns.get("RB", False),
-                    btns.get("dpad_up", False),
-                    btns.get("dpad_down", False),
-                )
-
+                self._last_btns = data.get("buttons", {})
                 self.last_left_trigger = float(data.get("left_trigger", 0.0))
                 self.last_right_trigger = float(data.get("right_trigger", 0.0))
+
+        # Always update buttons with last known state so edge detection
+        # correctly resets triggered=False on subsequent reads
+        self.buttons.update(
+            self._last_btns.get("A", False),
+            self._last_btns.get("B", False),
+            self._last_btns.get("X", False),
+            self._last_btns.get("Y", False),
+            self._last_btns.get("LB", False),
+            self._last_btns.get("RB", False),
+            self._last_btns.get("dpad_up", False),
+            self._last_btns.get("dpad_down", False),
+        )
 
         # If no new data for too long, zero out (safe stop)
         if time.time() - self._last_update_time > NO_UPDATE_TIMEOUT:

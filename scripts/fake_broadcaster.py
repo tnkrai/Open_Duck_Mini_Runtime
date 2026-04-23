@@ -101,15 +101,17 @@ def generate_walking_state(t: float) -> dict:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python fake_broadcaster.py <session_token>")
+    if len(sys.argv) < 4:
+        print("Usage: python fake_broadcaster.py <session_token> <supabase_url> <supabase_key>")
         sys.exit(1)
 
     session_token = sys.argv[1]
+    supabase_url = sys.argv[2]
+    supabase_key = sys.argv[3]
     channel_name = f"robot-telemetry-{session_token}"
 
     print(f"[FakeBroadcaster] Starting on channel: {channel_name}")
-    publisher = CloudPublisher(channel_name, target_hz=10)
+    publisher = CloudPublisher(channel_name, supabase_url, supabase_key, target_hz=10)
     publisher.start()
 
     print("[FakeBroadcaster] Broadcasting fake walking data at ~50 Hz (throttled to 10 Hz)...")

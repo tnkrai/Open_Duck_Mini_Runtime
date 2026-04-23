@@ -40,20 +40,22 @@ class RLWalk:
         cutoff_frequency=None,
         cloud_channel=None,
         cloud_commands_channel=None,
+        supabase_url=None,
+        supabase_key=None,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
 
         self.cloud_publisher = None
-        if cloud_channel:
+        if cloud_channel and supabase_url and supabase_key:
             from mini_bdx_runtime.cloud_publisher import CloudPublisher
-            self.cloud_publisher = CloudPublisher(cloud_channel)
+            self.cloud_publisher = CloudPublisher(cloud_channel, supabase_url, supabase_key)
             self.cloud_publisher.start()
 
         self.cloud_command_receiver = None
-        if cloud_commands_channel and remote:
+        if cloud_commands_channel and remote and supabase_url and supabase_key:
             from mini_bdx_runtime.cloud_command_receiver import CloudCommandReceiver
-            self.cloud_command_receiver = CloudCommandReceiver(cloud_commands_channel)
+            self.cloud_command_receiver = CloudCommandReceiver(cloud_commands_channel, supabase_url, supabase_key)
             self.cloud_command_receiver.start()
 
         self.commands = commands
@@ -485,6 +487,18 @@ if __name__ == "__main__":
         default=None,
         help="Supabase Broadcast channel name for cloud command relay",
     )
+    parser.add_argument(
+        "--supabase_url",
+        type=str,
+        default=None,
+        help="Supabase project URL for cloud telemetry/commands",
+    )
+    parser.add_argument(
+        "--supabase_key",
+        type=str,
+        default=None,
+        help="Supabase anon key for cloud telemetry/commands",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -504,6 +518,8 @@ if __name__ == "__main__":
         cutoff_frequency=args.cutoff_frequency,
         cloud_channel=args.cloud_channel,
         cloud_commands_channel=args.cloud_commands_channel,
+        supabase_url=args.supabase_url,
+        supabase_key=args.supabase_key,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

@@ -16,22 +16,16 @@ import os
 import time
 import threading
 
-# Default Supabase credentials — the anon key is public by design (same as
-# embedding in frontend JS).  Override via env vars for self-hosted setups.
-_DEFAULT_SUPABASE_URL = "https://ahmocgtnahrabokouiki.supabase.co"
-_DEFAULT_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFobW9jZ3RuYWhyYWJva291aWtpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM1MTcxNTEsImV4cCI6MjA3OTA5MzE1MX0._KjbMvf10TlyuDvHLfaXDTejX1tXXy9G-Uvcxn6IEus"
-
-SUPABASE_URL = os.environ.get("TNKR_SUPABASE_URL", _DEFAULT_SUPABASE_URL)
-SUPABASE_KEY = os.environ.get("TNKR_SUPABASE_KEY", _DEFAULT_SUPABASE_KEY)
-
 COMMAND_FILE = "/dev/shm/tnkr_remote_commands.json"
 
 
 class CloudCommandReceiver:
     """Subscribes to a Supabase Broadcast channel and writes commands to /dev/shm."""
 
-    def __init__(self, channel_name: str):
+    def __init__(self, channel_name: str, supabase_url: str, supabase_key: str):
         self.channel_name = channel_name
+        self.supabase_url = supabase_url
+        self.supabase_key = supabase_key
         self._channel = None
         self._loop = None
         self._thread = None
@@ -58,7 +52,7 @@ class CloudCommandReceiver:
         from supabase import acreate_client
         from realtime.types import RealtimeSubscribeStates
 
-        supabase = await acreate_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = await acreate_client(self.supabase_url, self.supabase_key)
         self._channel = supabase.channel(self.channel_name)
 
         def on_subscribe(status, err):

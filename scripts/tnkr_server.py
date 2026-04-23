@@ -516,6 +516,8 @@ def stop_walk_process():
 
 class WalkStartRequest(BaseModel):
     sessionToken: str | None = None
+    supabaseUrl: str | None = None
+    supabaseKey: str | None = None
 
 
 @app.post("/api/walk/start")
@@ -553,6 +555,10 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
     if body.sessionToken:
         cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
         cmd.extend(["--cloud_commands_channel", f"robot-commands-{body.sessionToken}"])
+        if body.supabaseUrl:
+            cmd.extend(["--supabase_url", body.supabaseUrl])
+        if body.supabaseKey:
+            cmd.extend(["--supabase_key", body.supabaseKey])
 
     walk_process = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
 

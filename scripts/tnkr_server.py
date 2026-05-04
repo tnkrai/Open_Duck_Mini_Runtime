@@ -41,6 +41,7 @@ USB_PORT = "/dev/ttyACM0"
 
 hwi_instance: HWI | None = None
 walk_process: subprocess.Popen | None = None
+current_session_token: str | None = None
 
 
 def get_hwi() -> HWI:
@@ -498,14 +499,15 @@ def update_config(config: DuckConfigModel):
 # ── Walk Control ──────────────────────────────────────────────────────────────
 
 def stop_walk_process():
-    global walk_process
+    global walk_process, current_session_token
     if walk_process is not None and walk_process.poll() is None:
         walk_process.terminate()
         try:
             walk_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             walk_process.kill()
-        walk_process = None
+    walk_process = None
+    current_session_token = None
 
     # Clean up remote command file
     try:
@@ -522,11 +524,20 @@ class WalkStartRequest(BaseModel):
 
 @app.post("/api/walk/start")
 def walk_start(body: WalkStartRequest = WalkStartRequest()):
-    """Start the walk script with streaming enabled."""
-    global walk_process
+    """Start the walk script with streaming enabled.
+
+    If a walk is already running and the incoming sessionToken matches the
+    current one, this is a no-op (idempotent retry). If the token differs,
+    the running walk is stopped and a fresh one is started for the new
+    session, so a new browser tab / wizard run isn't silently bound to a
+    dead channel from a previous attempt.
+    """
+    global walk_process, current_session_token
 
     if walk_process is not None and walk_process.poll() is None:
-        return {"success": True, "message": "Walk is already running"}
+        if body.sessionToken and body.sessionToken == current_session_token:
+            return {"success": True, "message": "Walk is already running"}
+        stop_walk_process()
 
     # Release HWI so the walk script can use the USB port
     release_hwi()
@@ -561,6 +572,7 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
             cmd.extend(["--supabase_key", body.supabaseKey])
 
     walk_process = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
+    current_session_token = body.sessionToken
 
     return {"success": True, "pid": walk_process.pid}
 
@@ -568,10 +580,8 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
 @app.post("/api/walk/stop")
 def walk_stop():
     """Stop the walk script."""
-    global walk_process
-
     if walk_process is None or walk_process.poll() is not None:
-        walk_process = None
+        stop_walk_process()
         return {"success": True, "message": "Walk was not running"}
 
     stop_walk_process()

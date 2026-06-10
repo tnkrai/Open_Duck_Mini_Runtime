@@ -76,12 +76,40 @@ class HWI:
 
         self.io = rustypot.feetech(usb_port, 1000000)
 
+    # CH343/cdc_acm has no latency-timer knob, so single-servo transactions
+    # occasionally time out, and a brief bus voltage sag (e.g. on high-KP
+    # energize) can drop one mid-write. Retry transient OSErrors a few times;
+    # a truly unresponsive servo still fails every attempt and is named.
+    _IO_ATTEMPTS = 3
+    _IO_RETRY_DELAY = 0.02
+
+    def _io_retry(self, fn, joint_name, op):
+        """Run a single-servo io op, retrying transient OSErrors and naming
+        the joint (and id) if it ultimately fails."""
+        last_exc = None
+        for attempt in range(self._IO_ATTEMPTS):
+            try:
+                return fn()
+            except OSError as e:
+                last_exc = e
+                if attempt + 1 < self._IO_ATTEMPTS:
+                    print(
+                        f"[HWI] {op} timed out for '{joint_name}' "
+                        f"(id {self.joints[joint_name]}), "
+                        f"retry {attempt + 1}/{self._IO_ATTEMPTS - 1}: {e}"
+                    )
+                    time.sleep(self._IO_RETRY_DELAY)
+        raise OSError(
+            f"{op} failed for '{joint_name}' (id {self.joints[joint_name]}) "
+            f"after {self._IO_ATTEMPTS} attempts: {last_exc}"
+        )
+
     def _write_kps(self, kps):
         # CH343/cdc_acm adapter can't reliably do a bulk multi-servo sync
         # transaction at 1 Mbaud (raises OSError: Parsing error). Loop one
         # servo at a time. Does NOT touch self.kps (used by turn_on).
-        for id, kp in zip(self.joints.values(), kps):
-            self.io.set_kps([id], [kp])
+        for name, id, kp in zip(self.joints.keys(), self.joints.values(), kps):
+            self._io_retry(lambda i=id, k=kp: self.io.set_kps([i], [k]), name, "set_kps")
 
     def set_kps(self, kps):
         self.kps = kps
@@ -90,8 +118,8 @@ class HWI:
     def set_kds(self, kds):
         self.kds = kds
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
-        for id, kd in zip(self.joints.values(), self.kds):
-            self.io.set_kds([id], [kd])
+        for name, id, kd in zip(self.joints.keys(), self.joints.values(), self.kds):
+            self._io_retry(lambda i=id, k=kd: self.io.set_kds([i], [k]), name, "set_kds")
 
     def set_kp(self, id, kp):
         self.io.set_kps([id], [kp])
@@ -111,8 +139,8 @@ class HWI:
 
     def turn_off(self):
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
-        for id in self.joints.values():
-            self.io.disable_torque([id])
+        for name, id in self.joints.items():
+            self._io_retry(lambda i=id: self.io.disable_torque([i]), name, "disable_torque")
 
     def set_position(self, joint_name, pos):
         """
@@ -120,21 +148,26 @@ class HWI:
         """
         id = self.joints[joint_name]
         pos = pos + self.joints_offsets[joint_name]
-        self.io.write_goal_position([id], [pos])
+        self._io_retry(
+            lambda: self.io.write_goal_position([id], [pos]),
+            joint_name,
+            "write_goal_position",
+        )
 
     def set_position_all(self, joints_positions):
         """
         joints_positions is a dictionary with joint names as keys and joint positions as values
         Warning: expects radians
         """
-        ids_positions = {
-            self.joints[joint]: position + self.joints_offsets[joint]
-            for joint, position in joints_positions.items()
-        }
-
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
-        for id, position in ids_positions.items():
-            self.io.write_goal_position([id], [position])
+        for joint, position in joints_positions.items():
+            id = self.joints[joint]
+            target = position + self.joints_offsets[joint]
+            self._io_retry(
+                lambda i=id, p=target: self.io.write_goal_position([i], [p]),
+                joint,
+                "write_goal_position",
+            )
 
     def get_present_positions(self, ignore=[]):
         """
@@ -144,8 +177,12 @@ class HWI:
         try:
             # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
             present_positions = [
-                self.io.read_present_position([id])[0]
-                for id in self.joints.values()
+                self._io_retry(
+                    lambda i=id: self.io.read_present_position([i])[0],
+                    name,
+                    "read_present_position",
+                )
+                for name, id in self.joints.items()
             ]
         except Exception as e:
             print(e)
@@ -165,8 +202,12 @@ class HWI:
         try:
             # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
             present_velocities = [
-                self.io.read_present_velocity([id])[0]
-                for id in self.joints.values()
+                self._io_retry(
+                    lambda i=id: self.io.read_present_velocity([i])[0],
+                    name,
+                    "read_present_velocity",
+                )
+                for name, id in self.joints.items()
             ]
         except Exception as e:
             print(e)

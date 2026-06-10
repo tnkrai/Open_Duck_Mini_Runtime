@@ -407,6 +407,8 @@ do_pip_core() {
             "numpy>=1.26.4" \
             "onnxruntime>=1.18.1" \
             "adafruit-circuitpython-bno055>=5.4.13" \
+            "lgpio>=0.2.2.0" \
+            "supabase>=2.0.0" \
             "websockets>=12.0" \
             "fastapi>=0.115.0" \
             "uvicorn>=0.30.0" \
@@ -415,7 +417,7 @@ do_pip_core() {
             2>&1 | tail -5
 
         "$INSTALL_DIR/.venv/bin/python" -c \
-            "import numpy; import onnxruntime; import fastapi; print('Core packages verified')" \
+            "import numpy; import onnxruntime; import fastapi; import lgpio; import supabase; print('Core packages verified')" \
             || die "Core package verification failed — check log at $LOG_FILE"
     fi
 

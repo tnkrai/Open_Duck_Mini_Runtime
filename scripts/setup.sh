@@ -20,7 +20,7 @@ set -euo pipefail
 # ── Config ────────────────────────────────────────────────────────────────────
 
 REPO_URL="https://github.com/tnkrai/Open_Duck_Mini_Runtime.git"
-REPO_BRANCH="v2"
+REPO_BRANCH="v3"
 INSTALL_DIR="$HOME/Open_Duck_Mini_Runtime"
 CONFIG_FILE="$HOME/duck_config.json"
 SERVICE_NAME="tnkr-robot"

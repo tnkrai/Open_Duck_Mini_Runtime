@@ -76,19 +76,28 @@ class HWI:
 
         self.io = rustypot.feetech(usb_port, 1000000)
 
+    def _write_kps(self, kps):
+        # CH343/cdc_acm adapter can't reliably do a bulk multi-servo sync
+        # transaction at 1 Mbaud (raises OSError: Parsing error). Loop one
+        # servo at a time. Does NOT touch self.kps (used by turn_on).
+        for id, kp in zip(self.joints.values(), kps):
+            self.io.set_kps([id], [kp])
+
     def set_kps(self, kps):
         self.kps = kps
-        self.io.set_kps(list(self.joints.values()), self.kps)
+        self._write_kps(self.kps)
 
     def set_kds(self, kds):
         self.kds = kds
-        self.io.set_kds(list(self.joints.values()), self.kds)
+        # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
+        for id, kd in zip(self.joints.values(), self.kds):
+            self.io.set_kds([id], [kd])
 
     def set_kp(self, id, kp):
         self.io.set_kps([id], [kp])
 
     def turn_on(self):
-        self.io.set_kps(list(self.joints.values()), self.low_torque_kps)
+        self._write_kps(self.low_torque_kps)
         print("turn on : low KPS set")
         time.sleep(1)
 
@@ -97,11 +106,13 @@ class HWI:
 
         time.sleep(1)
 
-        self.io.set_kps(list(self.joints.values()), self.kps)
+        self._write_kps(self.kps)
         print("turn on : high kps")
 
     def turn_off(self):
-        self.io.disable_torque(list(self.joints.values()))
+        # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
+        for id in self.joints.values():
+            self.io.disable_torque([id])
 
     def set_position(self, joint_name, pos):
         """
@@ -121,9 +132,9 @@ class HWI:
             for joint, position in joints_positions.items()
         }
 
-        self.io.write_goal_position(
-            list(self.joints.values()), list(ids_positions.values())
-        )
+        # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
+        for id, position in ids_positions.items():
+            self.io.write_goal_position([id], [position])
 
     def get_present_positions(self, ignore=[]):
         """
@@ -131,9 +142,11 @@ class HWI:
         """
 
         try:
-            present_positions = self.io.read_present_position(
-                list(self.joints.values())
-            )
+            # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
+            present_positions = [
+                self.io.read_present_position([id])[0]
+                for id in self.joints.values()
+            ]
         except Exception as e:
             print(e)
             return None
@@ -150,9 +163,11 @@ class HWI:
         Returns the present velocities in rad/s (default) or rev/min
         """
         try:
-            present_velocities = self.io.read_present_velocity(
-                list(self.joints.values())
-            )
+            # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
+            present_velocities = [
+                self.io.read_present_velocity([id])[0]
+                for id in self.joints.values()
+            ]
         except Exception as e:
             print(e)
             return None

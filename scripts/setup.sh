@@ -294,6 +294,27 @@ do_i2c() {
 }
 
 # ── Step 4: USB serial latency ───────────────────────────────────────────────
+#
+# The robot talks to the Feetech STS3215 bus servos through a USB-to-serial
+# adapter plugged into the Pi Zero 2 W's micro-USB data port. Two adapter chip
+# variants exist in the field; both do the same job (serial bridge at 1 Mbaud)
+# and are interchangeable — only the chip differs:
+#
+#   Chip   | USB VID | Kernel driver | Device node    | Notes
+#   -------|---------|---------------|----------------|-------------------------
+#   CH343  | 0x1a86  | cdc_acm       | /dev/ttyACM*   | QinHeng; current (v3).
+#          |         |               |                | No latency_timer knob;
+#          |         |               |                | can't do bulk multi-servo
+#          |         |               |                | sync at 1Mbaud (per-servo
+#          |         |               |                | IO + retries in HWI).
+#   FTDI   | 0x0403  | ftdi_sio      | /dev/ttyUSB*   | Older adapter. Honors the
+#          |         |               |                | latency_timer rule below.
+#
+# The runtime does NOT hardcode the device path — HWI.find_servo_port()
+# (mini_bdx_runtime/rustypot_position_hwi.py) auto-detects the adapter by USB
+# vendor id, so any robot/cable works regardless of which ttyACM*/ttyUSB* it
+# enumerates as. The latency rule below only affects FTDI (ftdi_sio); it is a
+# no-op on CH343/cdc_acm, which has no latency_timer attribute.
 
 do_usb_latency() {
     start_spinner "Setting USB serial latency rule..."

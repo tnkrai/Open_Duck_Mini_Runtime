@@ -2,11 +2,46 @@ import time
 
 import numpy as np
 import rustypot
+import serial.tools.list_ports
 from mini_bdx_runtime.duck_config import DuckConfig
+
+# USB vendor IDs for the servo-bus adapters we ship. The bus adapter is the
+# only USB-serial device on the robot, so matching the chip vendor uniquely
+# identifies it — regardless of /dev/ttyACMx numbering, which USB port/cable
+# it's on, or the adapter's per-unit serial number. This lets the same code
+# run on any robot without a hardcoded device path.
+SERVO_ADAPTER_VIDS = {
+    0x1A86: "CH343",  # QinHeng (current v3 adapter, enumerates as /dev/ttyACM*)
+    0x0403: "FTDI",   # FTDI (older adapter, enumerates as /dev/ttyUSB*)
+}
+
+
+def find_servo_port() -> str:
+    """Locate the servo-bus USB adapter by vendor ID.
+
+    ttyACMx numbers renumber on replug and a by-id path is unique per physical
+    adapter, so we match the chip vendor instead — works on any robot/cable.
+    Raises a clear error if no known adapter is present.
+    """
+    ports = list(serial.tools.list_ports.comports())
+    matches = [(p.device, SERVO_ADAPTER_VIDS[p.vid]) for p in ports if p.vid in SERVO_ADAPTER_VIDS]
+    if not matches:
+        seen = ", ".join(
+            f"{p.device} (vid={p.vid:#06x})" if p.vid else p.device for p in ports
+        ) or "none"
+        raise RuntimeError(
+            "No servo-bus USB adapter found (looked for CH343/FTDI by vendor id). "
+            f"Serial devices present: {seen}. Is the adapter plugged in?"
+        )
+    if len(matches) > 1:
+        print(f"[HWI] Warning: multiple servo adapters found {matches}; using {matches[0][0]}")
+    device, chip = matches[0]
+    print(f"[HWI] Using servo adapter {device} ({chip})")
+    return device
 
 
 class HWI:
-    def __init__(self, duck_config: DuckConfig, usb_port: str = "/dev/ttyACM0"):
+    def __init__(self, duck_config: DuckConfig, usb_port: str | None = None):
 
         self.duck_config = duck_config
 
@@ -74,6 +109,8 @@ class HWI:
         self.kds = np.ones(len(self.joints)) * 0  # default kd
         self.low_torque_kps = np.ones(len(self.joints)) * 2
 
+        if usb_port is None:
+            usb_port = find_servo_port()
         self.io = rustypot.feetech(usb_port, 1000000)
 
     # CH343/cdc_acm has no latency-timer knob, so single-servo transactions

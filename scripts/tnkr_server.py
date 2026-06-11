@@ -35,7 +35,10 @@ HOME_DIR = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME_DIR, "duck_config.json")
 SCRIPTS_DIR = Path(__file__).parent
 SERVER_PORT = 8000
-USB_PORT = "/dev/ttyACM0"
+# None -> HWI.find_servo_port() auto-detects the servo adapter by USB vendor id
+# (CH343/FTDI), so the same code runs on any robot regardless of which
+# /dev/ttyACMx it enumerates as, the cable, or the adapter's serial number.
+USB_PORT = None
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 

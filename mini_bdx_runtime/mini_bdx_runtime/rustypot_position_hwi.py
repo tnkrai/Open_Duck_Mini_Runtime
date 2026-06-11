@@ -16,8 +16,8 @@ SERVO_ADAPTER_VIDS = {
 }
 
 
-def find_servo_port() -> str:
-    """Locate the servo-bus USB adapter by vendor ID.
+def find_servo_adapter() -> tuple[str, str]:
+    """Locate the servo-bus USB adapter by vendor ID; return (device, chip).
 
     ttyACMx numbers renumber on replug and a by-id path is unique per physical
     adapter, so we match the chip vendor instead — works on any robot/cable.
@@ -37,7 +37,12 @@ def find_servo_port() -> str:
         print(f"[HWI] Warning: multiple servo adapters found {matches}; using {matches[0][0]}")
     device, chip = matches[0]
     print(f"[HWI] Using servo adapter {device} ({chip})")
-    return device
+    return device, chip
+
+
+def find_servo_port() -> str:
+    """Back-compat wrapper around find_servo_adapter()."""
+    return find_servo_adapter()[0]
 
 
 class HWI:
@@ -109,8 +114,9 @@ class HWI:
         self.kds = np.ones(len(self.joints)) * 0  # default kd
         self.low_torque_kps = np.ones(len(self.joints)) * 2
 
+        self.servo_adapter_chip: str | None = None
         if usb_port is None:
-            usb_port = find_servo_port()
+            usb_port, self.servo_adapter_chip = find_servo_adapter()
         self.io = rustypot.feetech(usb_port, 1000000)
 
     # CH343/cdc_acm has no latency-timer knob, so single-servo transactions

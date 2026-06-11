@@ -31,6 +31,13 @@ TOTAL_STEPS=12
 MIN_DISK_MB=2048
 SWAP_SIZE_MB=2048
 
+# Anonymous usage telemetry (see telemetry_init below for the user notice).
+# Key is write-only (can send events, cannot read data). Key/host and the
+# property names must match mini_bdx_runtime/mini_bdx_runtime/telemetry.py.
+TELEMETRY_FILE="$HOME/.tnkr-telemetry.json"
+POSTHOG_KEY="phc_FarYZWwIbyZFV2iUKyl8WyRRdFFuw2MH3NZat4zPmEK"
+POSTHOG_HOST="https://us.i.posthog.com"
+
 # ── Colors & Symbols ─────────────────────────────────────────────────────────
 
 BOLD='\033[1m'
@@ -53,6 +60,16 @@ SPINNER_PID=""
 ORIGINAL_SWAP_SIZE=""
 SWAP_EXPANDED=false
 TEST_MODE=false
+CLEAN_INSTALL=false
+SETUP_START=$(date +%s)
+
+# Telemetry state (set by telemetry_init; referenced by the EXIT trap, so
+# initialized here for `set -u` safety)
+TELEMETRY_ENABLED="false"
+DEVICE_ID=""
+CURRENT_STEP_NUM=""
+CURRENT_STEP_ID=""
+STEP_START=""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,6 +92,88 @@ step_done() {
 
 mark_done() {
     touch "$STATE_DIR/step_${1}.done"
+}
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+#
+# Anonymous, opt-out usage telemetry. Sent via curl because steps 1-7 run
+# before the Python venv exists. Never blocks setup (3s cap, always || true),
+# never sends: motion data, names, hostnames, or location (GeoIP disabled).
+
+telemetry_init() {
+    if [ -f "$TELEMETRY_FILE" ]; then
+        # Existing device: reuse id + respect saved preference. Never re-prompt.
+        DEVICE_ID=$(sed -n 's/.*"device_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TELEMETRY_FILE" | head -1)
+        if grep -q '"enabled"[[:space:]]*:[[:space:]]*false' "$TELEMETRY_FILE"; then
+            TELEMETRY_ENABLED="false"
+        else
+            TELEMETRY_ENABLED="true"
+        fi
+    else
+        DEVICE_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "")
+        TELEMETRY_ENABLED="true"
+        echo ""
+        printf "  ${DIM}────────────────────────────────────────${RESET}\n"
+        printf "  ${BOLD}Anonymous usage telemetry${RESET}\n"
+        printf "  Helps us fix setup and robot failures for everyone.\n"
+        printf "  ${DIM}We collect:${RESET} setup step outcomes, API errors, hardware model.\n"
+        printf "  ${DIM}Never:${RESET} motion/joint data, names, precise location.\n"
+        printf "  ${DIM}Disable any time:${RESET} TNKR_TELEMETRY=0, or \"enabled\": false in %s\n" "$TELEMETRY_FILE"
+        printf "  ${DIM}────────────────────────────────────────${RESET}\n"
+        if [ "$TTY_OUT" = "/dev/tty" ]; then
+            local ans=""
+            read -r -t 15 -p "  Press Enter to continue, or type 'n' to opt out: " ans < /dev/tty || true
+            echo ""
+            case "$ans" in
+                n|N|no|NO) TELEMETRY_ENABLED="false"; info "Telemetry disabled" ;;
+            esac
+        fi
+    fi
+
+    # Env var is a hard override in both directions
+    case "${TNKR_TELEMETRY:-}" in
+        0|false|off) TELEMETRY_ENABLED="false" ;;
+        1|true|on)   TELEMETRY_ENABLED="true" ;;
+    esac
+
+    # Persist only when the file doesn't exist yet — never clobber user edits
+    if [ ! -f "$TELEMETRY_FILE" ] && [ -n "$DEVICE_ID" ]; then
+        printf '{\n  "device_id": "%s",\n  "enabled": %s,\n  "notice_version": 1,\n  "created_at": "%s"\n}\n' \
+            "$DEVICE_ID" "$TELEMETRY_ENABLED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$TELEMETRY_FILE" 2>/dev/null || true
+    fi
+
+    # No uuid source (non-Linux?) — stay silent rather than mislabel devices
+    [ -z "$DEVICE_ID" ] && TELEMETRY_ENABLED="false"
+
+    if [ "$TELEMETRY_ENABLED" = "true" ]; then
+        printf "  ${DOT} Telemetry: enabled ${DIM}(device %.8s…, disable: TNKR_TELEMETRY=0)${RESET}\n" "$DEVICE_ID"
+    fi
+}
+
+# ph_capture <event_name> [<json_props_fragment>]
+# Fragment example: "step_id":"08_pip_core","step_num":8
+ph_capture() {
+    [ "$TELEMETRY_ENABLED" = "true" ] || return 0
+    [ -n "$DEVICE_ID" ] || return 0
+    local event="$1" props="${2:-}"
+    curl -s --max-time 3 -o /dev/null -X POST "$POSTHOG_HOST/i/v0/e/" \
+        -H 'Content-Type: application/json' \
+        -d "{\"api_key\":\"$POSTHOG_KEY\",\"event\":\"$event\",\"distinct_id\":\"$DEVICE_ID\",\"properties\":{\"source\":\"openduck-runtime\",\"setup_script\":true,\"\$geoip_disable\":true${props:+,$props}}}" \
+        2>/dev/null || true
+}
+
+# Hardware props as a JSON fragment — property names are a contract with
+# mini_bdx_runtime/telemetry.py (pi_model, arch, ram_mb, os_release).
+telemetry_hw_props() {
+    local arch model ram_mb os_release
+    arch=$(uname -m 2>/dev/null || echo "")
+    model=""
+    [ -f /proc/device-tree/model ] && model=$(tr -d '\0' < /proc/device-tree/model)
+    ram_mb=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0) / 1024 ))
+    os_release=$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release 2>/dev/null | head -1)
+    printf '"arch":"%s","pi_model":"%s","ram_mb":%s,"os_release":"%s"' \
+        "$arch" "$model" "$ram_mb" "$os_release"
 }
 
 # ── Spinner ───────────────────────────────────────────────────────────────────
@@ -145,8 +244,16 @@ run_step() {
 
     printf "\n  ${WHITE}[%d/%d]${RESET} ${BOLD}%s${RESET}\n" \
         "$step_num" "$TOTAL_STEPS" "$step_title"
+    # Record which step is running so the EXIT trap can attribute a failure
+    # to it (set -e aborts mid-step; the trap sends setup_step_failed).
+    CURRENT_STEP_NUM="$step_num"
+    CURRENT_STEP_ID="$step_id"
+    STEP_START=$(date +%s)
     "$step_func"
     mark_done "$step_id"
+    ph_capture setup_step_completed \
+        "\"step_id\":\"$step_id\",\"step_num\":$step_num,\"duration_s\":$(( $(date +%s) - STEP_START ))"
+    CURRENT_STEP_ID=""
 }
 
 # ── Swap management ──────────────────────────────────────────────────────────
@@ -207,6 +314,20 @@ cleanup() {
     restore_swap
 
     if [ $exit_code -ne 0 ]; then
+        # Report which step died and why. error_tail = last log lines,
+        # ANSI-stripped, JSON-escaped via python3 (skipped if unavailable).
+        if [ -n "$CURRENT_STEP_ID" ]; then
+            local fail_duration tail_json
+            fail_duration=$(( $(date +%s) - ${STEP_START:-$(date +%s)} ))
+            tail_json="null"
+            if command -v python3 > /dev/null 2>&1 && [ -f "$LOG_FILE" ]; then
+                tail_json=$(tail -n 20 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[-2000:]))' \
+                    2>/dev/null || echo "null")
+            fi
+            ph_capture setup_step_failed \
+                "\"step_id\":\"$CURRENT_STEP_ID\",\"step_num\":${CURRENT_STEP_NUM:-0},\"exit_code\":$exit_code,\"duration_s\":$fail_duration,\"error_tail\":$tail_json"
+        fi
         echo ""
         printf "  ${RED}Setup interrupted or failed.${RESET}\n"
         printf "  ${DIM}Re-run the script to resume from where it left off.${RESET}\n"
@@ -429,10 +550,11 @@ do_pip_core() {
             "fastapi>=0.115.0" \
             "uvicorn>=0.30.0" \
             "pydantic>=2.0.0" \
+            "posthog>=3.0" \
             2>&1 | tail -5
 
         "$INSTALL_DIR/.venv/bin/python" -c \
-            "import numpy; import fastapi; print('Core packages verified (test mode)')" \
+            "import numpy; import fastapi; import posthog; print('Core packages verified (test mode)')" \
             || die "Core package verification failed — check log at $LOG_FILE"
     else
         # Install packages directly — NO pipe, so errors are visible and exit code works
@@ -446,11 +568,12 @@ do_pip_core() {
             "fastapi>=0.115.0" \
             "uvicorn>=0.30.0" \
             "pydantic>=2.0.0" \
+            "posthog>=3.0" \
             "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215" \
             2>&1 | tail -5
 
         "$INSTALL_DIR/.venv/bin/python" -c \
-            "import numpy; import onnxruntime; import fastapi; import lgpio; import supabase; print('Core packages verified')" \
+            "import numpy; import onnxruntime; import fastapi; import lgpio; import supabase; import posthog; print('Core packages verified')" \
             || die "Core package verification failed — check log at $LOG_FILE"
     fi
 
@@ -639,6 +762,10 @@ main() {
             info "State directory removed"
         fi
 
+        # NOTE: $TELEMETRY_FILE is deliberately preserved — the anonymous
+        # device id should stay stable across reinstalls.
+
+        CLEAN_INSTALL=true
         echo ""
         info "Clean complete — running fresh install"
         echo ""
@@ -656,6 +783,14 @@ main() {
         echo ""
         printf "  ${CYAN}Resuming setup (${done_count}/${TOTAL_STEPS} steps already complete)${RESET}\n"
     fi
+
+    # ── Telemetry consent + install-started event ─────────────────────────
+    telemetry_init
+    local resumed="false" hw_props
+    [ "$done_count" -gt 0 ] && resumed="true"
+    hw_props=$(telemetry_hw_props)
+    ph_capture setup_started \
+        "$hw_props,\"resumed\":$resumed,\"steps_already_done\":$done_count,\"clean_install\":$CLEAN_INSTALL,\"\$set\":{$hw_props}"
 
     # ── Header ────────────────────────────────────────────────────────────
     echo ""
@@ -694,6 +829,8 @@ LOGO
     run_step 12 "12_systemd"      "TNKR server"                           do_systemd
 
     # ── Done ──────────────────────────────────────────────────────────────
+    ph_capture setup_completed \
+        "\"total_duration_s\":$(( $(date +%s) - SETUP_START )),\"clean_install\":$CLEAN_INSTALL"
     print_success
 }
 

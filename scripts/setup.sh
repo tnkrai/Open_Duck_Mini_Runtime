@@ -135,8 +135,9 @@ run_step() {
     local step_id="$2"
     local step_title="$3"
     local step_func="$4"
+    local always="${5:-false}"   # if "true", run every time (never skipped by .done)
 
-    if step_done "$step_id"; then
+    if [ "$always" != "true" ] && step_done "$step_id"; then
         printf "\n  ${WHITE}[%d/%d]${RESET} ${BOLD}%s${RESET} ${DIM}... skipped${RESET}\n" \
             "$step_num" "$TOTAL_STEPS" "$step_title"
         return 0
@@ -342,8 +343,10 @@ do_clone() {
     fi
 
     if [ -d "$INSTALL_DIR/.git" ]; then
-        start_spinner "Updating existing installation..."
+        start_spinner "Checking for updates..."
         cd "$INSTALL_DIR"
+        local old_head new_head
+        old_head=$(git rev-parse HEAD 2>/dev/null || echo none)
         # Handle dirty state: stash local changes
         if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet HEAD 2>/dev/null; then
             git stash --include-untracked > /dev/null 2>&1 || true
@@ -351,7 +354,16 @@ do_clone() {
         git fetch origin "$REPO_BRANCH" > /dev/null 2>&1
         git checkout "$REPO_BRANCH" > /dev/null 2>&1 || true
         git reset --hard "origin/$REPO_BRANCH" > /dev/null 2>&1
-        stop_spinner true "Runtime updated"
+        new_head=$(git rev-parse HEAD)
+        if [ "$old_head" = "$new_head" ]; then
+            stop_spinner true "Already up to date ($(git rev-parse --short HEAD))"
+        else
+            # New code pulled — clear downstream step flags so new pip deps,
+            # config, and the systemd service are re-applied on this same run
+            # (and the service restarts onto the new code via step 12).
+            rm -f "$STATE_DIR"/step_0[789]_*.done "$STATE_DIR"/step_1[012]_*.done
+            stop_spinner true "Updated $(git rev-parse --short "$old_head" 2>/dev/null || echo new)→$(git rev-parse --short HEAD) — re-running install steps"
+        fi
     else
         # Remove non-git directory if it exists (broken state)
         if [ -d "$INSTALL_DIR" ]; then
@@ -669,7 +681,7 @@ LOGO
     run_step  3 "03_i2c"          "Hardware interfaces (I2C)"              do_i2c
     run_step  4 "04_usb_latency"  "Motor communication (USB latency)"      do_usb_latency
     run_step  5 "05_swap"         "Expand swap for compilation"            do_swap
-    run_step  6 "06_clone"        "Clone / update runtime"                 do_clone
+    run_step  6 "06_clone"        "Clone / update runtime"                 do_clone        true
     run_step  7 "07_venv"         "Python virtual environment"             do_venv
 
     # Set PIP path now that venv is guaranteed to exist

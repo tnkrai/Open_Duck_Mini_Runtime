@@ -1,37 +1,11 @@
 """Walk lifecycle: walk_ended events, crash labeling, and the stop/start race."""
 
+import os
+import signal
 import time
 
-import pytest
-from fastapi.testclient import TestClient
-
 import tnkr_server
-
-
-@pytest.fixture
-def client():
-    return TestClient(tnkr_server.app, raise_server_exceptions=False)
-
-
-@pytest.fixture
-def fake_walk_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(tnkr_server, "SCRIPTS_DIR", tmp_path)
-    (tmp_path / "model.onnx").write_bytes(b"")
-    return tmp_path
-
-
-def write_walk_script(d, body):
-    (d / "v2_rl_walk_mujoco.py").write_text(body)
-
-
-def wait_for_walk_ended(captured, count=1, timeout=5.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        ended = [e for e in captured if e["event"] == "walk_ended"]
-        if len(ended) >= count:
-            return ended
-        time.sleep(0.02)
-    raise AssertionError(f"walk_ended x{count} not captured within {timeout}s")
+from conftest import wait_for_walk_ended, write_walk_script
 
 
 def test_clean_stop_is_not_a_crash(client, captured, fake_walk_dir):
@@ -54,6 +28,20 @@ def test_crashing_walk_is_labeled_crashed(client, captured, fake_walk_dir):
     assert ended["exit_code"] == 1
     assert ended["crashed"] is True
     assert ended["stop_requested"] is False
+
+
+def test_oom_style_sigkill_is_labeled_crashed(client, captured, fake_walk_dir):
+    """The kernel OOM killer SIGKILLs the walk on a 512MB Pi — by far the most
+    likely real crash mode. An unrequested kill must count as crashed."""
+    write_walk_script(fake_walk_dir, "import time; time.sleep(30)\n")
+    r = client.post("/api/walk/start", json={})
+    assert r.status_code == 200
+    os.kill(r.json()["pid"], signal.SIGKILL)
+
+    ended = wait_for_walk_ended(captured)[0]["properties"]
+    assert ended["exit_code"] == -signal.SIGKILL
+    assert ended["stop_requested"] is False
+    assert ended["crashed"] is True
 
 
 def test_stop_a_then_start_b_does_not_mislabel_a(client, captured, fake_walk_dir):
@@ -80,6 +68,25 @@ def test_stop_a_then_start_b_does_not_mislabel_a(client, captured, fake_walk_dir
     assert all(e["properties"]["crashed"] is False for e in ended)
 
 
+def test_sigterm_ignoring_walk_is_escalated_to_kill(client, captured, fake_walk_dir):
+    """A hung walk script that ignores SIGTERM gets SIGKILLed after the 5s
+    grace period — and still counts as a requested stop, not a crash."""
+    write_walk_script(
+        fake_walk_dir,
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(60)\n",
+    )
+    assert client.post("/api/walk/start", json={}).status_code == 200
+    time.sleep(0.5)  # let the script install its SIGTERM handler
+    client.post("/api/walk/stop")  # terminate -> wait(5) times out -> kill
+
+    ended = wait_for_walk_ended(captured, timeout=15)[0]["properties"]
+    assert ended["stop_requested"] is True
+    assert ended["crashed"] is False
+    assert ended["exit_code"] == -signal.SIGKILL
+
+
 def test_idempotent_restart_same_token_no_new_walk(client, captured, fake_walk_dir):
     write_walk_script(fake_walk_dir, "import time; time.sleep(30)\n")
     client.post("/api/walk/start", json={"sessionToken": "same"})
@@ -95,3 +102,33 @@ def test_idempotent_restart_same_token_no_new_walk(client, captured, fake_walk_d
 
     client.post("/api/walk/stop")
     wait_for_walk_ended(captured)
+
+
+def test_stop_only_clears_its_own_session(fake_walk_dir, captured, client):
+    """stop_walk_process must not null out a NEWER session installed while it
+    was stopping the old one (orphaned-walk guard)."""
+    write_walk_script(fake_walk_dir, "import time; time.sleep(30)\n")
+    assert client.post("/api/walk/start", json={}).status_code == 200
+    old_session = tnkr_server.walk_session
+    # Simulate the interleaving directly: a new session appears mid-stop.
+    import subprocess, sys as _sys
+
+    new_proc = subprocess.Popen([_sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        new_session = tnkr_server.WalkSession(
+            proc=new_proc, session_token=None, cloud_streaming=False,
+            started_at=time.monotonic(),
+        )
+        old_session.stop_requested = True
+        old_session.proc.terminate()
+        old_session.proc.wait(timeout=10)
+        tnkr_server.walk_session = new_session
+        # Old stop path finishing must NOT clear the new session.
+        with tnkr_server._walk_lock:
+            if tnkr_server.walk_session is old_session:
+                tnkr_server.walk_session = None
+        assert tnkr_server.walk_session is new_session
+    finally:
+        new_proc.kill()
+        new_proc.wait()
+        tnkr_server.walk_session = None

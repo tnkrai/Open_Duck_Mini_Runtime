@@ -37,6 +37,8 @@ SWAP_SIZE_MB=2048
 TELEMETRY_FILE="$HOME/.tnkr-telemetry.json"
 POSTHOG_KEY="phc_FarYZWwIbyZFV2iUKyl8WyRRdFFuw2MH3NZat4zPmEK"
 POSTHOG_HOST="https://us.i.posthog.com"
+TELEMETRY_PROMPT_TIMEOUT_S=15
+TELEMETRY_CURL_MAX_TIME_S=3
 
 # ── Colors & Symbols ─────────────────────────────────────────────────────────
 
@@ -61,7 +63,9 @@ ORIGINAL_SWAP_SIZE=""
 SWAP_EXPANDED=false
 TEST_MODE=false
 CLEAN_INSTALL=false
-SETUP_START=$(date +%s)
+# Durations use bash's $SECONDS (seconds since shell start), not wall-clock:
+# the Pi has no RTC, so NTP jumping the clock mid-install would otherwise
+# produce negative or absurd durations.
 
 # Telemetry state (set by telemetry_init; referenced by the EXIT trap, so
 # initialized here for `set -u` safety)
@@ -122,7 +126,7 @@ telemetry_init() {
         printf "  ${DIM}────────────────────────────────────────${RESET}\n"
         if [ "$TTY_OUT" = "/dev/tty" ]; then
             local ans=""
-            read -r -t 15 -p "  Press Enter to continue, or type 'n' to opt out: " ans < /dev/tty || true
+            read -r -t "$TELEMETRY_PROMPT_TIMEOUT_S" -p "  Press Enter to continue, or type 'n' to opt out: " ans < /dev/tty || true
             echo ""
             case "$ans" in
                 n|N|no|NO) TELEMETRY_ENABLED="false"; info "Telemetry disabled" ;;
@@ -130,11 +134,14 @@ telemetry_init() {
         fi
     fi
 
-    # Env var is a hard override in both directions
-    case "${TNKR_TELEMETRY:-}" in
-        0|false|off) TELEMETRY_ENABLED="false" ;;
-        1|true|on)   TELEMETRY_ENABLED="true" ;;
-    esac
+    # Env var is a hard override in both directions. Token set must match
+    # telemetry.py: set-but-empty ("") also disables.
+    if [ -n "${TNKR_TELEMETRY+x}" ]; then
+        case "${TNKR_TELEMETRY,,}" in
+            ""|0|false|off) TELEMETRY_ENABLED="false" ;;
+            *)              TELEMETRY_ENABLED="true" ;;
+        esac
+    fi
 
     # Persist only when the file doesn't exist yet — never clobber user edits
     if [ ! -f "$TELEMETRY_FILE" ] && [ -n "$DEVICE_ID" ]; then
@@ -151,20 +158,29 @@ telemetry_init() {
     fi
 }
 
-# ph_capture <event_name> [<json_props_fragment>]
+# ph_capture <event_name> [<json_props_fragment>] [fg]
 # Fragment example: "step_id":"08_pip_core","step_num":8
+# Runs in the background by default so a blackholed network never slows the
+# install; pass "fg" for events that must be delivered before the script
+# exits (the EXIT trap's failure event and setup_completed).
 ph_capture() {
     [ "$TELEMETRY_ENABLED" = "true" ] || return 0
     [ -n "$DEVICE_ID" ] || return 0
-    local event="$1" props="${2:-}"
-    curl -s --max-time 3 -o /dev/null -X POST "$POSTHOG_HOST/i/v0/e/" \
-        -H 'Content-Type: application/json' \
-        -d "{\"api_key\":\"$POSTHOG_KEY\",\"event\":\"$event\",\"distinct_id\":\"$DEVICE_ID\",\"properties\":{\"source\":\"openduck-runtime\",\"setup_script\":true,\"\$geoip_disable\":true${props:+,$props}}}" \
-        2>/dev/null || true
+    local event="$1" props="${2:-}" mode="${3:-bg}"
+    local payload="{\"api_key\":\"$POSTHOG_KEY\",\"event\":\"$event\",\"distinct_id\":\"$DEVICE_ID\",\"properties\":{\"source\":\"openduck-runtime\",\"setup_script\":true,\"\$geoip_disable\":true${props:+,$props}}}"
+    if [ "$mode" = "fg" ]; then
+        curl -s --max-time "$TELEMETRY_CURL_MAX_TIME_S" -o /dev/null -X POST "$POSTHOG_HOST/i/v0/e/" \
+            -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || true
+    else
+        ( curl -s --max-time "$TELEMETRY_CURL_MAX_TIME_S" -o /dev/null -X POST "$POSTHOG_HOST/i/v0/e/" \
+            -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || true ) &
+    fi
 }
 
 # Hardware props as a JSON fragment — property names are a contract with
 # mini_bdx_runtime/telemetry.py (pi_model, arch, ram_mb, os_release).
+# JSON-escaped via python3 when available (device-tree model / PRETTY_NAME
+# strings with quotes would otherwise silently break the whole payload).
 telemetry_hw_props() {
     local arch model ram_mb os_release
     arch=$(uname -m 2>/dev/null || echo "")
@@ -172,6 +188,14 @@ telemetry_hw_props() {
     [ -f /proc/device-tree/model ] && model=$(tr -d '\0' < /proc/device-tree/model)
     ram_mb=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0) / 1024 ))
     os_release=$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release 2>/dev/null | head -1)
+    if command -v python3 > /dev/null 2>&1; then
+        python3 -c '
+import json, sys
+arch, model, ram, osr = sys.argv[1:5]
+print(",".join(f"{json.dumps(k)}:{json.dumps(v)}" for k, v in
+      [("arch", arch), ("pi_model", model), ("ram_mb", int(ram)), ("os_release", osr)]))
+' "$arch" "$model" "$ram_mb" "$os_release" 2>/dev/null && return 0
+    fi
     printf '"arch":"%s","pi_model":"%s","ram_mb":%s,"os_release":"%s"' \
         "$arch" "$model" "$ram_mb" "$os_release"
 }
@@ -248,11 +272,11 @@ run_step() {
     # to it (set -e aborts mid-step; the trap sends setup_step_failed).
     CURRENT_STEP_NUM="$step_num"
     CURRENT_STEP_ID="$step_id"
-    STEP_START=$(date +%s)
+    STEP_START=$SECONDS
     "$step_func"
     mark_done "$step_id"
     ph_capture setup_step_completed \
-        "\"step_id\":\"$step_id\",\"step_num\":$step_num,\"duration_s\":$(( $(date +%s) - STEP_START ))"
+        "\"step_id\":\"$step_id\",\"step_num\":$step_num,\"duration_s\":$(( SECONDS - STEP_START ))"
     CURRENT_STEP_ID=""
 }
 
@@ -315,18 +339,33 @@ cleanup() {
 
     if [ $exit_code -ne 0 ]; then
         # Report which step died and why. error_tail = last log lines,
-        # ANSI-stripped, JSON-escaped via python3 (skipped if unavailable).
+        # ANSI-stripped, home-paths/username redacted (privacy contract:
+        # usernames are never sent), JSON-escaped via python3 (skipped if
+        # unavailable). Ctrl-C/SIGTERM are tagged so dashboards can separate
+        # interruptions from real failures.
         if [ -n "$CURRENT_STEP_ID" ]; then
-            local fail_duration tail_json
-            fail_duration=$(( $(date +%s) - ${STEP_START:-$(date +%s)} ))
+            local fail_duration tail_json interrupted
+            fail_duration=$(( SECONDS - ${STEP_START:-$SECONDS} ))
+            interrupted=false
+            case "$exit_code" in 130|143) interrupted=true ;; esac
             tail_json="null"
             if command -v python3 > /dev/null 2>&1 && [ -f "$LOG_FILE" ]; then
+                sleep 0.2; sync 2>/dev/null || true  # let tee drain the pipe
+                # Redact home paths; redact the username only when it's >= 4
+                # chars — substituting "pi" would garble "pip install" in the
+                # very error text this event exists to carry.
+                local scrub_expr scrub_user
+                scrub_expr="s|$HOME|~|g; s|/home/[^/ \"']*|/home/<user>|g"
+                scrub_user=$(whoami)
+                [ "${#scrub_user}" -ge 4 ] && scrub_expr="$scrub_expr; s|$scrub_user|<user>|g"
                 tail_json=$(tail -n 20 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    sed "$scrub_expr" | \
                     python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[-2000:]))' \
                     2>/dev/null || echo "null")
             fi
             ph_capture setup_step_failed \
-                "\"step_id\":\"$CURRENT_STEP_ID\",\"step_num\":${CURRENT_STEP_NUM:-0},\"exit_code\":$exit_code,\"duration_s\":$fail_duration,\"error_tail\":$tail_json"
+                "\"step_id\":\"$CURRENT_STEP_ID\",\"step_num\":${CURRENT_STEP_NUM:-0},\"exit_code\":$exit_code,\"interrupted\":$interrupted,\"duration_s\":$fail_duration,\"error_tail\":$tail_json" \
+                fg
         fi
         echo ""
         printf "  ${RED}Setup interrupted or failed.${RESET}\n"
@@ -830,7 +869,7 @@ LOGO
 
     # ── Done ──────────────────────────────────────────────────────────────
     ph_capture setup_completed \
-        "\"total_duration_s\":$(( $(date +%s) - SETUP_START )),\"clean_install\":$CLEAN_INSTALL"
+        "\"total_duration_s\":$SECONDS,\"clean_install\":$CLEAN_INSTALL" fg
     print_success
 }
 

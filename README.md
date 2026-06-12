@@ -195,11 +195,16 @@ RAM, OS, Python version, servo USB adapter chip: CH343 vs FTDI).
 credentials, hostnames, usernames, or location (GeoIP is disabled). The device
 is identified only by a random UUID generated on first install.
 
-**How to opt out** (either works, any time):
+**How to opt out** (any time):
 
-- Set the environment variable `TNKR_TELEMETRY=0` (e.g. uncomment the
-  `Environment=` line in `/etc/systemd/system/tnkr-robot.service`), or
-- Edit `~/.tnkr-telemetry.json` and set `"enabled": false`.
+- Edit `~/.tnkr-telemetry.json` and set `"enabled": false` — the durable
+  opt-out: it covers both the server and the setup script and survives
+  reinstalls (including `setup.sh --clean`).
+- Alternatively, set the environment variable `TNKR_TELEMETRY=0` (e.g.
+  uncomment the `Environment=` line in
+  `/etc/systemd/system/tnkr-robot.service`). Note: re-running `setup.sh`
+  regenerates that service file, so prefer the JSON file for a permanent
+  opt-out.
 
 The setup script shows a notice (with an opt-out prompt when run
 interactively) before sending anything. `~/.tnkr-telemetry.json` survives

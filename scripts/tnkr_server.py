@@ -9,7 +9,6 @@ Telemetry is streamed via Supabase Realtime broadcast channels.
 import json
 import os
 import platform
-import signal
 import subprocess
 import sys
 import time
@@ -21,9 +20,14 @@ from pathlib import Path
 from threading import Thread, Lock
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.exception_handlers import http_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import anyio
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -41,9 +45,10 @@ HOME_DIR = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME_DIR, "duck_config.json")
 SCRIPTS_DIR = Path(__file__).parent
 SERVER_PORT = 8000
-# None -> HWI.find_servo_port() auto-detects the servo adapter by USB vendor id
-# (CH343/FTDI), so the same code runs on any robot regardless of which
-# /dev/ttyACMx it enumerates as, the cable, or the adapter's serial number.
+# None -> HWI auto-detects the servo adapter by USB vendor id via
+# find_servo_adapter() (CH343/FTDI), so the same code runs on any robot
+# regardless of which /dev/ttyACMx it enumerates as, the cable, or the
+# adapter's serial number.
 USB_PORT = None
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -65,6 +70,10 @@ class WalkSession:
 
 
 walk_session: WalkSession | None = None
+# Serializes walk start/stop. Without it, a stop from one browser tab can
+# block in proc.wait() while a start from another tab installs a NEW session,
+# which the stop then clobbers — orphaning a walk that holds the servo port.
+_walk_lock = Lock()
 
 
 def get_hwi() -> HWI:
@@ -127,11 +136,18 @@ _command_file_lock = Lock()
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
+def _locked_stop_walk():
+    with _walk_lock:
+        stop_walk_process()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     release_hwi()
-    stop_walk_process()
+    # Off the event loop: stopping a SIGTERM-ignoring walk can block ~5s in
+    # proc.wait(), which must not freeze in-flight responses during shutdown.
+    await anyio.to_thread.run_sync(_locked_stop_walk)
 
 
 app = FastAPI(title="TNKR Robot Server", lifespan=lifespan)
@@ -169,6 +185,9 @@ TELEMETRY_EXCLUDED_PATHS = {
 }
 
 
+ERROR_MESSAGE_MAX_LEN = 500
+
+
 def add_telemetry_props(**props):
     """Attach properties to the telemetry event for the current request.
 
@@ -180,6 +199,13 @@ def add_telemetry_props(**props):
     d = _request_props.get()
     if d is not None:
         d.update(props)
+
+
+def _stash_error(exc: BaseException, error_type: str | None = None):
+    add_telemetry_props(
+        error_type=error_type or type(exc).__name__,
+        error_message=str(getattr(exc, "detail", None) or exc)[:ERROR_MESSAGE_MAX_LEN],
+    )
 
 
 class TelemetryMiddleware(BaseHTTPMiddleware):
@@ -196,42 +222,62 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         token = _request_props.set({})
         start = time.monotonic()
         status = 500
+        skip_capture = False
         try:
             response = await call_next(request)
             status = response.status_code
+            # 404/405 on a path that matched no route = LAN noise (port
+            # scanners, stray apps), not a robot failure. Don't burn events.
+            if status in (404, 405) and "route" not in request.scope:
+                skip_capture = True
             return response
         except Exception as e:
             # Safety net — exception handlers normally convert before this.
-            add_telemetry_props(
-                error_type=type(e).__name__, error_message=str(e)[:500]
-            )
+            _stash_error(e)
+            raise
+        except BaseException:
+            # Cancellation (client disconnected, server shutting down) is not
+            # an API failure — capturing it would fabricate phantom 500s.
+            skip_capture = True
             raise
         finally:
-            props = {
-                "endpoint": request.url.path,
-                "method": request.method,
-                "status_code": status,
-                "duration_ms": round((time.monotonic() - start) * 1000, 1),
-                **(_request_props.get() or {}),
-            }
-            telemetry.capture(
-                "api_request_completed" if status < 400 else "api_request_failed",
-                props,
-            )
+            if not skip_capture:
+                props = {
+                    "endpoint": request.url.path,
+                    "method": request.method,
+                    "status_code": status,
+                    "duration_ms": round((time.monotonic() - start) * 1000, 1),
+                    **(_request_props.get() or {}),
+                }
+                telemetry.capture(
+                    "api_request_completed" if status < 400 else "api_request_failed",
+                    props,
+                )
             _request_props.reset(token)
 
 
 @app.exception_handler(StarletteHTTPException)
 async def _telemetry_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    add_telemetry_props(
-        error_type="HTTPException", error_message=str(exc.detail)[:500]
-    )
+    _stash_error(exc, error_type="HTTPException")
     return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def _telemetry_validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Field paths only — never the submitted values (they could hold tokens).
+    locs = "; ".join(
+        ".".join(str(p) for p in err.get("loc", [])) for err in exc.errors()[:10]
+    )
+    add_telemetry_props(
+        error_type="RequestValidationError",
+        error_message=locs[:ERROR_MESSAGE_MAX_LEN],
+    )
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.exception_handler(Exception)
 async def _telemetry_unhandled_exception_handler(request: Request, exc: Exception):
-    add_telemetry_props(error_type=type(exc).__name__, error_message=str(exc)[:500])
+    _stash_error(exc)
     traceback.print_exception(type(exc), exc, exc.__traceback__)
     # Generic body on purpose: the rich error goes to telemetry, not to every
     # browser on the LAN (CORS here is wide open).
@@ -512,17 +558,21 @@ imu_calib_status: dict = {
     "error": None,
     "offsets": None,
 }
+# Serializes the running-check + rebind + spawn in /start (two concurrent
+# starts would otherwise race past the check and spawn two I2C workers).
+_imu_lock = Lock()
 
 
-def _imu_calibrate_worker():
+def _imu_calibrate_worker(status: dict):
     """Run IMU calibration in a background thread.
 
     Telemetry is captured here (not in the start/stop endpoints) because the
     worker runs exactly once per calibration, so each outcome — completed,
-    failed, or user-stopped — produces exactly one event.
+    failed, or user-stopped — produces exactly one event. The worker loops on
+    the `status` dict it was HANDED, not the module global: /start rebinds the
+    global to a fresh dict, and reading the global here would let a stopped
+    worker latch onto the next run's dict (two workers, duplicate events).
     """
-    global imu_calib_status
-
     started = time.monotonic()
     try:
         import adafruit_bno055
@@ -535,11 +585,11 @@ def _imu_calibrate_worker():
         imu.mode = adafruit_bno055.NDOF_MODE
 
         # Poll until calibrated or stopped
-        while imu_calib_status["running"]:
-            status = imu.calibration_status  # (sys, gyro, accel, mag)
+        while status["running"]:
+            cal_status = imu.calibration_status  # (sys, gyro, accel, mag)
             calibrated = imu.calibrated
-            imu_calib_status["calibration_status"] = list(status)
-            imu_calib_status["calibrated"] = calibrated
+            status["calibration_status"] = list(cal_status)
+            status["calibrated"] = calibrated
 
             if calibrated:
                 offsets = {
@@ -547,7 +597,7 @@ def _imu_calibrate_worker():
                     "offsets_gyroscope": imu.offsets_gyroscope,
                     "offsets_magnetometer": imu.offsets_magnetometer,
                 }
-                imu_calib_status["offsets"] = {
+                status["offsets"] = {
                     k: list(v) for k, v in offsets.items()
                 }
 
@@ -555,7 +605,7 @@ def _imu_calibrate_worker():
                 pkl_path = str(SCRIPTS_DIR / "imu_calib_data.pkl")
                 pickle.dump(offsets, open(pkl_path, "wb"))
 
-                imu_calib_status["running"] = False
+                status["running"] = False
                 telemetry.capture(
                     "imu_calibration_completed",
                     {"duration_s": round(time.monotonic() - started, 1)},
@@ -570,13 +620,13 @@ def _imu_calibrate_worker():
             "imu_calibration_stopped",
             {
                 "duration_s": round(time.monotonic() - started, 1),
-                "calibration_status": imu_calib_status["calibration_status"],
+                "calibration_status": status["calibration_status"],
             },
         )
 
     except Exception as e:
-        imu_calib_status["error"] = str(e)
-        imu_calib_status["running"] = False
+        status["error"] = str(e)
+        status["running"] = False
         telemetry.capture(
             "imu_calibration_failed",
             {
@@ -592,19 +642,22 @@ def imu_calibrate_start():
     """Start IMU calibration in a background thread."""
     global imu_calib_thread, imu_calib_status
 
-    if imu_calib_status["running"]:
-        return {"success": True, "message": "Calibration already running"}
+    with _imu_lock:
+        if imu_calib_status["running"]:
+            return {"success": True, "message": "Calibration already running"}
 
-    imu_calib_status = {
-        "running": True,
-        "calibration_status": [0, 0, 0, 0],
-        "calibrated": False,
-        "error": None,
-        "offsets": None,
-    }
+        imu_calib_status = {
+            "running": True,
+            "calibration_status": [0, 0, 0, 0],
+            "calibrated": False,
+            "error": None,
+            "offsets": None,
+        }
 
-    imu_calib_thread = Thread(target=_imu_calibrate_worker, daemon=True)
-    imu_calib_thread.start()
+        imu_calib_thread = Thread(
+            target=_imu_calibrate_worker, args=(imu_calib_status,), daemon=True
+        )
+        imu_calib_thread.start()
 
     return {"success": True}
 
@@ -657,10 +710,11 @@ def update_config(config: DuckConfigModel):
     # Reload HWI with new config
     release_hwi()
 
+    # Keys only (capped) — the dict is open-typed, so never forward values.
     add_telemetry_props(
         expression_features_enabled=[
-            k for k, v in config.expression_features.items() if v
-        ]
+            str(k)[:50] for k, v in config.expression_features.items() if v
+        ][:20]
     )
     return {"success": True}
 
@@ -668,6 +722,7 @@ def update_config(config: DuckConfigModel):
 # ── Walk Control ──────────────────────────────────────────────────────────────
 
 def stop_walk_process():
+    """Stop the current walk. Callers must hold _walk_lock."""
     global walk_session
     session = walk_session
     if session is not None and session.proc.poll() is None:
@@ -679,7 +734,9 @@ def stop_walk_process():
             session.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             session.proc.kill()
-    walk_session = None
+    # Only clear if no newer session was installed meanwhile.
+    if walk_session is session:
+        walk_session = None
 
     # Clean up remote command file
     try:
@@ -691,7 +748,10 @@ def stop_walk_process():
 def _monitor_walk(session: WalkSession):
     """Wait for one walk launch to exit and report how it ended."""
     rc = session.proc.wait()
-    crashed = rc not in (0, -signal.SIGTERM, -signal.SIGKILL) and not session.stop_requested
+    # Any nonzero exit we didn't ask for is a crash — including -SIGKILL,
+    # which is how the kernel OOM killer ends walks on a 512MB Pi. Exempting
+    # signals wholesale would blind the crash-rate dashboard to OOM.
+    crashed = rc != 0 and not session.stop_requested
     telemetry.capture(
         "walk_ended",
         {
@@ -720,6 +780,11 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
     session, so a new browser tab / wizard run isn't silently bound to a
     dead channel from a previous attempt.
     """
+    with _walk_lock:
+        return _walk_start_locked(body)
+
+
+def _walk_start_locked(body: WalkStartRequest):
     global walk_session
 
     if walk_session is not None and walk_session.proc.poll() is None:
@@ -784,9 +849,10 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
 @app.post("/api/walk/stop")
 def walk_stop():
     """Stop the walk script."""
-    was_running = walk_session is not None and walk_session.proc.poll() is None
-    add_telemetry_props(was_running=was_running)
-    stop_walk_process()
+    with _walk_lock:
+        was_running = walk_session is not None and walk_session.proc.poll() is None
+        add_telemetry_props(was_running=was_running)
+        stop_walk_process()
     if not was_running:
         return {"success": True, "message": "Walk was not running"}
     return {"success": True}

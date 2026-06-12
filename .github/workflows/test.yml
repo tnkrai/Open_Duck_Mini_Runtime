@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:
+    branches: [v3]
+  pull_request:
+    branches: [v3]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # rustypot (Rust ext) and the adafruit/board stack need robot hardware;
+      # tests stub them, so install only what the server + telemetry import.
+      - name: Install dependencies
+        run: |
+          pip install "fastapi>=0.115.0" "uvicorn>=0.30.0" "pydantic>=2.0.0" \
+                      "posthog>=3.0" numpy pyserial pytest httpx
+          pip install -e . --no-deps
+      - name: Run pytest
+        run: pytest tests/ -v
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint setup.sh
+        run: |
+          bash -n scripts/setup.sh
+          shellcheck scripts/setup.sh

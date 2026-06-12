@@ -19,6 +19,8 @@ MemoryHigh=256M
 MemoryMax=384M
 # Ensure Python output is visible in journalctl immediately
 Environment=PYTHONUNBUFFERED=1
+# Uncomment to disable anonymous usage telemetry (see README "Telemetry")
+# Environment=TNKR_TELEMETRY=0
 
 [Install]
 WantedBy=multi-user.target

@@ -28,7 +28,7 @@ class RLWalk:
         self,
         onnx_model_path: str,
         duck_config_path: str = f"{HOME_DIR}/duck_config.json",
-        serial_port: str = "/dev/ttyACM0",
+        serial_port: str = None,  # None -> HWI auto-detects the servo adapter by USB vendor id
         control_freq: float = 50,
         pid=[30, 0, 0],
         action_scale=0.25,

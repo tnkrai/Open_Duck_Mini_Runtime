@@ -180,3 +180,32 @@ Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_M
 - left and right triggers to control the left and right antennas
 - LB (new!) press and hold to increase the walking frequency, kind of a sprint mode 🙂
 ```
+## Telemetry
+
+The runtime sends **anonymous usage telemetry** to help us find and fix setup
+and robot failures across the fleet.
+
+**What we collect:** setup step outcomes (success/failure + error text from the
+setup log), API request outcomes from the robot server (endpoint, status,
+duration, failure cause), walk session outcomes (duration, exit code, whether
+joint data was being streamed — as a boolean), and hardware specs (Pi model,
+RAM, OS, Python version, servo USB adapter chip: CH343 vs FTDI).
+
+**What we never collect:** joint/motion data, session tokens, Supabase
+credentials, hostnames, usernames, or location (GeoIP is disabled). The device
+is identified only by a random UUID generated on first install.
+
+**How to opt out** (any time):
+
+- Edit `~/.tnkr-telemetry.json` and set `"enabled": false` — the durable
+  opt-out: it covers both the server and the setup script and survives
+  reinstalls (including `setup.sh --clean`).
+- Alternatively, set the environment variable `TNKR_TELEMETRY=0` (e.g.
+  uncomment the `Environment=` line in
+  `/etc/systemd/system/tnkr-robot.service`). Note: re-running `setup.sh`
+  regenerates that service file, so prefer the JSON file for a permanent
+  opt-out.
+
+The setup script shows a notice (with an opt-out prompt when run
+interactively) before sending anything. `~/.tnkr-telemetry.json` survives
+`setup.sh --clean` so reinstalls keep the same anonymous id.

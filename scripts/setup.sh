@@ -613,7 +613,6 @@ do_pip_core() {
             "numpy>=1.26.4" \
             "onnxruntime>=1.18.1" \
             "adafruit-circuitpython-bno055>=5.4.13" \
-            "lgpio>=0.2.2.0" \
             "supabase>=2.0.0" \
             "websockets>=12.0" \
             "fastapi>=0.115.0" \
@@ -621,6 +620,21 @@ do_pip_core() {
             "pydantic>=2.0.0" \
             "posthog>=3.0" \
             "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215"
+
+        # lgpio gets a dedicated install. On Raspberry Pi OS Trixie the system
+        # Python is 3.13 and 64-bit images are aarch64: piwheels publishes no
+        # aarch64 wheels, and lgpio's PyPI sdist (0.2.2.0) does not compile on
+        # Python 3.13 even with swig + build-essential present (Adafruit_Blinka
+        # #974). Adafruit ships prebuilt, statically-linked lgpio wheels for
+        # cp313/cp314 aarch64; point pip at their index so it grabs the matching
+        # wheel. --prefer-binary keeps that wheel ahead of the sdist, and for any
+        # target the index does not cover (32-bit armhf, Python 3.11/3.12) pip
+        # falls back to PyPI and builds from source with the toolchain above.
+        # The find-links URL is the index.html, NOT the bare wheels/ directory —
+        # the directory URL redirects to GitHub's HTML file browser, which pip
+        # cannot scrape for wheel links.
+        pip_install --no-cache-dir --prefer-binary "lgpio>=0.2.2.0" \
+            --find-links https://github.com/adafruit/lgpio-python-wheels/raw/main/wheels/index.html
 
         "$INSTALL_DIR/.venv/bin/python" -c \
             "import numpy; import onnxruntime; import fastapi; import lgpio; import supabase; import posthog; print('Core packages verified')" \

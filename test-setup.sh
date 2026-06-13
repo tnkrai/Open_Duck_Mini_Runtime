@@ -56,20 +56,22 @@ test_syntax() {
 
 # ── Test: C build toolchain present ───────────────────────────────────────────
 # Regression guard for the lgpio wheel-build failure: when piwheels has no
-# matching binary wheel, pip falls back to compiling lgpio (and rustypot) from
-# source, which needs gcc/make (build-essential) and Python.h (python3-dev).
-# Without them, setup dies at step 8 with "failed-wheel-build-for-install".
+# matching binary wheel (e.g. Python 3.13 / cp313), pip falls back to compiling
+# lgpio (and rustypot) from source. That needs gcc/make (build-essential),
+# Python.h (python3-dev), and swig (lgpio's sdist runs swig at build time to
+# generate lgpio_wrap.c). Without them, setup dies at step 8 with
+# "failed-wheel-build-for-install".
 
 test_build_deps() {
     header "Test: apt list includes C build toolchain"
     local apt_block
     apt_block="$(sed -n '/apt-get install/,/2>&1/p' "$SCRIPT_DIR/scripts/setup.sh")"
     local missing=""
-    for pkg in build-essential python3-dev; do
+    for pkg in build-essential python3-dev swig; do
         echo "$apt_block" | grep -q "$pkg" || missing="$missing $pkg"
     done
     if [ -z "$missing" ]; then
-        pass "build-essential and python3-dev are installed via apt"
+        pass "build-essential, python3-dev and swig are installed via apt"
     else
         fail "missing build deps in apt install:$missing (lgpio source build will fail)"
     fi

@@ -358,9 +358,9 @@ cleanup() {
                 scrub_expr="s|$HOME|~|g; s|/home/[^/ \"']*|/home/<user>|g"
                 scrub_user=$(whoami)
                 [ "${#scrub_user}" -ge 4 ] && scrub_expr="$scrub_expr; s|$scrub_user|<user>|g"
-                tail_json=$(tail -n 20 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*m//g' | \
+                tail_json=$(tail -n 80 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*m//g' | \
                     sed "$scrub_expr" | \
-                    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[-2000:]))' \
+                    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[-6000:]))' \
                     2>/dev/null || echo "null")
             fi
             ph_capture setup_step_failed \
@@ -435,10 +435,10 @@ do_system_deps() {
 
     start_spinner "Installing system packages..."
     sudo apt-get install -y -qq \
-        git python3-pip python3-venv cargo \
+        git python3-pip python3-venv python3-dev build-essential cargo \
         libsdl2-dev libsdl2-mixer-dev libsdl2-image-dev libsdl2-ttf-dev \
         > /dev/null 2>&1
-    stop_spinner true "System packages installed (git, python3, cargo, SDL2)"
+    stop_spinner true "System packages installed (git, python3, build tools, cargo, SDL2)"
 }
 
 # ── Step 3: Enable I2C ───────────────────────────────────────────────────────
@@ -572,6 +572,19 @@ setup_pip_env() {
     fi
 }
 
+# Run `pip install` with FULL output captured to LOG_FILE while showing only a
+# short tail on the console. The setup_step_failed telemetry reads error_tail
+# from LOG_FILE, so the old `... 2>&1 | tail -5` truncated build output before it
+# reached the log — PostHog (and the on-disk log) only ever saw pip's final
+# summary, never the actual compiler error. Writing the full build log to disk
+# fixes both local debugging and telemetry. Exit code is preserved for `set -e`.
+pip_install() {
+    local rc=0
+    "$PIP" install "$@" >> "$LOG_FILE" 2>&1 || rc=$?
+    tail -n 8 "$LOG_FILE"
+    return "$rc"
+}
+
 PIP=""  # set once in main after venv step
 
 # ── Step 8: Core pip packages ────────────────────────────────────────────────
@@ -583,21 +596,20 @@ do_pip_core() {
 
     if [ "$TEST_MODE" = "true" ]; then
         # Test mode: skip hardware-specific packages that can't install in Docker
-        "$PIP" install --no-cache-dir --prefer-binary \
+        pip_install --no-cache-dir --prefer-binary \
             "numpy>=1.26.4" \
             "websockets>=12.0" \
             "fastapi>=0.115.0" \
             "uvicorn>=0.30.0" \
             "pydantic>=2.0.0" \
-            "posthog>=3.0" \
-            2>&1 | tail -5
+            "posthog>=3.0"
 
         "$INSTALL_DIR/.venv/bin/python" -c \
             "import numpy; import fastapi; import posthog; print('Core packages verified (test mode)')" \
             || die "Core package verification failed — check log at $LOG_FILE"
     else
-        # Install packages directly — NO pipe, so errors are visible and exit code works
-        "$PIP" install --no-cache-dir --prefer-binary \
+        # Full build output goes to LOG_FILE (see pip_install); console stays short.
+        pip_install --no-cache-dir --prefer-binary \
             "numpy>=1.26.4" \
             "onnxruntime>=1.18.1" \
             "adafruit-circuitpython-bno055>=5.4.13" \
@@ -608,8 +620,7 @@ do_pip_core() {
             "uvicorn>=0.30.0" \
             "pydantic>=2.0.0" \
             "posthog>=3.0" \
-            "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215" \
-            2>&1 | tail -5
+            "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215"
 
         "$INSTALL_DIR/.venv/bin/python" -c \
             "import numpy; import onnxruntime; import fastapi; import lgpio; import supabase; import posthog; print('Core packages verified')" \
@@ -635,7 +646,7 @@ do_pip_rustypot() {
     printf "  ${DIM}The script is safe to interrupt and resume.${RESET}\n"
     echo ""
 
-    CARGO_BUILD_JOBS=1 "$PIP" install --no-cache-dir "rustypot==0.1.0" 2>&1 | tail -20
+    CARGO_BUILD_JOBS=1 pip_install --no-cache-dir "rustypot==0.1.0"
 
     # Verify
     "$INSTALL_DIR/.venv/bin/python" -c "import rustypot; print('rustypot verified')" \
@@ -651,29 +662,25 @@ do_pip_optional() {
 
     if [ "$TEST_MODE" = "true" ]; then
         echo "  ${DIM}Installing optional packages (test mode — lightweight only)...${RESET}"
-        "$PIP" install --no-cache-dir --prefer-binary \
+        pip_install --no-cache-dir --prefer-binary \
             "openai>=1.70.0" \
-            2>&1 | tail -5 || {
-            warn "Some optional packages failed"
-        }
+            || warn "Some optional packages failed"
     else
         echo "  ${DIM}Installing optional packages (non-fatal if they fail)...${RESET}"
 
         # scipy — only needed by imu.py (not raw_imu.py which the walk script uses)
         # pygame — only needed for Xbox controller (not remote mode from dashboard)
         # openai — not used by walk script or server currently
-        "$PIP" install --no-cache-dir --prefer-binary \
+        pip_install --no-cache-dir --prefer-binary \
             "scipy>=1.15.1" \
             "pygame>=2.6.0" \
             "openai>=1.70.0" \
-            2>&1 | tail -10 || {
-            warn "Some optional packages failed — robot will still work in remote mode"
-        }
+            || warn "Some optional packages failed — robot will still work in remote mode"
     fi
 
     # Install the project itself in editable mode (deps already handled above)
     cd "$INSTALL_DIR"
-    "$PIP" install --no-cache-dir --no-deps -e . 2>&1 | tail -5
+    pip_install --no-cache-dir --no-deps -e .
 
     info "Package installation complete"
 

@@ -54,6 +54,27 @@ test_syntax() {
     fi
 }
 
+# ── Test: C build toolchain present ───────────────────────────────────────────
+# Regression guard for the lgpio wheel-build failure: when piwheels has no
+# matching binary wheel, pip falls back to compiling lgpio (and rustypot) from
+# source, which needs gcc/make (build-essential) and Python.h (python3-dev).
+# Without them, setup dies at step 8 with "failed-wheel-build-for-install".
+
+test_build_deps() {
+    header "Test: apt list includes C build toolchain"
+    local apt_block
+    apt_block="$(sed -n '/apt-get install/,/2>&1/p' "$SCRIPT_DIR/scripts/setup.sh")"
+    local missing=""
+    for pkg in build-essential python3-dev; do
+        echo "$apt_block" | grep -q "$pkg" || missing="$missing $pkg"
+    done
+    if [ -z "$missing" ]; then
+        pass "build-essential and python3-dev are installed via apt"
+    else
+        fail "missing build deps in apt install:$missing (lgpio source build will fail)"
+    fi
+}
+
 # ── Test: Docker build ────────────────────────────────────────────────────────
 
 test_build() {
@@ -99,6 +120,7 @@ test_clean() {
 run_all() {
     test_shellcheck
     test_syntax
+    test_build_deps
     test_build || return 1
     test_idempotency
     test_clean
@@ -107,11 +129,12 @@ run_all() {
 case "${1:-all}" in
     syntax)     test_syntax ;;
     shellcheck) test_shellcheck ;;
+    builddeps)  test_build_deps ;;
     build)      test_build ;;
     idempotent) test_build && test_idempotency ;;
     clean)      test_build && test_clean ;;
     all)        run_all ;;
-    *)          echo "Usage: bash test-setup.sh [syntax|shellcheck|build|idempotent|clean|all]" ;;
+    *)          echo "Usage: bash test-setup.sh [syntax|shellcheck|builddeps|build|idempotent|clean|all]" ;;
 esac
 
 echo ""

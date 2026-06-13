@@ -429,8 +429,14 @@ do_preflight() {
 # ── Step 2: System dependencies ──────────────────────────────────────────────
 
 do_system_deps() {
+    # This step always re-runs (run_step ... true) so that changes to the
+    # package list below actually get installed when a user re-runs setup.sh —
+    # otherwise the step is marked done and skipped, and new deps (e.g. swig,
+    # added for lgpio's source build) silently never install. apt is idempotent
+    # and fast when everything is already present. update is non-fatal so a
+    # transient mirror hiccup on a re-run doesn't block resuming later steps.
     start_spinner "Updating package lists..."
-    sudo apt-get update -qq > /dev/null 2>&1
+    sudo apt-get update -qq > /dev/null 2>&1 || true
     stop_spinner true "Package lists updated"
 
     start_spinner "Installing system packages..."
@@ -858,7 +864,7 @@ LOGO
     # ── Run steps ─────────────────────────────────────────────────────────
 
     run_step  1 "01_preflight"    "Pre-flight checks"                      do_preflight
-    run_step  2 "02_system_deps"  "System dependencies"                    do_system_deps
+    run_step  2 "02_system_deps"  "System dependencies"                    do_system_deps  true
     run_step  3 "03_i2c"          "Hardware interfaces (I2C)"              do_i2c
     run_step  4 "04_usb_latency"  "Motor communication (USB latency)"      do_usb_latency
     run_step  5 "05_swap"         "Expand swap for compilation"            do_swap

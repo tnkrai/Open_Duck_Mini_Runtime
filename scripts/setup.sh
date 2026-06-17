@@ -439,12 +439,13 @@ do_system_deps() {
     sudo apt-get update -qq > /dev/null 2>&1 || true
     stop_spinner true "Package lists updated"
 
-    start_spinner "Installing system packages..."
+start_spinner "Installing system packages..."
     sudo apt-get install -y -qq \
         git python3-pip python3-venv python3-dev build-essential swig cargo \
+        liblgpio-dev \
         libsdl2-dev libsdl2-mixer-dev libsdl2-image-dev libsdl2-ttf-dev \
         > /dev/null 2>&1
-    stop_spinner true "System packages installed (git, python3, build tools, swig, cargo, SDL2)"
+    stop_spinner true "System packages installed (git, python3, build tools, swig, cargo, SDL2, lgpio)"
 }
 
 # ── Step 3: Enable I2C ───────────────────────────────────────────────────────

@@ -191,6 +191,7 @@ class Imu:
                 raw_accelero = self.imu.acceleration
             except Exception as e:
                 print("[IMU]:", e)
+                time.sleep(0.1)
                 continue
 
             # Skip this reading if the sensor returned None for any axis

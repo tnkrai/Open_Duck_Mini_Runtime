@@ -30,6 +30,7 @@ import uvicorn
 
 from mini_bdx_runtime.rustypot_position_hwi import HWI
 from mini_bdx_runtime.duck_config import DuckConfig
+from mini_bdx_runtime import telemetry
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -64,7 +65,10 @@ JOINTS = {
 hwi_instance: HWI | None = None
 walk_process: subprocess.Popen | None = None
 current_session_token: str | None = None
+last_walk_exit_code: int | None = None  # non-zero surfaces a crashed walk to clients
 rehome_io = None  # pypot FeetechSTS3215IO while a rehoming session is open
+state_imu = None  # raw_imu.Imu singleton for idle /api/state reads (BNO055, I2C)
+last_state_joints: dict[str, float] = {}  # last-read pose, served while hardware is owned elsewhere
 
 
 def get_hwi() -> HWI:
@@ -89,6 +93,56 @@ def release_hwi():
         except Exception:
             pass
         hwi_instance = None
+
+
+def is_walking() -> bool:
+    return walk_process is not None and walk_process.poll() is None
+
+
+def walk_exit_code() -> int | None:
+    """The last walk's exit code — non-zero/None surfaces a crash to clients
+    (never a zombie or a duck stuck mid-gait without anyone knowing)."""
+    global last_walk_exit_code
+    if walk_process is not None and walk_process.poll() is not None:
+        last_walk_exit_code = walk_process.returncode
+    return last_walk_exit_code
+
+
+def refuse_while_walking():
+    if is_walking():
+        raise HTTPException(
+            status_code=409, detail="The walk owns the servo bus — stop it first"
+        )
+
+
+def get_state_imu():
+    """Lazy BNO055 reader for idle /api/state (live joints + orientation).
+
+    Same exclusivity rule as the servo bus: released before the walk spawns
+    (the walk subprocess owns the I2C then; orientation comes from its
+    telemetry snapshot instead). Coexists with the IMU-calibration worker —
+    both only issue read transactions."""
+    global state_imu
+    if state_imu is None:
+        from mini_bdx_runtime.raw_imu import Imu
+
+        upside_down = False
+        try:
+            upside_down = bool(_read_config().get("imu_upside_down", False))
+        except Exception:
+            pass
+        state_imu = Imu(sampling_freq=15, user_pitch_bias=0, upside_down=upside_down)
+    return state_imu
+
+
+def release_state_imu():
+    global state_imu
+    if state_imu is not None:
+        try:
+            state_imu.stop()
+        except Exception:
+            pass
+        state_imu = None
 
 
 # ── Request/Response models ───────────────────────────────────────────────────
@@ -201,7 +255,62 @@ app.add_middleware(
 def health():
     machine = platform.machine()  # 'aarch64' / 'armv7l' on Pi, 'x86_64' / 'arm64' on Mac
     is_pi = machine in ("aarch64", "armv7l")
-    return {"status": "ok", "is_pi": is_pi, "platform": machine}
+    return {
+        "status": "ok",
+        "is_pi": is_pi,
+        "platform": machine,
+        "walking": is_walking(),
+        "walkExitCode": walk_exit_code(),
+    }
+
+
+@app.get("/api/state")
+def read_state():
+    """Live joints (radians) + IMU orientation for the studio's viewer/recorder.
+
+    At idle, read joints off the bus and orientation off the BNO055. While the
+    walk owns the hardware, serve the walk loop's shared-memory snapshot (it
+    reads every joint at 50 Hz for its policy anyway); fall back to the
+    last-known pose if the snapshot is missing or stale — never fight for the
+    port, never serve a dead snapshot as live."""
+    global last_state_joints
+    imu_payload = None
+    if is_walking():
+        snap = telemetry.read_snapshot()
+        if snap and snap.get("joints"):
+            last_state_joints = {
+                n: round(float(p), 4) for n, p in snap["joints"].items()
+            }
+            snap_imu = snap.get("imu") or {}
+            if snap_imu.get("quaternion"):
+                imu_payload = {
+                    "quaternion": snap_imu["quaternion"],
+                    "gyro": snap_imu.get("gyro", []),
+                    "accel": snap_imu.get("accelero", []),
+                }
+    elif rehome_io is None:
+        try:
+            hwi = get_hwi()
+            positions = hwi.get_present_positions()
+            if positions is not None and len(positions) == len(hwi.joints):
+                last_state_joints = {
+                    n: round(float(p), 4)
+                    for n, p in zip(hwi.joints.keys(), positions)
+                }
+        except Exception:
+            pass  # transient read blip → serve the cached pose
+        try:
+            imu_data = get_state_imu().get_data()
+            imu_payload = {
+                "quaternion": [
+                    float(q) for q in imu_data.get("quaternion", [1.0, 0.0, 0.0, 0.0])
+                ],
+                "gyro": [float(g) for g in imu_data["gyro"]],
+                "accel": [float(a) for a in imu_data["accelero"]],
+            }
+        except Exception:
+            pass  # IMU absent/unready → joints still served
+    return {"joints": last_state_joints, "imu": imu_payload, "fps": 0.0}
 
 
 # ── Motor Check ───────────────────────────────────────────────────────────────
@@ -209,6 +318,7 @@ def health():
 @app.post("/api/motors/check")
 def check_motors():
     """Check all 14 motors for responsiveness."""
+    refuse_while_walking()
     try:
         hwi = get_hwi()
     except Exception as e:
@@ -628,6 +738,7 @@ def _stance_offsets(hwi) -> dict[str, float]:
 def stance_start():
     """Begin a stance session with a pristine HWI (offsets reloaded from disk)."""
     global stance_holding
+    refuse_while_walking()
     # Reload so leftovers from other flows (e.g. the deprecated calibration
     # endpoints mutate init_pos) can't leak into the stance session.
     try:
@@ -897,8 +1008,14 @@ def _read_config() -> dict:
 
 
 def _write_config(config: dict):
-    with open(CONFIG_PATH, "w") as f:
+    """Atomic write (temp + rename) with a .bak of the previous version — a
+    power cut mid-write must never cost the calibration in duck_config.json."""
+    if os.path.exists(CONFIG_PATH):
+        shutil.copyfile(CONFIG_PATH, CONFIG_PATH + ".bak")
+    tmp_path = CONFIG_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(config, f, indent=4)
+    os.replace(tmp_path, CONFIG_PATH)
 
 
 @app.get("/api/config")
@@ -927,13 +1044,15 @@ def update_config(config: DuckConfigModel):
 # ── Walk Control ──────────────────────────────────────────────────────────────
 
 def stop_walk_process():
-    global walk_process, current_session_token
+    global walk_process, current_session_token, last_walk_exit_code
     if walk_process is not None and walk_process.poll() is None:
         walk_process.terminate()
         try:
             walk_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             walk_process.kill()
+    if walk_process is not None:
+        last_walk_exit_code = walk_process.returncode
     walk_process = None
     current_session_token = None
 
@@ -942,6 +1061,8 @@ def stop_walk_process():
         os.remove(COMMAND_FILE)
     except FileNotFoundError:
         pass
+    # Same rule as the walk's own shutdown: no dead telemetry snapshots
+    telemetry.clear()
 
 
 class WalkStartRequest(BaseModel):
@@ -973,8 +1094,10 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
             return {"success": True, "message": "Walk is already running"}
         stop_walk_process()
 
-    # Release HWI so the walk script can use the USB port
+    # Release HWI + BNO055 so the walk script owns both buses (serial + I2C);
+    # /api/state serves the walk's telemetry snapshot while it runs
     release_hwi()
+    release_state_imu()
 
     venv_python = sys.executable
     is_pi = platform.machine() in ("aarch64", "armv7l")
@@ -1039,6 +1162,48 @@ def walk_stop():
 
 
 # ── Remote Commands ──────────────────────────────────────────────────────────
+
+# ── Voltage (idle-only battery read) ──────────────────────────────────────────
+
+# Battery health bands for the duck's 2S pack.
+VOLTAGE_LOW = 7.4
+VOLTAGE_CRITICAL = 7.0
+
+
+@app.get("/api/voltage")
+def voltage():
+    """Battery voltage read off the servos via pypot (check_voltage.py's
+    approach — the register reads back decivolts). Idle-only: refused while
+    the walk or a rehoming session owns the bus."""
+    refuse_while_walking()
+    if rehome_io is not None:
+        raise HTTPException(
+            status_code=503,
+            detail="Servo rehoming session in progress — finish it first",
+        )
+    release_hwi()  # pypot needs the port; the next idle op lazily reopens HWI
+    try:
+        from pypot.feetech import FeetechSTS3215IO
+
+        io = FeetechSTS3215IO(USB_PORT, baudrate=1000000)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not open servo bus: {e}")
+    try:
+        raw = io.get_present_voltage(list(JOINTS.values()))
+        per_motor = [round(float(v) * 0.1, 2) for v in raw]  # decivolts → volts
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Voltage read failed: {e}")
+    finally:
+        try:
+            io.close()
+        except Exception:
+            pass
+    volts = round(sum(per_motor) / len(per_motor), 2) if per_motor else 0.0
+    health_band = (
+        "ok" if volts >= VOLTAGE_LOW else ("low" if volts >= VOLTAGE_CRITICAL else "critical")
+    )
+    return {"volts": volts, "perMotor": per_motor, "health": health_band}
+
 
 @app.post("/api/commands")
 def send_commands(req: CommandRequest):

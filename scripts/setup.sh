@@ -639,6 +639,30 @@ LOGO
     printf "  ${BOLD}Open Duck Mini ${DIM}— Robot Setup${RESET}\n"
     printf "  ${DIM}────────────────────────────────────────${RESET}\n"
 
+    # ── Already installed? Fast update path ───────────────────────────────
+    # A finished install re-running this script means "update the duck":
+    # skip the system steps, pull the latest runtime, restart the server.
+    if step_done "12_systemd" && [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
+        PIP="$INSTALL_DIR/.venv/bin/pip"
+        echo ""
+        printf "  ${CYAN}Already set up — updating instead${RESET}\n"
+        printf "  ${DIM}(bash setup.sh --clean for a full reinstall)${RESET}\n"
+        do_clone   # stops the server if running, then git-updates the runtime
+        cd "$INSTALL_DIR"
+        "$PIP" install --no-cache-dir --no-deps -e . 2>&1 | tail -3
+        start_spinner "Restarting server..."
+        sudo systemctl restart "$SERVICE_NAME"
+        sleep 2
+        if systemctl is-active "$SERVICE_NAME" > /dev/null 2>&1; then
+            stop_spinner true "Server restarted"
+            print_success
+        else
+            stop_spinner false "Server failed to restart"
+            die "Check logs: sudo journalctl -u $SERVICE_NAME -n 30"
+        fi
+        return 0
+    fi
+
     # ── Run steps ─────────────────────────────────────────────────────────
 
     run_step  1 "01_preflight"    "Pre-flight checks"                      do_preflight

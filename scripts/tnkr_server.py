@@ -7,6 +7,7 @@ and walk control endpoints.
 Telemetry is streamed via Supabase Realtime broadcast channels.
 """
 
+import glob
 import json
 import os
 import platform
@@ -38,7 +39,28 @@ HOME_DIR = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME_DIR, "duck_config.json")
 SCRIPTS_DIR = Path(__file__).parent
 SERVER_PORT = 8000
-USB_PORT = "/dev/ttyACM0"
+
+
+def _resolve_usb_port(default: str = "/dev/ttyACM0") -> str:
+    """Resolve the servo-bus serial port to a stable path.
+
+    The CH340 USB-serial adapter (VID 1a86) enumerates as /dev/ttyACMx, and the
+    number is NOT stable across reboots/replugs — booting with it as ttyACM1
+    instead of ttyACM0 makes a hardcoded path 503 every motor endpoint. So we
+    prefer the /dev/serial/by-id symlink, which is keyed on the adapter's serial
+    number and never moves. An explicit TNKR_USB_PORT env var overrides
+    everything; if no by-id link is found, fall back to `default`.
+    """
+    env = os.environ.get("TNKR_USB_PORT")
+    if env:
+        return env
+    matches = sorted(glob.glob("/dev/serial/by-id/usb-1a86_USB_Single_Serial_*-if00"))
+    if matches:
+        return matches[0]
+    return default
+
+
+USB_PORT = _resolve_usb_port()
 
 # Joint name -> servo id, same mapping as HWI.joints. Kept as a module
 # constant so the rehoming flow can address servos without opening the

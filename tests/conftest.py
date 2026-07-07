@@ -98,6 +98,9 @@ def client():
 @pytest.fixture
 def fake_walk_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(tnkr_server, "SCRIPTS_DIR", tmp_path)
+    # Pretend to be a Pi so walk_start takes the real walk-script path (the
+    # non-Pi path spawns the mock fake_broadcaster, which needs cloud creds).
+    monkeypatch.setattr(tnkr_server.platform, "machine", lambda: "aarch64")
     (tmp_path / "model.onnx").write_bytes(b"")
     return tmp_path
 

@@ -143,9 +143,18 @@ class Imu:
         self.last_imu_data = {
             "gyro": [0, 0, 0],
             "accelero": [0, 0, 0],
+            "quaternion": [1.0, 0.0, 0.0, 0.0],  # w, x, y, z (identity)
         }
+        # fused orientation for viewers/telemetry; the policy only uses gyro+accel
+        self._last_quat = [1.0, 0.0, 0.0, 0.0]
+        self._stop = False
         self.imu_queue = Queue(maxsize=1)
         Thread(target=self.imu_worker, daemon=True).start()
+
+    def stop(self):
+        """Stop the worker so another owner (the walk subprocess) can have the
+        BNO055's I2C to itself — same exclusivity rule as the servo bus."""
+        self._stop = True
 
     def tare_x(self):
         """Compute a static X-axis accelerometer offset (tare).
@@ -182,7 +191,7 @@ class Imu:
         applies the X-axis tare offset, and pushes the result into a
         single-slot queue for consumption by get_data().
         """
-        while True:
+        while not self._stop:
             s = time.time()
             try:
                 # Read raw tuples first so we can check for None before
@@ -191,6 +200,7 @@ class Imu:
                 raw_accelero = self.imu.acceleration
             except Exception as e:
                 print("[IMU]:", e)
+                time.sleep(0.1)
                 continue
 
             # Skip this reading if the sensor returned None for any axis
@@ -206,9 +216,20 @@ class Imu:
 
             accelero[0] -= self.x_offset
 
+            # Fused quaternion (w, x, y, z) rides along for viewers/telemetry.
+            # A failed read keeps the previous value — never skip the whole
+            # sample over it, the policy's gyro/accel must keep flowing.
+            try:
+                raw_quat = self.imu.quaternion
+                if raw_quat is not None and None not in raw_quat:
+                    self._last_quat = [float(q) for q in raw_quat]
+            except Exception:
+                pass
+
             data = {
                 "gyro": gyro,
                 "accelero": accelero,
+                "quaternion": list(self._last_quat),
             }
 
             self.imu_queue.put(data)

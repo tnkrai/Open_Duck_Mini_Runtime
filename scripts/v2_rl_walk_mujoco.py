@@ -16,7 +16,9 @@ from mini_bdx_runtime.antennas import Antennas
 from mini_bdx_runtime.projector import Projector
 from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
-# StateServer removed — telemetry is now Supabase-only via CloudPublisher
+# StateServer removed — cloud telemetry via CloudPublisher; local telemetry is a
+# one-slot /dev/shm snapshot the server's /api/state reads while we own the bus
+from mini_bdx_runtime import walk_telemetry as local_telemetry
 
 import os
 
@@ -86,6 +88,14 @@ class RLWalk:
             )
 
         self.hwi = HWI(self.duck_config, serial_port)
+
+        # get_obs stashes each tick's raw positions here so the local telemetry
+        # drop costs zero extra bus reads
+        self.telemetry_joint_names = [
+            k for k in self.hwi.joints.keys() if "antenna" not in k
+        ]
+        self.last_dof_pos = None
+        self.last_imu_data = None
 
         self.start()
 
@@ -188,6 +198,10 @@ class RLWalk:
         if len(dof_vel) != self.num_dofs:
             print(f"ERROR len(dof_vel) != {self.num_dofs}")
             return None
+
+        # stash for the local telemetry drop in the run loop — no extra bus reads
+        self.last_dof_pos = dof_pos
+        self.last_imu_data = imu_data
 
         cmds = self.last_commands
 
@@ -361,6 +375,26 @@ class RLWalk:
 
                 self.hwi.set_position_all(action_dict)
 
+                if self.last_dof_pos is not None:
+                    local_telemetry.write_snapshot(
+                        dict(
+                            zip(
+                                self.telemetry_joint_names,
+                                (float(p) for p in self.last_dof_pos),
+                            )
+                        ),
+                        imu={
+                            "quaternion": [
+                                float(q)
+                                for q in self.last_imu_data.get(
+                                    "quaternion", [1.0, 0.0, 0.0, 0.0]
+                                )
+                            ],
+                            "gyro": [float(g) for g in self.last_imu_data["gyro"]],
+                            "accelero": [float(a) for a in self.last_imu_data["accelero"]],
+                        },
+                    )
+
                 if self.cloud_publisher is not None:
                     dof_pos = self.hwi.get_present_positions(
                         ignore=["left_antenna", "right_antenna"]
@@ -407,6 +441,8 @@ class RLWalk:
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
+            # a leftover snapshot from a dead walk must never read as a live pose
+            local_telemetry.clear()
             # Clean up cloud connections
             if self.cloud_command_receiver is not None:
                 self.cloud_command_receiver.stop()

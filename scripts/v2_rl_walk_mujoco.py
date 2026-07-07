@@ -18,7 +18,7 @@ from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
 # StateServer removed — cloud telemetry via CloudPublisher; local telemetry is a
 # one-slot /dev/shm snapshot the server's /api/state reads while we own the bus
-from mini_bdx_runtime import telemetry as local_telemetry
+from mini_bdx_runtime import walk_telemetry as local_telemetry
 
 import os
 
@@ -30,7 +30,7 @@ class RLWalk:
         self,
         onnx_model_path: str,
         duck_config_path: str = f"{HOME_DIR}/duck_config.json",
-        serial_port: str = "/dev/ttyACM0",
+        serial_port: str = None,  # None -> HWI auto-detects the servo adapter by USB vendor id
         control_freq: float = 50,
         pid=[30, 0, 0],
         action_scale=0.25,

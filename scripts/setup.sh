@@ -31,6 +31,15 @@ TOTAL_STEPS=12
 MIN_DISK_MB=2048
 SWAP_SIZE_MB=2048
 
+# Anonymous usage telemetry (see telemetry_init below for the user notice).
+# Key is write-only (can send events, cannot read data). Key/host and the
+# property names must match mini_bdx_runtime/mini_bdx_runtime/telemetry.py.
+TELEMETRY_FILE="$HOME/.tnkr-telemetry.json"
+POSTHOG_KEY="phc_FarYZWwIbyZFV2iUKyl8WyRRdFFuw2MH3NZat4zPmEK"
+POSTHOG_HOST="https://us.i.posthog.com"
+TELEMETRY_PROMPT_TIMEOUT_S=15
+TELEMETRY_CURL_MAX_TIME_S=3
+
 # ── Colors & Symbols ─────────────────────────────────────────────────────────
 
 BOLD='\033[1m'
@@ -53,6 +62,18 @@ SPINNER_PID=""
 ORIGINAL_SWAP_SIZE=""
 SWAP_EXPANDED=false
 TEST_MODE=false
+CLEAN_INSTALL=false
+# Durations use bash's $SECONDS (seconds since shell start), not wall-clock:
+# the Pi has no RTC, so NTP jumping the clock mid-install would otherwise
+# produce negative or absurd durations.
+
+# Telemetry state (set by telemetry_init; referenced by the EXIT trap, so
+# initialized here for `set -u` safety)
+TELEMETRY_ENABLED="false"
+DEVICE_ID=""
+CURRENT_STEP_NUM=""
+CURRENT_STEP_ID=""
+STEP_START=""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,6 +96,108 @@ step_done() {
 
 mark_done() {
     touch "$STATE_DIR/step_${1}.done"
+}
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+#
+# Anonymous, opt-out usage telemetry. Sent via curl because steps 1-7 run
+# before the Python venv exists. Never blocks setup (3s cap, always || true),
+# never sends: motion data, names, hostnames, or location (GeoIP disabled).
+
+telemetry_init() {
+    if [ -f "$TELEMETRY_FILE" ]; then
+        # Existing device: reuse id + respect saved preference. Never re-prompt.
+        DEVICE_ID=$(sed -n 's/.*"device_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TELEMETRY_FILE" | head -1)
+        if grep -q '"enabled"[[:space:]]*:[[:space:]]*false' "$TELEMETRY_FILE"; then
+            TELEMETRY_ENABLED="false"
+        else
+            TELEMETRY_ENABLED="true"
+        fi
+    else
+        DEVICE_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "")
+        TELEMETRY_ENABLED="true"
+        echo ""
+        printf "  ${DIM}────────────────────────────────────────${RESET}\n"
+        printf "  ${BOLD}Anonymous usage telemetry${RESET}\n"
+        printf "  Helps us fix setup and robot failures for everyone.\n"
+        printf "  ${DIM}We collect:${RESET} setup step outcomes, API errors, hardware model.\n"
+        printf "  ${DIM}Never:${RESET} motion/joint data, names, precise location.\n"
+        printf "  ${DIM}Disable any time:${RESET} TNKR_TELEMETRY=0, or \"enabled\": false in %s\n" "$TELEMETRY_FILE"
+        printf "  ${DIM}────────────────────────────────────────${RESET}\n"
+        if [ "$TTY_OUT" = "/dev/tty" ]; then
+            local ans=""
+            read -r -t "$TELEMETRY_PROMPT_TIMEOUT_S" -p "  Press Enter to continue, or type 'n' to opt out: " ans < /dev/tty || true
+            echo ""
+            case "$ans" in
+                n|N|no|NO) TELEMETRY_ENABLED="false"; info "Telemetry disabled" ;;
+            esac
+        fi
+    fi
+
+    # Env var is a hard override in both directions. Token set must match
+    # telemetry.py: set-but-empty ("") also disables.
+    if [ -n "${TNKR_TELEMETRY+x}" ]; then
+        case "${TNKR_TELEMETRY,,}" in
+            ""|0|false|off) TELEMETRY_ENABLED="false" ;;
+            *)              TELEMETRY_ENABLED="true" ;;
+        esac
+    fi
+
+    # Persist only when the file doesn't exist yet — never clobber user edits
+    if [ ! -f "$TELEMETRY_FILE" ] && [ -n "$DEVICE_ID" ]; then
+        printf '{\n  "device_id": "%s",\n  "enabled": %s,\n  "notice_version": 1,\n  "created_at": "%s"\n}\n' \
+            "$DEVICE_ID" "$TELEMETRY_ENABLED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$TELEMETRY_FILE" 2>/dev/null || true
+    fi
+
+    # No uuid source (non-Linux?) — stay silent rather than mislabel devices
+    [ -z "$DEVICE_ID" ] && TELEMETRY_ENABLED="false"
+
+    if [ "$TELEMETRY_ENABLED" = "true" ]; then
+        printf "  ${DOT} Telemetry: enabled ${DIM}(device %.8s…, disable: TNKR_TELEMETRY=0)${RESET}\n" "$DEVICE_ID"
+    fi
+}
+
+# ph_capture <event_name> [<json_props_fragment>] [fg]
+# Fragment example: "step_id":"08_pip_core","step_num":8
+# Runs in the background by default so a blackholed network never slows the
+# install; pass "fg" for events that must be delivered before the script
+# exits (the EXIT trap's failure event and setup_completed).
+ph_capture() {
+    [ "$TELEMETRY_ENABLED" = "true" ] || return 0
+    [ -n "$DEVICE_ID" ] || return 0
+    local event="$1" props="${2:-}" mode="${3:-bg}"
+    local payload="{\"api_key\":\"$POSTHOG_KEY\",\"event\":\"$event\",\"distinct_id\":\"$DEVICE_ID\",\"properties\":{\"source\":\"openduck-runtime\",\"setup_script\":true,\"\$geoip_disable\":true${props:+,$props}}}"
+    if [ "$mode" = "fg" ]; then
+        curl -s --max-time "$TELEMETRY_CURL_MAX_TIME_S" -o /dev/null -X POST "$POSTHOG_HOST/i/v0/e/" \
+            -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || true
+    else
+        ( curl -s --max-time "$TELEMETRY_CURL_MAX_TIME_S" -o /dev/null -X POST "$POSTHOG_HOST/i/v0/e/" \
+            -H 'Content-Type: application/json' -d "$payload" 2>/dev/null || true ) &
+    fi
+}
+
+# Hardware props as a JSON fragment — property names are a contract with
+# mini_bdx_runtime/telemetry.py (pi_model, arch, ram_mb, os_release).
+# JSON-escaped via python3 when available (device-tree model / PRETTY_NAME
+# strings with quotes would otherwise silently break the whole payload).
+telemetry_hw_props() {
+    local arch model ram_mb os_release
+    arch=$(uname -m 2>/dev/null || echo "")
+    model=""
+    [ -f /proc/device-tree/model ] && model=$(tr -d '\0' < /proc/device-tree/model)
+    ram_mb=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0) / 1024 ))
+    os_release=$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release 2>/dev/null | head -1)
+    if command -v python3 > /dev/null 2>&1; then
+        python3 -c '
+import json, sys
+arch, model, ram, osr = sys.argv[1:5]
+print(",".join(f"{json.dumps(k)}:{json.dumps(v)}" for k, v in
+      [("arch", arch), ("pi_model", model), ("ram_mb", int(ram)), ("os_release", osr)]))
+' "$arch" "$model" "$ram_mb" "$os_release" 2>/dev/null && return 0
+    fi
+    printf '"arch":"%s","pi_model":"%s","ram_mb":%s,"os_release":"%s"' \
+        "$arch" "$model" "$ram_mb" "$os_release"
 }
 
 # ── Spinner ───────────────────────────────────────────────────────────────────
@@ -135,8 +258,9 @@ run_step() {
     local step_id="$2"
     local step_title="$3"
     local step_func="$4"
+    local always="${5:-false}"   # if "true", run every time (never skipped by .done)
 
-    if step_done "$step_id"; then
+    if [ "$always" != "true" ] && step_done "$step_id"; then
         printf "\n  ${WHITE}[%d/%d]${RESET} ${BOLD}%s${RESET} ${DIM}... skipped${RESET}\n" \
             "$step_num" "$TOTAL_STEPS" "$step_title"
         return 0
@@ -144,8 +268,16 @@ run_step() {
 
     printf "\n  ${WHITE}[%d/%d]${RESET} ${BOLD}%s${RESET}\n" \
         "$step_num" "$TOTAL_STEPS" "$step_title"
+    # Record which step is running so the EXIT trap can attribute a failure
+    # to it (set -e aborts mid-step; the trap sends setup_step_failed).
+    CURRENT_STEP_NUM="$step_num"
+    CURRENT_STEP_ID="$step_id"
+    STEP_START=$SECONDS
     "$step_func"
     mark_done "$step_id"
+    ph_capture setup_step_completed \
+        "\"step_id\":\"$step_id\",\"step_num\":$step_num,\"duration_s\":$(( SECONDS - STEP_START ))"
+    CURRENT_STEP_ID=""
 }
 
 # ── Swap management ──────────────────────────────────────────────────────────
@@ -206,6 +338,35 @@ cleanup() {
     restore_swap
 
     if [ $exit_code -ne 0 ]; then
+        # Report which step died and why. error_tail = last log lines,
+        # ANSI-stripped, home-paths/username redacted (privacy contract:
+        # usernames are never sent), JSON-escaped via python3 (skipped if
+        # unavailable). Ctrl-C/SIGTERM are tagged so dashboards can separate
+        # interruptions from real failures.
+        if [ -n "$CURRENT_STEP_ID" ]; then
+            local fail_duration tail_json interrupted
+            fail_duration=$(( SECONDS - ${STEP_START:-$SECONDS} ))
+            interrupted=false
+            case "$exit_code" in 130|143) interrupted=true ;; esac
+            tail_json="null"
+            if command -v python3 > /dev/null 2>&1 && [ -f "$LOG_FILE" ]; then
+                sleep 0.2; sync 2>/dev/null || true  # let tee drain the pipe
+                # Redact home paths; redact the username only when it's >= 4
+                # chars — substituting "pi" would garble "pip install" in the
+                # very error text this event exists to carry.
+                local scrub_expr scrub_user
+                scrub_expr="s|$HOME|~|g; s|/home/[^/ \"']*|/home/<user>|g"
+                scrub_user=$(whoami)
+                [ "${#scrub_user}" -ge 4 ] && scrub_expr="$scrub_expr; s|$scrub_user|<user>|g"
+                tail_json=$(tail -n 80 "$LOG_FILE" | sed 's/\x1b\[[0-9;]*m//g' | \
+                    sed "$scrub_expr" | \
+                    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[-6000:]))' \
+                    2>/dev/null || echo "null")
+            fi
+            ph_capture setup_step_failed \
+                "\"step_id\":\"$CURRENT_STEP_ID\",\"step_num\":${CURRENT_STEP_NUM:-0},\"exit_code\":$exit_code,\"interrupted\":$interrupted,\"duration_s\":$fail_duration,\"error_tail\":$tail_json" \
+                fg
+        fi
         echo ""
         printf "  ${RED}Setup interrupted or failed.${RESET}\n"
         printf "  ${DIM}Re-run the script to resume from where it left off.${RESET}\n"
@@ -268,16 +429,23 @@ do_preflight() {
 # ── Step 2: System dependencies ──────────────────────────────────────────────
 
 do_system_deps() {
+    # This step always re-runs (run_step ... true) so that changes to the
+    # package list below actually get installed when a user re-runs setup.sh —
+    # otherwise the step is marked done and skipped, and new deps (e.g. swig,
+    # added for lgpio's source build) silently never install. apt is idempotent
+    # and fast when everything is already present. update is non-fatal so a
+    # transient mirror hiccup on a re-run doesn't block resuming later steps.
     start_spinner "Updating package lists..."
-    sudo apt-get update -qq > /dev/null 2>&1
+    sudo apt-get update -qq > /dev/null 2>&1 || true
     stop_spinner true "Package lists updated"
 
-    start_spinner "Installing system packages..."
+start_spinner "Installing system packages..."
     sudo apt-get install -y -qq \
-        git python3-pip python3-venv cargo \
+        git python3-pip python3-venv python3-dev build-essential swig cargo \
+        liblgpio-dev \
         libsdl2-dev libsdl2-mixer-dev libsdl2-image-dev libsdl2-ttf-dev \
         > /dev/null 2>&1
-    stop_spinner true "System packages installed (git, python3, cargo, SDL2)"
+    stop_spinner true "System packages installed (git, python3, build tools, swig, cargo, SDL2, lgpio)"
 }
 
 # ── Step 3: Enable I2C ───────────────────────────────────────────────────────
@@ -294,6 +462,27 @@ do_i2c() {
 }
 
 # ── Step 4: USB serial latency ───────────────────────────────────────────────
+#
+# The robot talks to the Feetech STS3215 bus servos through a USB-to-serial
+# adapter plugged into the Pi Zero 2 W's micro-USB data port. Two adapter chip
+# variants exist in the field; both do the same job (serial bridge at 1 Mbaud)
+# and are interchangeable — only the chip differs:
+#
+#   Chip   | USB VID | Kernel driver | Device node    | Notes
+#   -------|---------|---------------|----------------|-------------------------
+#   CH343  | 0x1a86  | cdc_acm       | /dev/ttyACM*   | QinHeng; current (v3).
+#          |         |               |                | No latency_timer knob;
+#          |         |               |                | can't do bulk multi-servo
+#          |         |               |                | sync at 1Mbaud (per-servo
+#          |         |               |                | IO + retries in HWI).
+#   FTDI   | 0x0403  | ftdi_sio      | /dev/ttyUSB*   | Older adapter. Honors the
+#          |         |               |                | latency_timer rule below.
+#
+# The runtime does NOT hardcode the device path — HWI.find_servo_port()
+# (mini_bdx_runtime/rustypot_position_hwi.py) auto-detects the adapter by USB
+# vendor id, so any robot/cable works regardless of which ttyACM*/ttyUSB* it
+# enumerates as. The latency rule below only affects FTDI (ftdi_sio); it is a
+# no-op on CH343/cdc_acm, which has no latency_timer attribute.
 
 do_usb_latency() {
     start_spinner "Setting USB serial latency rule..."
@@ -321,8 +510,10 @@ do_clone() {
     fi
 
     if [ -d "$INSTALL_DIR/.git" ]; then
-        start_spinner "Updating existing installation..."
+        start_spinner "Checking for updates..."
         cd "$INSTALL_DIR"
+        local old_head new_head
+        old_head=$(git rev-parse HEAD 2>/dev/null || echo none)
         # Handle dirty state: stash local changes
         if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet HEAD 2>/dev/null; then
             git stash --include-untracked > /dev/null 2>&1 || true
@@ -330,7 +521,16 @@ do_clone() {
         git fetch origin "$REPO_BRANCH" > /dev/null 2>&1
         git checkout "$REPO_BRANCH" > /dev/null 2>&1 || true
         git reset --hard "origin/$REPO_BRANCH" > /dev/null 2>&1
-        stop_spinner true "Runtime updated"
+        new_head=$(git rev-parse HEAD)
+        if [ "$old_head" = "$new_head" ]; then
+            stop_spinner true "Already up to date ($(git rev-parse --short HEAD))"
+        else
+            # New code pulled — clear downstream step flags so new pip deps,
+            # config, and the systemd service are re-applied on this same run
+            # (and the service restarts onto the new code via step 12).
+            rm -f "$STATE_DIR"/step_0[789]_*.done "$STATE_DIR"/step_1[012]_*.done
+            stop_spinner true "Updated $(git rev-parse --short "$old_head" 2>/dev/null || echo new)→$(git rev-parse --short HEAD) — re-running install steps"
+        fi
     else
         # Remove non-git directory if it exists (broken state)
         if [ -d "$INSTALL_DIR" ]; then
@@ -379,6 +579,19 @@ setup_pip_env() {
     fi
 }
 
+# Run `pip install` with FULL output captured to LOG_FILE while showing only a
+# short tail on the console. The setup_step_failed telemetry reads error_tail
+# from LOG_FILE, so the old `... 2>&1 | tail -5` truncated build output before it
+# reached the log — PostHog (and the on-disk log) only ever saw pip's final
+# summary, never the actual compiler error. Writing the full build log to disk
+# fixes both local debugging and telemetry. Exit code is preserved for `set -e`.
+pip_install() {
+    local rc=0
+    "$PIP" install "$@" >> "$LOG_FILE" 2>&1 || rc=$?
+    tail -n 8 "$LOG_FILE"
+    return "$rc"
+}
+
 PIP=""  # set once in main after venv step
 
 # ── Step 8: Core pip packages ────────────────────────────────────────────────
@@ -390,32 +603,34 @@ do_pip_core() {
 
     if [ "$TEST_MODE" = "true" ]; then
         # Test mode: skip hardware-specific packages that can't install in Docker
-        "$PIP" install --no-cache-dir --prefer-binary \
+        pip_install --no-cache-dir --prefer-binary \
             "numpy>=1.26.4" \
             "websockets>=12.0" \
             "fastapi>=0.115.0" \
             "uvicorn>=0.30.0" \
             "pydantic>=2.0.0" \
-            2>&1 | tail -5
+            "posthog>=3.0"
 
         "$INSTALL_DIR/.venv/bin/python" -c \
-            "import numpy; import fastapi; print('Core packages verified (test mode)')" \
+            "import numpy; import fastapi; import posthog; print('Core packages verified (test mode)')" \
             || die "Core package verification failed — check log at $LOG_FILE"
     else
-        # Install packages directly — NO pipe, so errors are visible and exit code works
-        "$PIP" install --no-cache-dir --prefer-binary \
+        # Full build output goes to LOG_FILE (see pip_install); console stays short.
+        pip_install --no-cache-dir --prefer-binary \
             "numpy>=1.26.4" \
             "onnxruntime>=1.18.1" \
             "adafruit-circuitpython-bno055>=5.4.13" \
+            "lgpio>=0.2.2.0" \
+            "supabase>=2.0.0" \
             "websockets>=12.0" \
             "fastapi>=0.115.0" \
             "uvicorn>=0.30.0" \
             "pydantic>=2.0.0" \
-            "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215" \
-            2>&1 | tail -5
+            "posthog>=3.0" \
+            "pypot @ git+https://github.com/pollen-robotics/pypot@support-feetech-sts3215"
 
         "$INSTALL_DIR/.venv/bin/python" -c \
-            "import numpy; import onnxruntime; import fastapi; print('Core packages verified')" \
+            "import numpy; import onnxruntime; import fastapi; import lgpio; import supabase; import posthog; print('Core packages verified')" \
             || die "Core package verification failed — check log at $LOG_FILE"
     fi
 
@@ -438,7 +653,7 @@ do_pip_rustypot() {
     printf "  ${DIM}The script is safe to interrupt and resume.${RESET}\n"
     echo ""
 
-    CARGO_BUILD_JOBS=1 "$PIP" install --no-cache-dir "rustypot==0.1.0" 2>&1 | tail -20
+    CARGO_BUILD_JOBS=1 pip_install --no-cache-dir "rustypot==0.1.0"
 
     # Verify
     "$INSTALL_DIR/.venv/bin/python" -c "import rustypot; print('rustypot verified')" \
@@ -454,29 +669,25 @@ do_pip_optional() {
 
     if [ "$TEST_MODE" = "true" ]; then
         echo "  ${DIM}Installing optional packages (test mode — lightweight only)...${RESET}"
-        "$PIP" install --no-cache-dir --prefer-binary \
+        pip_install --no-cache-dir --prefer-binary \
             "openai>=1.70.0" \
-            2>&1 | tail -5 || {
-            warn "Some optional packages failed"
-        }
+            || warn "Some optional packages failed"
     else
         echo "  ${DIM}Installing optional packages (non-fatal if they fail)...${RESET}"
 
         # scipy — only needed by imu.py (not raw_imu.py which the walk script uses)
         # pygame — only needed for Xbox controller (not remote mode from dashboard)
         # openai — not used by walk script or server currently
-        "$PIP" install --no-cache-dir --prefer-binary \
+        pip_install --no-cache-dir --prefer-binary \
             "scipy>=1.15.1" \
             "pygame>=2.6.0" \
             "openai>=1.70.0" \
-            2>&1 | tail -10 || {
-            warn "Some optional packages failed — robot will still work in remote mode"
-        }
+            || warn "Some optional packages failed — robot will still work in remote mode"
     fi
 
     # Install the project itself in editable mode (deps already handled above)
     cd "$INSTALL_DIR"
-    "$PIP" install --no-cache-dir --no-deps -e . 2>&1 | tail -5
+    pip_install --no-cache-dir --no-deps -e .
 
     info "Package installation complete"
 
@@ -604,6 +815,10 @@ main() {
             info "State directory removed"
         fi
 
+        # NOTE: $TELEMETRY_FILE is deliberately preserved — the anonymous
+        # device id should stay stable across reinstalls.
+
+        CLEAN_INSTALL=true
         echo ""
         info "Clean complete — running fresh install"
         echo ""
@@ -621,6 +836,14 @@ main() {
         echo ""
         printf "  ${CYAN}Resuming setup (${done_count}/${TOTAL_STEPS} steps already complete)${RESET}\n"
     fi
+
+    # ── Telemetry consent + install-started event ─────────────────────────
+    telemetry_init
+    local resumed="false" hw_props
+    [ "$done_count" -gt 0 ] && resumed="true"
+    hw_props=$(telemetry_hw_props)
+    ph_capture setup_started \
+        "$hw_props,\"resumed\":$resumed,\"steps_already_done\":$done_count,\"clean_install\":$CLEAN_INSTALL,\"\$set\":{$hw_props}"
 
     # ── Header ────────────────────────────────────────────────────────────
     echo ""
@@ -666,11 +889,11 @@ LOGO
     # ── Run steps ─────────────────────────────────────────────────────────
 
     run_step  1 "01_preflight"    "Pre-flight checks"                      do_preflight
-    run_step  2 "02_system_deps"  "System dependencies"                    do_system_deps
+    run_step  2 "02_system_deps"  "System dependencies"                    do_system_deps  true
     run_step  3 "03_i2c"          "Hardware interfaces (I2C)"              do_i2c
     run_step  4 "04_usb_latency"  "Motor communication (USB latency)"      do_usb_latency
     run_step  5 "05_swap"         "Expand swap for compilation"            do_swap
-    run_step  6 "06_clone"        "Clone / update runtime"                 do_clone
+    run_step  6 "06_clone"        "Clone / update runtime"                 do_clone        true
     run_step  7 "07_venv"         "Python virtual environment"             do_venv
 
     # Set PIP path now that venv is guaranteed to exist
@@ -683,6 +906,8 @@ LOGO
     run_step 12 "12_systemd"      "TNKR server"                           do_systemd
 
     # ── Done ──────────────────────────────────────────────────────────────
+    ph_capture setup_completed \
+        "\"total_duration_s\":$SECONDS,\"clean_install\":$CLEAN_INSTALL" fg
     print_success
 }
 

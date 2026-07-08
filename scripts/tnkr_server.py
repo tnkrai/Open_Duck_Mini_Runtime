@@ -262,18 +262,19 @@ async def lifespan(app: FastAPI):
     await anyio.to_thread.run_sync(_locked_stop_walk)
 
 
-def _close_rehome_io():
-    """Drop torque and free the bus if a rehoming session is still open."""
+def _close_rehome_io(disable_torque: bool = True):
+    """Free the bus if a rehoming session is still open, optionally dropping torque."""
     global rehome_io
     if rehome_io is None:
         return
     io = rehome_io
     rehome_io = None
-    for sid in JOINTS.values():
-        try:
-            io.disable_torque([sid])
-        except Exception:
-            pass
+    if disable_torque:
+        for sid in JOINTS.values():
+            try:
+                io.disable_torque([sid])
+            except Exception:
+                pass
     try:
         io.close()
     except Exception:
@@ -910,10 +911,14 @@ def rehome_set_zero(req: JointRequest):
 
 @app.post("/api/rehome/finish")
 def rehome_finish():
-    """Close the rehoming session: release all torque, free the bus."""
+    """Close the rehoming session: free the bus but KEEP torque on, so the duck
+    stays rigid holding the fresh zero pose it built up joint by joint. IMU
+    calibration runs next on that rigid, upright duck; stance calibration goes
+    limp explicitly via /api/stance/release. Server shutdown (lifespan) still
+    drops torque so an unplugged duck never fights being handled."""
     if rehome_io is None:
         return {"success": True, "message": "No rehoming session was running"}
-    _close_rehome_io()
+    _close_rehome_io(disable_torque=False)
     return {"success": True}
 
 

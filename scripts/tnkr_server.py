@@ -184,8 +184,9 @@ def get_state_imu():
 
     Same exclusivity rule as the servo bus: released before the walk spawns
     (the walk subprocess owns the I2C then; orientation comes from its
-    telemetry snapshot instead). Coexists with the IMU-calibration worker —
-    both only issue read transactions."""
+    telemetry snapshot instead). The IMU-calibration worker shares this
+    handle (see _imu_calibrate_worker) — constructing a second BNO055_I2C
+    would soft-reset the chip and wipe the axis remap."""
     global state_imu
     if state_imu is None:
         from mini_bdx_runtime.raw_imu import Imu
@@ -1151,14 +1152,18 @@ def _imu_calibrate_worker(status: dict):
     """
     started = time.monotonic()
     try:
-        import adafruit_bno055
-        import board
-        import busio
         import pickle
 
-        i2c = busio.I2C(board.SCL, board.SDA)
-        imu = adafruit_bno055.BNO055_I2C(i2c)
-        imu.mode = adafruit_bno055.NDOF_MODE
+        # Reuse the state IMU's chip handle rather than opening a second one:
+        # adafruit_bno055's constructor soft-resets the BNO055 (SYS_TRIGGER
+        # 0x20, "reset to default settings"), which wipes the axis remap
+        # raw_imu.Imu applied for this robot's mounting. Every /api/state
+        # quaternion after that reset is in the chip's factory frame — the
+        # studio's 3D duck renders tipped over while the real duck stands
+        # upright. Sharing the handle keeps the remap (and the live
+        # orientation view) intact; the Imu constructor already put the chip
+        # in NDOF_MODE.
+        imu = get_state_imu().imu
 
         # Poll until calibrated or stopped
         while status["running"]:
@@ -1392,6 +1397,11 @@ def _walk_start_locked(body: WalkStartRequest):
     # so a duck standing in its stance doesn't collapse; the walk script's
     # own turn_on() then takes over from that pose.
     release_hwi(disable_torque=False)
+    # The walk subprocess constructs its own Imu, whose adafruit constructor
+    # soft-resets the BNO055 — stop any running calibration first so its
+    # worker doesn't keep polling (and fighting over I2C with) a chip it no
+    # longer owns.
+    imu_calib_status["running"] = False
     release_state_imu()
 
     venv_python = sys.executable

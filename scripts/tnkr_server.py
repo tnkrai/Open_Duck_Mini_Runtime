@@ -141,14 +141,21 @@ def get_hwi() -> HWI:
     return hwi_instance
 
 
-def release_hwi():
-    """Release the HWI connection so the walk script can use it."""
+def release_hwi(disable_torque: bool = True):
+    """Release the HWI connection so another flow can take the serial bus.
+
+    Feetech servos hold their last commanded position in firmware without any
+    bus traffic, so freeing the port does NOT require cutting torque. Pass
+    disable_torque=False to hand off the bus while the robot keeps holding its
+    pose (e.g. the walking stance) — going limp mid-stand makes the duck fall.
+    """
     global hwi_instance
     if hwi_instance is not None:
-        try:
-            hwi_instance.turn_off()
-        except Exception:
-            pass
+        if disable_torque:
+            try:
+                hwi_instance.turn_off()
+            except Exception:
+                pass
         hwi_instance = None
 
 
@@ -914,7 +921,8 @@ def rehome_finish():
 # the whole duck into its standing stance, capture every offset at once
 # (offset = raw - init_pos, self-correcting no matter how far the old offsets
 # drifted), then hold the pose and fine-tune per-joint offsets live before
-# saving to duck_config.json.
+# saving to duck_config.json. After a save from the holding state the duck
+# KEEPS holding the stance (torque stays on) — it doesn't go limp and fall.
 
 # Position-mode STS3215 servos are drivable over ~±π rad. A commanded target
 # (init_pos + offset) beyond this can't be reached: the servo clamps/wraps, so
@@ -944,9 +952,11 @@ def stance_start():
     global stance_holding
     refuse_while_walking()
     # Reload so leftovers from other flows (e.g. the deprecated calibration
-    # endpoints mutate init_pos) can't leak into the stance session.
+    # endpoints mutate init_pos) can't leak into the stance session. Bus-only:
+    # re-entering the wizard must not drop a duck still holding its stance —
+    # the user goes limp explicitly via /api/stance/release.
     try:
-        release_hwi()
+        release_hwi(disable_torque=False)
         hwi = get_hwi()
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -1081,7 +1091,6 @@ def stance_positions():
 @app.post("/api/stance/save")
 def stance_save():
     """Persist the session's offsets to duck_config.json (with a .bak backup)."""
-    global stance_holding
     try:
         hwi = get_hwi()
     except Exception as e:
@@ -1103,8 +1112,14 @@ def stance_save():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    stance_holding = False
-    release_hwi()  # robot goes limp; next use reloads the saved config
+    if not stance_holding:
+        # Saved while limp (user never pressed hold) — nothing to keep
+        # energized; next use reloads the saved config from disk.
+        release_hwi()
+    # else: keep torque on so the duck stays in the saved stance — cutting it
+    # here made the robot collapse the moment the user saved. The in-memory
+    # offsets equal what was just written to disk, and every other bus
+    # consumer (walk start, rehome, voltage) releases the HWI itself first.
 
     return {"success": True, "offsets": offsets}
 
@@ -1371,8 +1386,12 @@ def _walk_start_locked(body: WalkStartRequest):
         stop_walk_process()
 
     # Release HWI + BNO055 so the walk script owns both buses (serial + I2C);
-    # /api/state serves the walk's telemetry snapshot while it runs
-    release_hwi()
+    # /api/state serves the walk's telemetry snapshot while it runs.
+    # Bus-only release: the servos keep holding their pose in firmware while
+    # the walk process boots (several seconds of python/onnxruntime imports),
+    # so a duck standing in its stance doesn't collapse; the walk script's
+    # own turn_on() then takes over from that pose.
+    release_hwi(disable_torque=False)
     release_state_imu()
 
     venv_python = sys.executable
@@ -1474,7 +1493,9 @@ def voltage():
             status_code=503,
             detail="Servo rehoming session in progress — finish it first",
         )
-    release_hwi()  # pypot needs the port; the next idle op lazily reopens HWI
+    # pypot needs the port; the next idle op lazily reopens HWI. Bus-only:
+    # a battery poll must never drop a duck that is holding its stance.
+    release_hwi(disable_torque=False)
     try:
         from pypot.feetech import FeetechSTS3215IO
 

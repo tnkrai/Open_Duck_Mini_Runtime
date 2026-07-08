@@ -186,15 +186,11 @@ def test_add_telemetry_props_noop_outside_request():
 
 # ── IMU worker outcome events ────────────────────────────────────────────────
 
-def _stub_imu_modules(monkeypatch, fake_imu):
-    monkeypatch.setitem(sys.modules, "board", types.SimpleNamespace(SCL=1, SDA=2))
-    monkeypatch.setitem(
-        sys.modules, "busio", types.SimpleNamespace(I2C=lambda *a, **k: None)
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "adafruit_bno055",
-        types.SimpleNamespace(BNO055_I2C=lambda i2c: fake_imu, NDOF_MODE=12),
+def _stub_state_imu(monkeypatch, fake_imu):
+    # The worker reads the chip through the state IMU's shared handle (a second
+    # BNO055_I2C would soft-reset the chip and wipe the axis remap).
+    monkeypatch.setattr(
+        tnkr_server, "get_state_imu", lambda: types.SimpleNamespace(imu=fake_imu)
     )
 
 
@@ -222,7 +218,7 @@ def test_imu_worker_completed_event(captured, monkeypatch, tmp_path):
         offsets_gyroscope = (0, 0, 0)
         offsets_magnetometer = (0, 0, 0)
 
-    _stub_imu_modules(monkeypatch, FakeIMU())
+    _stub_state_imu(monkeypatch, FakeIMU())
     monkeypatch.setattr(tnkr_server, "SCRIPTS_DIR", tmp_path)
     status = {"running": True, "calibration_status": [0, 0, 0, 0],
               "calibrated": False, "error": None, "offsets": None}
@@ -239,7 +235,7 @@ def test_imu_worker_stopped_event(captured, monkeypatch):
         # never calibrates; loop exits when status["running"] flips
 
     fake = FakeIMU()
-    _stub_imu_modules(monkeypatch, fake)
+    _stub_state_imu(monkeypatch, fake)
     status = {"running": True, "calibration_status": [0, 0, 0, 0],
               "calibrated": False, "error": None, "offsets": None}
 

@@ -1490,18 +1490,25 @@ def walk_stop():
 
 # ── Remote Commands ──────────────────────────────────────────────────────────
 
-# ── Voltage (idle-only battery read) ──────────────────────────────────────────
+# ── Voltage + temperature (idle-only servo vitals read) ───────────────────────
 
 # Battery health bands for the duck's 2S pack.
 VOLTAGE_LOW = 7.4
 VOLTAGE_CRITICAL = 7.0
 
+# Servo temperature bands (°C). The STS3215 firmware cuts torque at its
+# over-temperature limit (70 by default) — warn well before that.
+TEMP_WARM = 55
+TEMP_HOT = 65
+
 
 @app.get("/api/voltage")
 def voltage():
-    """Battery voltage read off the servos via pypot (check_voltage.py's
-    approach — the register reads back decivolts). Idle-only: refused while
-    the walk or a rehoming session owns the bus."""
+    """Battery voltage + servo temperatures read via pypot (check_voltage.py's
+    approach — the voltage register reads back decivolts). Both maps are keyed
+    by joint name — the hottest servo is the story for heat, so readings carry
+    their identity. Idle-only: refused while the walk or a rehoming session
+    owns the bus."""
     refuse_while_walking()
     if rehome_io is not None:
         raise HTTPException(
@@ -1517,9 +1524,12 @@ def voltage():
         io = FeetechSTS3215IO(USB_PORT, baudrate=1000000)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Could not open servo bus: {e}")
+    names = list(JOINTS.keys())
     try:
         raw = io.get_present_voltage(list(JOINTS.values()))
-        per_motor = [round(float(v) * 0.1, 2) for v in raw]  # decivolts → volts
+        per_motor = {n: round(float(v) * 0.1, 2) for n, v in zip(names, raw)}
+        raw_temp = io.get_present_temperature(list(JOINTS.values()))
+        temps = {n: int(t) for n, t in zip(names, raw_temp)}  # already °C, 1 byte
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Voltage read failed: {e}")
     finally:
@@ -1527,11 +1537,22 @@ def voltage():
             io.close()
         except Exception:
             pass
-    volts = round(sum(per_motor) / len(per_motor), 2) if per_motor else 0.0
+    volts = round(sum(per_motor.values()) / len(per_motor), 2) if per_motor else 0.0
     health_band = (
         "ok" if volts >= VOLTAGE_LOW else ("low" if volts >= VOLTAGE_CRITICAL else "critical")
     )
-    return {"volts": volts, "perMotor": per_motor, "health": health_band}
+    hottest = max(temps, key=temps.get) if temps else None
+    max_temp = temps[hottest] if hottest is not None else 0
+    temp_band = "ok" if max_temp < TEMP_WARM else ("warm" if max_temp < TEMP_HOT else "hot")
+    return {
+        "volts": volts,
+        "perMotor": per_motor,
+        "health": health_band,
+        "temps": temps,
+        "maxTempC": max_temp,
+        "hottest": hottest,
+        "tempHealth": temp_band,
+    }
 
 
 @app.post("/api/commands")

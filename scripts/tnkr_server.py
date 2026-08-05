@@ -1488,6 +1488,37 @@ def walk_stop():
     return {"success": True}
 
 
+def _set_walk_pause(paused: bool):
+    if not is_walking():
+        raise HTTPException(
+            status_code=409,
+            detail="No walk is running — nothing to pause",
+        )
+    walk_pause.write(paused)
+    add_telemetry_props(paused=paused)
+    return {"success": True, "paused": paused}
+
+
+@app.post("/api/walk/pause")
+def walk_pause_endpoint():
+    """Freeze the gait while keeping the servos powered.
+
+    The difference from /api/walk/stop: stopping kills the walk process, whose
+    cleanup disables torque, so the duck goes limp and falls. Pausing leaves the
+    walk running — it just stops issuing new motor targets, and Feetech servos
+    hold their last commanded target in firmware, so the duck stays standing
+    exactly where it was. The walk picks the flag up within one control tick
+    (~20ms). Same state the controller's A button toggles, so the two agree.
+    """
+    return _set_walk_pause(True)
+
+
+@app.post("/api/walk/resume")
+def walk_resume():
+    """Resume a paused walk — the policy takes over from the held pose."""
+    return _set_walk_pause(False)
+
+
 # ── Remote Commands ──────────────────────────────────────────────────────────
 
 # ── Voltage + temperature (idle-only servo vitals read) ───────────────────────

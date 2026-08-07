@@ -8,6 +8,7 @@ Telemetry is streamed via Supabase Realtime broadcast channels.
 """
 
 import json
+import math
 import os
 import platform
 import shutil
@@ -42,6 +43,8 @@ from mini_bdx_runtime.rustypot_position_hwi import HWI, find_servo_adapter
 from mini_bdx_runtime.duck_config import DuckConfig
 from mini_bdx_runtime import telemetry
 from mini_bdx_runtime import walk_telemetry
+from mini_bdx_runtime import walk_pause
+from mini_bdx_runtime import walk_offsets
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -149,7 +152,7 @@ def release_hwi(disable_torque: bool = True):
     disable_torque=False to hand off the bus while the robot keeps holding its
     pose (e.g. the walking stance) — going limp mid-stand makes the duck fall.
     """
-    global hwi_instance
+    global hwi_instance, head_puppet_active
     if hwi_instance is not None:
         if disable_torque:
             try:
@@ -157,10 +160,20 @@ def release_hwi(disable_torque: bool = True):
             except Exception:
                 pass
         hwi_instance = None
+    # A puppet session is only as live as the HWI it drives: whoever takes the
+    # bus next (walk, rehome, stance) leaves the head somewhere we no longer
+    # know, so the next request must re-enter rather than skip the setup.
+    head_puppet_active = False
 
 
 def is_walking() -> bool:
     return walk_session is not None and walk_session.proc.poll() is None
+
+
+def is_paused() -> bool:
+    """Whether the running walk is frozen (torque held) — see /api/walk/pause.
+    Only meaningful while a walk is running; idle, there is no gait to pause."""
+    return is_walking() and bool(walk_pause.read())
 
 
 def walk_exit_code() -> int | None:
@@ -311,6 +324,7 @@ _request_props: ContextVar[dict | None] = ContextVar(
 # Endpoints that are polled or high-frequency — never captured.
 TELEMETRY_EXCLUDED_PATHS = {
     "/api/commands",              # 50 Hz remote-control stream
+    "/api/head/puppet",           # on-screen joystick stream
     "/api/health",                # dashboard polling
     "/api/imu/calibrate/status",  # calibration UI polling
 }
@@ -467,6 +481,7 @@ def health():
         "is_pi": is_pi,
         "platform": machine,
         "walking": is_walking(),
+        "paused": is_paused(),
         "walkExitCode": walk_exit_code(),
     }
 
@@ -1130,6 +1145,165 @@ def stance_save():
     return {"success": True, "offsets": offsets}
 
 
+# ── Head puppet (on-screen joystick drives the head) ─────────────────────────
+#
+# The HTTP half of scripts/head_puppet.py, which needs a physical Xbox pad.
+# Idle only: while a walk runs it owns the bus, and head targets already ride
+# along in the /api/commands stream (indices 3..6), so there is nothing to add
+# there — a second writer would just fight the joystick stream for the file.
+#
+# Dashboard flow: POST axes as the user drags (the first one enters the mode),
+# /stop when the panel closes.
+
+# Mechanical travel per head joint, degrees — the values head_puppet.py uses.
+HEAD_LIMITS_DEG = {
+    "neck_pitch": (-20.0, 60.0),
+    "head_pitch": (-60.0, 45.0),
+    "head_yaw": (-60.0, 60.0),
+    "head_roll": (-20.0, 20.0),
+}
+
+# Axis name in the request -> joint it drives. Named for what the user is
+# doing to the head, so the frontend never has to know the joint names.
+HEAD_AXES = {
+    "yaw": "head_yaw",
+    "pitch": "head_pitch",
+    "roll": "head_roll",
+    "neckPitch": "neck_pitch",
+}
+
+# A compliant head is smooth to puppet and safe to catch hold of. Only the
+# head servos are softened — dropping the legs to this would fold a duck that
+# is standing, which is exactly the state we expect to be puppeted in.
+HEAD_PUPPET_KP = 8
+
+head_puppet_active = False
+# Last axis positions, so a request carrying only the axes that moved leaves
+# the rest of the head where it is (a 2-axis on-screen stick shouldn't yank
+# roll back to centre every frame).
+head_puppet_axes = {name: 0.0 for name in HEAD_AXES}
+
+
+def _head_axis_to_rad(joint: str, axis: float) -> float:
+    """Stick axis (-1..1) -> joint angle, radians. 0 is the middle of the
+    joint's travel, matching head_puppet.py — note that for the asymmetric
+    joints (head_pitch, neck_pitch) that middle is not the init pose."""
+    lo, hi = HEAD_LIMITS_DEG[joint]
+    return math.radians(lo + (axis + 1.0) / 2.0 * (hi - lo))
+
+
+def _head_puppet_payload(**extra) -> dict:
+    return {
+        "active": head_puppet_active,
+        "axes": dict(head_puppet_axes),
+        "applied": {
+            joint: round(math.degrees(_head_axis_to_rad(joint, head_puppet_axes[axis])), 2)
+            for axis, joint in HEAD_AXES.items()
+        },
+        "limits": {j: list(v) for j, v in HEAD_LIMITS_DEG.items()},
+        "axisNames": list(HEAD_AXES),
+        **extra,
+    }
+
+
+class HeadPuppetRequest(BaseModel):
+    # All optional: a request moves only the axes it names. -1..1, clamped.
+    yaw: float | None = None
+    pitch: float | None = None
+    roll: float | None = None
+    neckPitch: float | None = None
+
+
+@app.post("/api/head/puppet")
+def head_puppet(req: HeadPuppetRequest):
+    """Point the head from on-screen joystick axes, in -1..1.
+
+    The first call enters puppet mode — torque on, head softened to
+    HEAD_PUPPET_KP — so the frontend can just start streaming axes as the user
+    drags. Every call after that is only the four servo writes, which is what
+    keeps this cheap enough to post at joystick rates.
+    """
+    global head_puppet_active
+
+    requested = {
+        axis: getattr(req, axis) for axis in HEAD_AXES if getattr(req, axis) is not None
+    }
+    # inf/NaN survive pydantic's float coercion and would land in a goal
+    # position; reject before anything moves.
+    for axis, value in requested.items():
+        if not math.isfinite(value):
+            raise HTTPException(
+                status_code=400, detail=f"Axis {axis} must be a finite number"
+            )
+
+    refuse_while_walking()
+    try:
+        hwi = get_hwi()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    entering = not head_puppet_active
+    if entering:
+        try:
+            # Stand the duck up in its init pose, as head_puppet.py does, then
+            # soften the head alone. turn_on() leaves legs at their normal kps,
+            # so a duck already holding a stance stays rigid through this.
+            hwi.turn_on()
+            for joint in HEAD_LIMITS_DEG:
+                hwi.set_kp(hwi.joints[joint], HEAD_PUPPET_KP)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        head_puppet_active = True
+
+    for axis, value in requested.items():
+        head_puppet_axes[axis] = max(-1.0, min(1.0, float(value)))
+
+    try:
+        for axis, joint in HEAD_AXES.items():
+            hwi.set_position(joint, _head_axis_to_rad(joint, head_puppet_axes[axis]))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not move head: {e}")
+
+    if entering:
+        add_telemetry_props(entered=True)
+    return _head_puppet_payload(success=True)
+
+
+@app.post("/api/head/puppet/stop")
+def head_puppet_stop():
+    """Leave puppet mode: head back to centre, normal kps restored.
+
+    Torque stays on — same rule as the stance endpoints, since cutting it
+    would drop a duck that is standing. Use /api/stance/release to go limp.
+    """
+    global head_puppet_active
+    if not head_puppet_active:
+        return _head_puppet_payload(success=True, message="Head puppet was not active")
+
+    # Drop the mode first: if the bus write below fails, the next request must
+    # re-enter cleanly rather than believe a head it never re-centred is live.
+    head_puppet_active = False
+    for axis in head_puppet_axes:
+        head_puppet_axes[axis] = 0.0
+
+    # No is_walking() guard needed: walk start releases the HWI, which clears
+    # head_puppet_active, so a session never survives into a walk to be
+    # stopped here.
+    try:
+        hwi = get_hwi()
+        for axis, joint in HEAD_AXES.items():
+            hwi.set_position(joint, _head_axis_to_rad(joint, 0.0))
+        # hwi.kps is indexed by joint order — restore each head joint to the
+        # stiffness the rest of the robot is running at.
+        joint_order = list(hwi.joints)
+        for joint in HEAD_LIMITS_DEG:
+            hwi.set_kp(hwi.joints[joint], float(hwi.kps[joint_order.index(joint)]))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    return _head_puppet_payload(success=True)
+
+
 # ── IMU Calibration ───────────────────────────────────────────────────────
 
 imu_calib_thread: Thread | None = None
@@ -1337,6 +1511,11 @@ def stop_walk_process():
         os.remove(COMMAND_FILE)
     except FileNotFoundError:
         pass
+    # A pause belongs to the walk that was paused — never inherit it
+    walk_pause.clear()
+    # Same for an unsaved live trim: the next walk starts from duck_config.json,
+    # not from whatever the last session was mid-experiment with.
+    walk_offsets.clear()
     # Same rule as the walk's own shutdown: no dead telemetry snapshots
     walk_telemetry.clear()
 
@@ -1464,6 +1643,14 @@ def _walk_start_locked(body: WalkStartRequest):
         already_running=False,
     )
 
+    # Start from a clean slate. stop_walk_process() clears these, but a walk
+    # that died hard (SIGKILL, power cut) never ran its own cleanup — and
+    # is_walking() goes true the moment we spawn, seconds before the walk
+    # publishes its own state, so a leftover file would read as *this* walk's
+    # pause/trim for the whole boot window.
+    walk_pause.clear()
+    walk_offsets.clear()
+
     proc = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
     walk_session = WalkSession(
         proc=proc,
@@ -1517,6 +1704,171 @@ def walk_pause_endpoint():
 def walk_resume():
     """Resume a paused walk — the policy takes over from the held pose."""
     return _set_walk_pause(False)
+
+
+# ── Live joint trim (offsets, adjustable mid-gait) ────────────────────────────
+#
+# The stance wizard trims a standing duck; a sagging hip or a toed-in ankle
+# only shows up in the gait, so tuning it there means a stop/adjust/start cycle
+# per guess. These endpoints move joints_offsets while the walk runs — the walk
+# reads the shared file each tick and slews to the new values.
+#
+# Dashboard flow: GET to populate the sliders, POST deltas as the user nudges,
+# /save when the duck looks right, /reset to get back to the saved values.
+
+class WalkOffsetsRequest(BaseModel):
+    offsets: dict[str, float]
+    # "absolute" sets the offset outright (sliders); "delta" adds to the
+    # current live value (nudge buttons, which shouldn't have to know it).
+    mode: str = "absolute"
+
+
+def _saved_offsets() -> dict[str, float]:
+    """The trim in duck_config.json — what the walk starts from, and the
+    anchor a live trim may only stray TRIM_LIMIT_RAD from."""
+    try:
+        saved = _read_config().get("joints_offsets", {})
+    except (FileNotFoundError, ValueError, OSError):
+        saved = {}
+    return {name: float(saved.get(name, 0.0)) for name in JOINTS}
+
+
+def _live_offsets() -> dict[str, float]:
+    """The trim in effect right now: the walk's published values while it
+    runs, otherwise what the next walk will start with."""
+    live = walk_offsets.read() if is_walking() else None
+    saved = _saved_offsets()
+    if live is None:
+        return saved
+    # Only joints we know: a stray key in the file must not invent a joint.
+    return {name: round(live.get(name, saved[name]), 4) for name in JOINTS}
+
+
+def _offsets_payload(**extra) -> dict:
+    saved = _saved_offsets()
+    offsets = _live_offsets()
+    return {
+        "walking": is_walking(),
+        "offsets": offsets,
+        "saved": saved,
+        # Trims the user would lose by stopping the walk without saving.
+        "unsaved": sorted(
+            name for name in JOINTS if abs(offsets[name] - saved[name]) > 1e-6
+        ),
+        "joints": list(JOINTS),
+        "limit": walk_offsets.TRIM_LIMIT_RAD,
+        "rampRate": walk_offsets.RAMP_RATE_RAD_S,
+        **extra,
+    }
+
+
+@app.get("/api/walk/offsets")
+def walk_offsets_get():
+    """Current trim, the saved baseline, and the limits — everything the
+    dashboard needs to render its sliders. Works whether or not a walk is
+    running; idle, `offsets` is what the next walk will start from."""
+    return _offsets_payload()
+
+
+@app.post("/api/walk/offsets")
+def walk_offsets_set(req: WalkOffsetsRequest):
+    """Adjust the trim of a live gait, one joint or many.
+
+    Absolute mode replaces the offset, delta mode adds to it, and a partial
+    dict leaves every other joint alone — so a slider and a +/- button can
+    both post here. Values are clamped to the saved value ± limit, and the
+    walk ramps to them at rampRate rad/s rather than snapping, so a whole
+    session of trimming never asks the duck to take a step it can't.
+    """
+    if req.mode not in ("absolute", "delta"):
+        raise HTTPException(
+            status_code=400, detail=f"mode must be 'absolute' or 'delta', got {req.mode!r}"
+        )
+    if not is_walking():
+        raise HTTPException(
+            status_code=409,
+            detail="No walk is running — trim a standing duck with /api/stance/offset",
+        )
+    unknown = [name for name in req.offsets if name not in JOINTS]
+    if unknown:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown joint(s): {', '.join(sorted(unknown))}"
+        )
+    for name, value in req.offsets.items():
+        # inf/NaN survive pydantic's float coercion and would be written
+        # straight into a goal position.
+        if not math.isfinite(value):
+            raise HTTPException(
+                status_code=400, detail=f"Offset for {name} must be a finite number"
+            )
+
+    saved = _saved_offsets()
+    current = _live_offsets()
+    limit = walk_offsets.TRIM_LIMIT_RAD
+
+    updated = dict(current)
+    clamped = []
+    for name, value in req.offsets.items():
+        target = value if req.mode == "absolute" else current[name] + value
+        bounded = max(saved[name] - limit, min(saved[name] + limit, target))
+        if abs(bounded - target) > 1e-9:
+            clamped.append(name)
+        updated[name] = round(bounded, 4)
+
+    try:
+        walk_offsets.write(updated)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not publish offsets: {e}")
+
+    add_telemetry_props(
+        mode=req.mode,
+        joints_adjusted=len(req.offsets),
+        clamped=len(clamped),
+        max_trim=round(max(abs(updated[n] - saved[n]) for n in JOINTS), 4),
+    )
+    return _offsets_payload(success=True, clamped=sorted(clamped))
+
+
+@app.post("/api/walk/offsets/reset")
+def walk_offsets_reset():
+    """Drop the live trim back to the saved values — the undo for a session
+    of nudging that made things worse. Ramps back, same as any other change."""
+    if not is_walking():
+        raise HTTPException(status_code=409, detail="No walk is running")
+    try:
+        walk_offsets.write(_saved_offsets())
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not publish offsets: {e}")
+    return _offsets_payload(success=True)
+
+
+@app.post("/api/walk/offsets/save")
+def walk_offsets_save():
+    """Persist the live trim to duck_config.json (with a .bak), without
+    interrupting the walk. Until this is called the trim lives only in shared
+    memory and dies with the walk — this is the button that keeps the tuning."""
+    offsets = _live_offsets()
+    try:
+        config = _read_config()
+    except FileNotFoundError:
+        config = DuckConfigModel().model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    config["joints_offsets"] = offsets
+    try:
+        _write_config(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # The walk owns the bus and its own copy of the offsets; the idle HWI (if
+    # any) would keep serving the pre-save config, so drop it. Bus-only —
+    # cutting torque here would drop a duck that's standing.
+    if not is_walking():
+        release_hwi(disable_torque=False)
+
+    add_telemetry_props(joints_saved=len(offsets))
+    return _offsets_payload(success=True)
 
 
 # ── Remote Commands ──────────────────────────────────────────────────────────

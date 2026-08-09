@@ -30,6 +30,9 @@ LOG_FILE="$STATE_DIR/setup.log"
 TOTAL_STEPS=12
 MIN_DISK_MB=2048
 SWAP_SIZE_MB=2048
+# How long to wait for the server to answer /api/health after a start/restart.
+# Generous: a Pi Zero 2 W needs ~15-25s just to import fastapi/uvicorn/numpy.
+SERVER_HEALTH_TIMEOUT_S=45
 
 # Anonymous usage telemetry (see telemetry_init below for the user notice).
 # Key is write-only (can send events, cannot read data). Key/host and the
@@ -708,6 +711,53 @@ do_config() {
 
 # ── Step 12: Systemd service ─────────────────────────────────────────────────
 
+# Wait until the server actually serves.
+#
+# `systemctl is-active` cannot answer this. The unit is Type=simple, so systemd
+# marks it active the instant the process forks — before Python has imported
+# fastapi, before uvicorn binds the port, and before any module-level code has
+# had a chance to fail. A server that dies during import still reports "active"
+# for the first few seconds, so the old `sleep 2 && is-active` check could not
+# fail, and setup declared success over a dead server.
+#
+# /api/health only answers once uvicorn is serving, so it tests the thing we
+# actually claim in the success banner.
+wait_for_server_health() {
+    local deadline=$(( SECONDS + SERVER_HEALTH_TIMEOUT_S ))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if curl -sf --max-time 2 "http://127.0.0.1:$SERVER_PORT/api/health" > /dev/null 2>&1; then
+            return 0
+        fi
+        # Crash loop: Restart=on-failure + StartLimitBurst=5 means systemd gives
+        # up permanently after 5 failures in 5 minutes and then refuses manual
+        # starts too ("start request repeated too quickly"). Once the unit is in
+        # that state it will never answer — stop waiting out the full timeout.
+        if systemctl is-failed --quiet "$SERVICE_NAME" 2>/dev/null; then
+            return 1
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+# Print why the server didn't come up, then abort. Always call this instead of
+# just warning: a step that leaves a dead server must NOT be marked done, or the
+# next run skips it and setup_completed fires over a robot that never serves.
+die_server_unhealthy() {
+    local what="$1"
+
+    printf "  ${DIM}Service state: %s${RESET}\n" \
+        "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)"
+    echo ""
+    printf "  ${DIM}Last 20 log lines:${RESET}\n"
+    sudo journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null \
+        | sed 's/^/    /' || true
+    echo ""
+    die "$what did not respond on port $SERVER_PORT within ${SERVER_HEALTH_TIMEOUT_S}s — see the log above"
+}
+
 do_systemd() {
     if [ ! -f "$INSTALL_DIR/tnkr-robot.service.template" ]; then
         die "Service template not found at $INSTALL_DIR/tnkr-robot.service.template"
@@ -722,19 +772,20 @@ do_systemd() {
     sudo systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
     stop_spinner true "Service installed"
 
-    # Restore swap before starting the service (service shouldn't need 2GB swap)
-    restore_swap
-
     start_spinner "Starting server..."
     sudo systemctl restart "$SERVICE_NAME"
-    # Give it a moment to start
-    sleep 2
-    if systemctl is-active "$SERVICE_NAME" > /dev/null 2>&1; then
-        stop_spinner true "Server running"
+    if wait_for_server_health; then
+        stop_spinner true "Server running and answering on port $SERVER_PORT"
     else
         stop_spinner false "Server failed to start"
-        printf "  ${DIM}Check logs: sudo journalctl -u %s -n 30${RESET}\n" "$SERVICE_NAME"
+        die_server_unhealthy "Server"
     fi
+
+    # Restore swap only after the server is confirmed up. Importing numpy/
+    # onnxruntime/fastapi is the most memory-hungry moment of the whole install,
+    # and this board has ~415MB of RAM — dropping 2GB of swap immediately before
+    # that (as this used to) removes the safety net exactly when it's needed.
+    restore_swap
 }
 
 # ── Success banner ───────────────────────────────────────────────────────────
@@ -875,13 +926,12 @@ LOGO
         "$PIP" install --no-cache-dir --no-deps -e . 2>&1 | tail -3
         start_spinner "Restarting server..."
         sudo systemctl restart "$SERVICE_NAME"
-        sleep 2
-        if systemctl is-active "$SERVICE_NAME" > /dev/null 2>&1; then
-            stop_spinner true "Server restarted"
+        if wait_for_server_health; then
+            stop_spinner true "Server restarted and answering on port $SERVER_PORT"
             print_success
         else
             stop_spinner false "Server failed to restart"
-            die "Check logs: sudo journalctl -u $SERVICE_NAME -n 30"
+            die_server_unhealthy "Server"
         fi
         return 0
     fi

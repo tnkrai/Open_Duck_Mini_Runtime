@@ -519,11 +519,29 @@ do_clone() {
         old_head=$(git rev-parse HEAD 2>/dev/null || echo none)
         # Handle dirty state: stash local changes
         if ! git diff --quiet HEAD 2>/dev/null || ! git diff --cached --quiet HEAD 2>/dev/null; then
-            git stash --include-untracked > /dev/null 2>&1 || true
+            git stash --include-untracked >> "$LOG_FILE" 2>&1 || true
         fi
-        git fetch origin "$REPO_BRANCH" > /dev/null 2>&1
-        git checkout "$REPO_BRANCH" > /dev/null 2>&1 || true
-        git reset --hard "origin/$REPO_BRANCH" > /dev/null 2>&1
+
+        # git output goes to the log, never /dev/null. set -e already aborts the
+        # run when fetch or reset fails, but with the output discarded the user
+        # saw a bare abort and the failure event's error_tail (which reads
+        # LOG_FILE) carried the PREVIOUS step's output — a git failure here used
+        # to be reported against whatever ran last.
+        if ! git fetch origin "$REPO_BRANCH" >> "$LOG_FILE" 2>&1; then
+            stop_spinner false "Could not reach origin"
+            die "git fetch origin $REPO_BRANCH failed — check the network, then see $LOG_FILE"
+        fi
+        # This used to be `|| true`. A failed checkout left the run on whatever
+        # branch it started on, and the reset below then moved THAT branch to
+        # origin's commit: right files, wrong branch, no warning.
+        if ! git checkout "$REPO_BRANCH" >> "$LOG_FILE" 2>&1; then
+            stop_spinner false "Could not switch to $REPO_BRANCH"
+            die "git checkout $REPO_BRANCH failed — see $LOG_FILE"
+        fi
+        if ! git reset --hard "origin/$REPO_BRANCH" >> "$LOG_FILE" 2>&1; then
+            stop_spinner false "Could not update to origin/$REPO_BRANCH"
+            die "git reset --hard origin/$REPO_BRANCH failed — see $LOG_FILE"
+        fi
         new_head=$(git rev-parse HEAD)
         if [ "$old_head" = "$new_head" ]; then
             stop_spinner true "Already up to date ($(git rev-parse --short HEAD))"
@@ -540,7 +558,10 @@ do_clone() {
             rm -rf "$INSTALL_DIR"
         fi
         start_spinner "Cloning runtime..."
-        git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1
+        if ! git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$INSTALL_DIR" >> "$LOG_FILE" 2>&1; then
+            stop_spinner false "Could not clone the runtime"
+            die "git clone $REPO_URL failed — check the network, then see $LOG_FILE"
+        fi
         stop_spinner true "Runtime cloned"
     fi
 }

@@ -63,6 +63,12 @@ ORIGINAL_SWAP_SIZE=""
 SWAP_EXPANDED=false
 TEST_MODE=false
 CLEAN_INSTALL=false
+# Set by --from-cli. The tnkr CLI relays this script's output over SSH, so the
+# success banner below would tell an operator to run `systemctl status` on the
+# machine they are sitting at rather than on the robot. The caller owns the
+# ending instead. An older script that has never heard of the flag ignores it
+# and prints the banner, which is wrong but harmless.
+FROM_CLI=false
 # Durations use bash's $SECONDS (seconds since shell start), not wall-clock:
 # the Pi has no RTC, so NTP jumping the clock mid-install would otherwise
 # produce negative or absurd durations.
@@ -743,6 +749,15 @@ print_success() {
     local server_url
     server_url="http://$(hostname).local:$SERVER_PORT"
 
+    # Driven by the tnkr CLI over SSH. Everything below is written for someone
+    # sitting at the robot — "sudo systemctl status" on the operator's laptop
+    # does nothing — so the caller prints the ending instead. Guarded here
+    # rather than at the two call sites, so a third one cannot forget.
+    if [ "$FROM_CLI" = "true" ]; then
+        printf '%s\n' "$server_url"
+        return 0
+    fi
+
     echo ""
     printf "  ${DIM}────────────────────────────────────────${RESET}\n"
     echo ""
@@ -774,9 +789,15 @@ print_success() {
 
 main() {
     # ── Parse flags ───────────────────────────────────────────────────────
+    # One parser, and it does not care about order. --clean used to be read
+    # from "$1" alone, a few lines below, which meant `--from-cli --clean`
+    # silently dropped the --clean and gave a resumed install to someone who
+    # asked for a pristine one.
     for arg in "$@"; do
         case "$arg" in
-            --test) TEST_MODE=true ;;
+            --test)     TEST_MODE=true ;;
+            --clean)    CLEAN_INSTALL=true ;;
+            --from-cli) FROM_CLI=true ;;
         esac
     done
 
@@ -784,7 +805,7 @@ main() {
         warn "Test mode — hardware packages (onnxruntime, rustypot, adafruit) will be skipped"
     fi
 
-    if [ "${1:-}" = "--clean" ]; then
+    if [ "$CLEAN_INSTALL" = "true" ]; then
         cd "$HOME"
         echo ""
         printf "  ${YELLOW}${BOLD}Cleaning previous installation...${RESET}\n"
@@ -818,7 +839,6 @@ main() {
         # NOTE: $TELEMETRY_FILE is deliberately preserved — the anonymous
         # device id should stay stable across reinstalls.
 
-        CLEAN_INSTALL=true
         echo ""
         info "Clean complete — running fresh install"
         echo ""

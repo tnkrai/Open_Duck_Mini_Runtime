@@ -753,8 +753,18 @@ print_success() {
     # sitting at the robot — "sudo systemctl status" on the operator's laptop
     # does nothing — so the caller prints the ending instead. Guarded here
     # rather than at the two call sites, so a third one cannot forget.
+    #
+    # Nothing is printed, not even the URL. $server_url is built from this
+    # machine's own hostname, and whether the *operator's* machine resolves
+    # `.local` is a different question: true on macOS, not on Linux without
+    # avahi, and false for anyone who reached this robot by address. So for an
+    # install run as `--host pi@192.168.1.42`, a bare
+    # `http://raspberrypi.local:8000` here is at best a duplicate of the line the
+    # CLI prints and at worst a URL that does not answer from where they are
+    # sitting. The CLI derives a reachable one from the destination it actually
+    # connected with, and it cannot suppress this line itself without parsing a
+    # stream it deliberately does not read.
     if [ "$FROM_CLI" = "true" ]; then
-        printf '%s\n' "$server_url"
         return 0
     fi
 

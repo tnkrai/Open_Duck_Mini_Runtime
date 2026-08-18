@@ -282,6 +282,34 @@ def check_contract(manifest: ComponentManifest, loop_spec: tuple[ObsBlock, ...])
             )
 
 
+def check_assumes(manifest: ComponentManifest, *, runtime_version: str) -> None:
+    """Every `assumes` entry this runtime knows how to check, checked.
+
+    Today that is the runtime version floor. An entry with a key we do not recognise is
+    IGNORED rather than refused: a component built for a newer runtime may declare
+    things this one has never heard of, and refusing on that would make every forward-
+    looking manifest unusable. An entry we DO recognise and cannot parse is a different
+    matter and refuses, because a floor nobody can read is a floor not being enforced.
+    """
+    from mini_bdx_runtime.runtime_version import satisfies
+
+    floor = manifest.assumes.get("runtime")
+    if not floor:
+        return
+    try:
+        ok = satisfies(str(floor), runtime_version)
+    except ValueError as exc:
+        raise ComponentError(
+            "COMPONENT_ASSUMPTION_UNMET",
+            f"{manifest.id}: cannot read its runtime requirement {floor!r}: {exc}",
+        ) from exc
+    if not ok:
+        raise ComponentError(
+            "COMPONENT_ASSUMPTION_UNMET",
+            f"{manifest.id} needs runtime {floor}, this runtime is {runtime_version}",
+        )
+
+
 def check_embodiment(manifest: ComponentManifest, embodiment: str) -> None:
     """This policy was built for this robot. A DK1 policy on a duck is not a contract
     mismatch to be explained by block names — it is the wrong robot entirely."""
@@ -541,7 +569,12 @@ def _write_json(path: Path, data) -> None:
 def active_state(root: Path | None = None) -> dict:
     """`{"active": id|None, "previous": id|None}`."""
     state = _read_json(catalogue_dir(root) / ACTIVE_FILE, {})
-    return {"active": state.get("active"), "previous": state.get("previous")}
+    return {
+        "active": state.get("active"),
+        "previous": state.get("previous"),
+        "runtimeVersion": state.get("runtimeVersion"),
+        "loopFingerprint": state.get("loopFingerprint"),
+    }
 
 
 def invalid_components(root: Path | None = None) -> dict:
@@ -613,8 +646,11 @@ def activate(
             "upload it again to try a different build",
         )
 
+    from mini_bdx_runtime.runtime_version import RUNTIME_VERSION
+
     component = staged_component(component_id, root=root)
     check_embodiment(component.manifest, embodiment)
+    check_assumes(component.manifest, runtime_version=RUNTIME_VERSION)
     check_contract(component.manifest, loop_spec)
     verify_hash(component)
 
@@ -645,12 +681,22 @@ def activate(
 
     state = active_state(root)
     previous = state["active"]
+    from mini_bdx_runtime.runtime_version import RUNTIME_VERSION, loop_fingerprint
+
     _write_json(
         catalogue_dir(root) / ACTIVE_FILE,
         # The one being replaced becomes previous. A component that is re-activated
         # must not become its own previous, or rollback is a no-op exactly when it is
         # needed most.
-        {"active": component_id, "previous": previous if previous != component_id else state["previous"]},
+        {
+            "active": component_id,
+            "previous": previous if previous != component_id else state["previous"],
+            # What the loop looked like when this was proved to fit it. A runtime
+            # upgrade changes these under an untouched component, which is the gap
+            # check_still_fits closes.
+            "runtimeVersion": RUNTIME_VERSION,
+            "loopFingerprint": loop_fingerprint(),
+        },
     )
     return active_state(root)
 
@@ -675,7 +721,15 @@ def rollback(*, root: Path | None = None) -> dict:
             f"the previous component {previous!r} is no longer installed",
         )
     _write_json(
-        catalogue_dir(root) / ACTIVE_FILE, {"active": previous, "previous": state["active"]}
+        catalogue_dir(root) / ACTIVE_FILE,
+        {
+            "active": previous,
+            "previous": state["active"],
+            # Carried, not re-stamped. Rolling back does not re-prove anything, so
+            # claiming this runtime validated it would be a lie the next check trusts.
+            "runtimeVersion": state.get("runtimeVersion"),
+            "loopFingerprint": state.get("loopFingerprint"),
+        },
     )
     return active_state(root)
 
@@ -690,3 +744,52 @@ def resolve_active(
     if fallback:
         return fallback
     raise ComponentError("COMPONENT_NOT_FOUND", "no component is active and no default is set")
+
+
+def check_still_fits(
+    component: Component, *, root: Path | None = None, loop_spec: tuple[ObsBlock, ...]
+) -> None:
+    """Re-check a component against the loop it is about to feed, after an upgrade.
+
+    Install-time checking is not enough, and this is the gap that only appears once you
+    read the two repos together. `tnkr upgrade openduck-mini` versions the RUNTIME;
+    Phase 1 versions the COMPONENTS inside it. The loop lives in the runtime, so an
+    upgrade can change the observation contract under a component that was never
+    touched — it still hashes correctly, still says the same thing about itself, and is
+    now wrong. Nothing at install time can see that, because at install time it was
+    right.
+
+    Cheap by design: compare the recorded fingerprint against this runtime's. Equal
+    means the loop is the one the component was proved against and there is nothing to
+    do. Only a difference pays for the full re-check.
+    """
+    from mini_bdx_runtime.runtime_version import RUNTIME_VERSION, loop_fingerprint
+
+    state = active_state(root)
+    recorded = state.get("loopFingerprint")
+    current = loop_fingerprint()
+    if recorded == current:
+        return
+
+    # The loop moved. Everything below re-runs what activation ran, and a failure here
+    # names the upgrade rather than the component, because the component did not change.
+    try:
+        check_assumes(component.manifest, runtime_version=RUNTIME_VERSION)
+        check_contract(component.manifest, loop_spec)
+    except ComponentError as exc:
+        raise ComponentError(
+            exc.code,
+            f"{exc.detail} (the runtime changed under it: was "
+            f"{state.get('runtimeVersion') or 'unrecorded'}, is now {RUNTIME_VERSION})",
+        ) from exc
+
+    # It still fits. Record the new loop so the next start is the cheap path again.
+    _write_json(
+        catalogue_dir(root) / ACTIVE_FILE,
+        {
+            "active": state["active"],
+            "previous": state["previous"],
+            "runtimeVersion": RUNTIME_VERSION,
+            "loopFingerprint": current,
+        },
+    )

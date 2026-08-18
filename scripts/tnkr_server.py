@@ -45,6 +45,7 @@ from mini_bdx_runtime.components import (
     activate as activate_component,
     active_state,
     invalid_components,
+    check_still_fits,
     resolve_active,
     rollback as rollback_component,
     discard_staged,
@@ -1801,6 +1802,17 @@ def _walk_start_locked(body: WalkStartRequest):
         raise HTTPException(
             status_code=status, detail={"code": exc.code, "detail": exc.detail}
         )
+
+    # And re-check it against the loop as it is NOW, not as it was at install time.
+    # `tnkr upgrade` versions the runtime while Phase 1 versions the components inside
+    # it, so an upgrade can change the observation contract under a component nobody
+    # touched: it still hashes correctly, still says the same thing about itself, and
+    # is now wrong. Cheap when nothing moved — a fingerprint comparison — and only pays
+    # for the full re-check when the loop actually changed.
+    try:
+        check_still_fits(component, loop_spec=WALK_OBS_SPEC)
+    except ComponentError as exc:
+        raise _component_http_error(exc)
 
     if is_pi:
         onnx_path = str(component.artifact_path)

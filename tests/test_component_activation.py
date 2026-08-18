@@ -93,7 +93,7 @@ def test_activating_keeps_the_one_it_replaced_as_previous(catalogue):
     _activate("walk-v2")
     _stage("walk-v3")
     state = _activate("walk-v3")
-    assert state == {"active": "walk-v3", "previous": "walk-v2"}
+    assert (state["active"], state["previous"]) == ("walk-v3", "walk-v2")
 
 
 def test_staging_is_emptied_once_it_is_installed(catalogue):
@@ -112,7 +112,7 @@ def test_reactivating_the_same_component_does_not_make_it_its_own_previous(catal
     _activate("walk-v3")
     _stage("walk-v3", payload=b"rebuilt")
     state = _activate("walk-v3")
-    assert state == {"active": "walk-v3", "previous": "walk-v2"}
+    assert (state["active"], state["previous"]) == ("walk-v3", "walk-v2")
 
 
 # --- validation failure -----------------------------------------------------
@@ -208,7 +208,8 @@ def test_rollback_restores_the_previous_component(catalogue):
     _activate("walk-v2")
     _stage("walk-v3")
     _activate("walk-v3")
-    assert rollback() == {"active": "walk-v2", "previous": "walk-v3"}
+    rolled = rollback()
+    assert (rolled["active"], rolled["previous"]) == ("walk-v2", "walk-v3")
 
 
 def test_rollback_with_no_previous_errors_cleanly(catalogue):
@@ -250,7 +251,8 @@ def test_rollback_is_reversible(catalogue):
     _stage("walk-v3")
     _activate("walk-v3")
     rollback()
-    assert rollback() == {"active": "walk-v3", "previous": "walk-v2"}
+    rolled = rollback()
+    assert (rolled["active"], rolled["previous"]) == ("walk-v3", "walk-v2")
 
 
 # --- durability -------------------------------------------------------------
@@ -269,7 +271,8 @@ def test_an_unreadable_active_file_reads_as_nothing_active_rather_than_crashing(
     _stage("walk-v3")
     _activate("walk-v3")
     (catalogue_dir() / "active.json").write_text("{ truncated")
-    assert active_state() == {"active": None, "previous": None}
+    assert active_state()["active"] is None
+    assert active_state()["previous"] is None
     assert resolve_active(fallback="walk-v2") == "walk-v2"
 
 
@@ -376,7 +379,8 @@ def test_rollback_over_http(client, catalogue):
     _activate("walk-v3")
     res = client.post("/api/components/rollback")
     assert res.status_code == 200
-    assert res.json() == {"active": "walk-v2", "previous": "walk-v3"}
+    body = res.json()
+    assert (body["active"], body["previous"]) == ("walk-v2", "walk-v3")
 
 
 def test_rollback_with_nothing_to_roll_back_to_is_a_clean_409(client, catalogue):
@@ -385,3 +389,102 @@ def test_rollback_with_nothing_to_roll_back_to_is_a_clean_409(client, catalogue)
     res = client.post("/api/components/rollback")
     assert res.status_code == 409
     assert res.json()["detail"]["code"] == "COMPONENT_NO_PREVIOUS"
+
+
+# --- a runtime upgrade under an untouched component -------------------------
+
+def test_a_runtime_upgrade_that_changes_the_loop_refuses_the_component(catalogue, monkeypatch):
+    """The gap that only appears once you read the two repos together.
+
+    tnkr upgrade versions the RUNTIME; Phase 1 versions the COMPONENTS inside it. The
+    loop lives in the runtime, so an upgrade can change the contract under a component
+    nobody touched. Install-time checking cannot see it, because at install time it was
+    right.
+    """
+    from mini_bdx_runtime import runtime_version
+    from mini_bdx_runtime.components import check_still_fits, staged_component
+
+    _stage("walk-v3")
+    _activate("walk-v3")
+    installed = _installed_component("walk-v3")
+
+    # nothing changed: the cheap path, no complaint
+    check_still_fits(installed, loop_spec=WALK_OBS_SPEC)
+
+    # the runtime upgrades and its loop gains a block
+    upgraded = WALK_OBS_SPEC + (type(WALK_OBS_SPEC[0])("new_sensor", (4,)),)
+    monkeypatch.setattr(runtime_version, "RUNTIME_VERSION", "3.0.0")
+    monkeypatch.setattr(runtime_version, "loop_fingerprint", lambda: "a-different-loop")
+
+    with pytest.raises(ComponentError) as exc:
+        check_still_fits(installed, loop_spec=upgraded)
+    assert exc.value.code == "COMPONENT_CONTRACT_MISMATCH"
+    # the message blames the upgrade, not the component, because the component is unchanged
+    assert "the runtime changed under it" in exc.value.detail
+    assert "is now 3.0.0" in exc.value.detail
+
+
+def test_a_runtime_upgrade_that_leaves_the_loop_alone_re_stamps_and_moves_on(
+    catalogue, monkeypatch
+):
+    from mini_bdx_runtime import runtime_version
+    from mini_bdx_runtime.components import active_state, check_still_fits
+
+    _stage("walk-v3")
+    _activate("walk-v3")
+    installed = _installed_component("walk-v3")
+
+    monkeypatch.setattr(runtime_version, "RUNTIME_VERSION", "2.1.0")
+    monkeypatch.setattr(runtime_version, "loop_fingerprint", lambda: "same-blocks-new-digest")
+    check_still_fits(installed, loop_spec=WALK_OBS_SPEC)
+
+    state = active_state()
+    assert state["runtimeVersion"] == "2.1.0"
+    assert state["loopFingerprint"] == "same-blocks-new-digest"
+
+
+def test_a_component_that_needs_a_newer_runtime_is_refused_at_activation(catalogue):
+    _stage("from-the-future", assumes={"runtime": ">=9.0.0"})
+    with pytest.raises(ComponentError) as exc:
+        _activate("from-the-future")
+    assert exc.value.code == "COMPONENT_ASSUMPTION_UNMET"
+    assert "9.0.0" in exc.value.detail
+
+
+def test_an_unreadable_runtime_floor_refuses_rather_than_passing(catalogue):
+    """A floor nobody can parse is a floor not being enforced, and silently passing it
+    is the worst of the three outcomes."""
+    _stage("odd", assumes={"runtime": "sometime after tuesday"})
+    with pytest.raises(ComponentError) as exc:
+        _activate("odd")
+    assert exc.value.code == "COMPONENT_ASSUMPTION_UNMET"
+
+
+def test_an_assumption_this_runtime_has_never_heard_of_is_ignored(catalogue):
+    """A component built for a newer runtime may declare things this one does not know.
+    Refusing on that would make every forward-looking manifest unusable."""
+    _stage("forward-looking", assumes={"runtime": ">=2.0.0", "some_future_thing": "yes"})
+    assert _activate("forward-looking")["active"] == "forward-looking"
+
+
+def test_rollback_does_not_claim_this_runtime_validated_the_old_component(catalogue, monkeypatch):
+    """Carried, not re-stamped. Claiming otherwise is a lie the next check trusts."""
+    from mini_bdx_runtime import runtime_version
+    from mini_bdx_runtime.components import active_state
+
+    _stage("walk-v2")
+    _activate("walk-v2")
+    _stage("walk-v3")
+    _activate("walk-v3")
+    stamped = active_state()["loopFingerprint"]
+
+    monkeypatch.setattr(runtime_version, "loop_fingerprint", lambda: "moved-on")
+    rollback()
+    assert active_state()["loopFingerprint"] == stamped
+
+
+def _installed_component(component_id):
+    """The component as installed, which is what a start-up re-check sees."""
+    from mini_bdx_runtime.components import resolve
+
+    return resolve(component_id)

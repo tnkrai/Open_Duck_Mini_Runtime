@@ -488,3 +488,30 @@ def _installed_component(component_id):
     from mini_bdx_runtime.components import resolve
 
     return resolve(component_id)
+
+
+def test_the_recheck_leaves_no_trace_when_nothing_has_been_activated(catalogue):
+    """A duck nobody has installed anything on runs the policy shipped with the
+    runtime, which moves with the runtime by construction and can never be stale. The
+    first version re-checked it anyway and stamped {"active": null} into the catalogue
+    on every single walk start."""
+    from mini_bdx_runtime.components import active_state, catalogue_dir, check_still_fits, resolve_builtin
+    import tnkr_server
+
+    shipped = resolve_builtin("walk-v2", pathlib.Path(tnkr_server.__file__).parent)
+    check_still_fits(shipped, loop_spec=WALK_OBS_SPEC)
+    assert not (catalogue_dir() / "active.json").exists()
+    assert active_state()["active"] is None
+
+
+def test_the_recheck_ignores_a_component_that_is_not_the_active_one(catalogue):
+    _stage("walk-v2")
+    _activate("walk-v2")
+    _stage("walk-v3")
+    _activate("walk-v3")
+    before = active_state()
+
+    from mini_bdx_runtime.components import check_still_fits, resolve
+
+    check_still_fits(resolve("walk-v2"), loop_spec=WALK_OBS_SPEC)
+    assert active_state() == before

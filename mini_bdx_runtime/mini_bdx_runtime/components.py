@@ -766,6 +766,16 @@ def check_still_fits(
     from mini_bdx_runtime.runtime_version import RUNTIME_VERSION, loop_fingerprint
 
     state = active_state(root)
+    if state["active"] != component.manifest.id:
+        # Not the active component, so there is nothing recorded about which loop it
+        # was proved against and nothing to compare. The usual case is a duck nobody
+        # has installed anything on, running the policy SHIPPED with the runtime — and
+        # that one moves with the runtime by construction, so it can never be the thing
+        # this function exists to catch. Returning early also stops a record being
+        # stamped for a component that is not the active one, which is what the first
+        # version did: it wrote {"active": null} into the catalogue on every start.
+        return
+
     recorded = state.get("loopFingerprint")
     current = loop_fingerprint()
     if recorded == current:

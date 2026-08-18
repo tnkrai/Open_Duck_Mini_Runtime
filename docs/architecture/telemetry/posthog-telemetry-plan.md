@@ -1,5 +1,26 @@
 # PostHog Analytics for Open Duck Mini Runtime (v3)
 
+> **Partly superseded (2026-08-18).** This plan still describes what the runtime
+> sends and why, and all of that is accurate. Two things it decided have since
+> changed, both in
+> [`identity-and-ownership.md`](identity-and-ownership.md), which points at the
+> cross-repo design of record:
+>
+> 1. **The project.** This plan created a separate "Tnkr Robots" project to keep
+>    robot events out of Tnkr Prod. The runtime now reports to **Tnkr Prod**
+>    instead. A merge in PostHog is scoped to one project, so a robot's history
+>    and the account that owns it have to be in the same one or they can never be
+>    joined. Mentions of "Tnkr Robots" below, including the dashboard plan, read
+>    as Tnkr Prod.
+> 2. **Anonymity is now conditional.** This plan assumed a `device_id` that is
+>    anonymous forever. It still is on the robot, but a signed-in owner
+>    connecting the robot in Tnkr Studio links it to their Tnkr account, which
+>    makes the robot's earlier events attributable. Nothing on the robot does
+>    this and nothing on the robot can; see the README's telemetry section for
+>    what customers are told.
+>
+> Everything else here stands.
+
 ## Context
 
 We want visibility into how people's OpenDucks behave in the wild: what hardware they run (Pi model, RAM, OS, and especially which servo USB adapter chip — CH343 vs FTDI on v3), whether each install step and each API-driven setup step (motor check, calibration, IMU calibration, walk start) succeeds, and the *exact cause* when one fails. Telemetry must be respectful: enabled by default with a clear notice and an easy opt-out, anonymous device ID, and **never** the 10–50Hz joint stream (only a `cloud_streaming` boolean).

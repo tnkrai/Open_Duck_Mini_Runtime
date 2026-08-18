@@ -322,3 +322,171 @@ def prepare(
     verify_hash(component)
     check_contract(component.manifest, loop_spec)
     return component
+
+
+# ---------------------------------------------------------------------------
+# Staging: where a component lives between arriving and being trusted
+# ---------------------------------------------------------------------------
+# Decision 6 and Decision 14. An upload is not an installation. Bytes arrive, get
+# hashed, and sit in staging until something has proved they LOAD — because the unit
+# has Restart=on-failure with StartLimitBurst=5, so a component that crashes the server
+# on load burns five restarts and then systemd refuses to start the unit at all. At
+# that point the thing you would use to roll back is the thing that will not start.
+#
+# So staging is not tidiness. It is the property that an unloadable component can never
+# become the persisted active choice.
+
+
+def staging_dir(root: Path | None = None) -> Path:
+    return catalogue_dir(root) / ".staging"
+
+
+def stage_manifest(component_id: str, data: dict, *, root: Path | None = None) -> ComponentManifest:
+    """Park a manifest for a component whose bytes have not arrived yet.
+
+    Parsed and validated NOW rather than at activation. A malformed manifest should be
+    refused before an operator spends a Pi Zero's wifi on an 800K upload that was never
+    going to be accepted.
+    """
+    if not component_id or "/" in component_id or component_id.startswith("."):
+        raise ComponentError("COMPONENT_NOT_FOUND", f"invalid component id {component_id!r}")
+    manifest = ComponentManifest.from_dict(data)
+    if manifest.id != component_id:
+        raise ComponentError(
+            "COMPONENT_MANIFEST_INVALID",
+            f"manifest says id={manifest.id!r} but it is being installed as {component_id!r}",
+        )
+    base = staging_dir(root) / component_id
+    base.mkdir(parents=True, exist_ok=True)
+    # A new manifest invalidates any half-uploaded artifact staged against the old one.
+    # Leaving it would let a hash from manifest A be checked against bytes uploaded for
+    # manifest B, which is the one combination that could pass while being wrong.
+    artifact = base / "artifact.onnx"
+    if artifact.exists():
+        artifact.unlink()
+    (base / "manifest.json").write_text(json.dumps(manifest.to_dict()))
+    return manifest
+
+
+def staged_manifest(component_id: str, *, root: Path | None = None) -> ComponentManifest:
+    path = staging_dir(root) / component_id / "manifest.json"
+    if not path.is_file():
+        raise ComponentError(
+            "COMPONENT_NOT_FOUND", f"nothing staged for {component_id!r}; send its manifest first"
+        )
+    try:
+        return ComponentManifest.from_dict(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ComponentError("COMPONENT_MANIFEST_INVALID", f"{path}: {exc}") from exc
+
+
+class ArtifactWriter:
+    """Writes an artifact to staging one chunk at a time, hashing as it goes.
+
+    Exists so the async HTTP path and the sync helper share ONE implementation of
+    "write, hash, verify, delete on mismatch". The first version of the endpoint
+    collected `request.stream()` into a list and handed it to a synchronous writer,
+    which reads like streaming and is not: the list held the entire artifact, so the
+    memory shape was identical to taking a `bytes` body. This class is what makes the
+    async path genuinely incremental — a chunk is written and forgotten before the next
+    one arrives.
+    """
+
+    def __init__(self, component_id: str, *, root: Path | None = None) -> None:
+        self.manifest = staged_manifest(component_id, root=root)
+        self.component_id = component_id
+        base = staging_dir(root) / component_id
+        base.mkdir(parents=True, exist_ok=True)
+        self.path = base / "artifact.onnx"
+        self._digest = hashlib.sha256()
+        self._written = 0
+        self._fh = self.path.open("wb")
+
+    def write(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        try:
+            self._digest.update(chunk)
+            self._fh.write(chunk)
+            self._written += len(chunk)
+        except OSError as exc:
+            self.abort()
+            raise ComponentError("COMPONENT_WRITE_FAILED", f"{self.path}: {exc}") from exc
+
+    def abort(self) -> None:
+        """Close and remove. Bytes that failed their check are not a partial success to
+        resume from; leaving them invites a later call to find a file and assume it was
+        verified."""
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        self.path.unlink(missing_ok=True)
+
+    def finish(self) -> int:
+        try:
+            self._fh.close()
+        except OSError as exc:
+            self.path.unlink(missing_ok=True)
+            raise ComponentError("COMPONENT_WRITE_FAILED", f"{self.path}: {exc}") from exc
+
+        if self._written == 0:
+            self.path.unlink(missing_ok=True)
+            raise ComponentError("COMPONENT_HASH_MISMATCH", "no bytes were uploaded")
+
+        actual = self._digest.hexdigest()
+        if actual != self.manifest.hash:
+            self.path.unlink(missing_ok=True)
+            raise ComponentError(
+                "COMPONENT_HASH_MISMATCH",
+                f"{self.component_id}: uploaded {self._written} bytes hashing to "
+                f"{actual}, manifest says {self.manifest.hash}",
+            )
+        return self._written
+
+
+def stage_artifact(component_id: str, chunks, *, root: Path | None = None) -> int:
+    """Write an artifact to staging from an iterable of chunks. Returns bytes written.
+
+    NEVER holds the artifact in memory, and never holds it in memory "briefly" either:
+    each chunk is written and hashed and dropped. tnkr-robot.service.template caps this
+    process at MemoryMax=384M on a 512MB Pi Zero 2 W, and that device is documented to
+    fail SILENTLY when it runs out — an OOM kill mid-upload looks like the robot simply
+    stopping. 884K is fine today and a camera-conditioned policy is not, which is the
+    whole reason this is a stream rather than a `body: bytes`.
+
+    A hash mismatch DELETES the staged artifact rather than leaving it. Bytes that
+    failed their check are not a partial success to resume from; leaving them invites a
+    later call to find a file and assume it was verified.
+    """
+    writer = ArtifactWriter(component_id, root=root)
+    try:
+        for chunk in chunks:
+            writer.write(chunk)
+    except ComponentError:
+        raise
+    except Exception:
+        writer.abort()
+        raise
+    return writer.finish()
+
+
+def staged_component(component_id: str, *, root: Path | None = None) -> Component:
+    """What is staged, if both halves arrived."""
+    manifest = staged_manifest(component_id, root=root)
+    artifact = staging_dir(root) / component_id / "artifact.onnx"
+    if not artifact.is_file():
+        raise ComponentError(
+            "COMPONENT_NOT_FOUND",
+            f"{component_id!r} has a staged manifest but no artifact yet",
+        )
+    return Component(manifest=manifest, artifact_path=artifact)
+
+
+def discard_staged(component_id: str, *, root: Path | None = None) -> None:
+    """Throw away a staged component. Never touches what is installed."""
+    import shutil as _shutil
+
+    base = staging_dir(root) / component_id
+    if base.is_dir():
+        _shutil.rmtree(base, ignore_errors=True)

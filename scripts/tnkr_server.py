@@ -42,6 +42,11 @@ import uvicorn
 from mini_bdx_runtime.components import (
     ArtifactWriter,
     ComponentError,
+    activate as activate_component,
+    active_state,
+    invalid_components,
+    resolve_active,
+    rollback as rollback_component,
     discard_staged,
     prepare,
     stage_manifest,
@@ -1654,6 +1659,68 @@ def component_discard(component_id: str):
     return Response(status_code=204)
 
 
+@app.post("/api/components/{component_id}/activate")
+def component_activate(component_id: str):
+    """Promote a staged component to active, if it loads.
+
+    Two-phase on purpose. The unit has Restart=on-failure with StartLimitBurst=5, so a
+    component that crashes the server on load burns five restarts and then systemd
+    refuses to start the unit at all — and the thing you would use to roll back is the
+    thing that will not start. Validation runs in a child process, and a component that
+    fails it is recorded and never retried, because retrying IS the five restarts.
+    """
+    try:
+        return activate_component(
+            component_id, embodiment=EMBODIMENT, loop_spec=WALK_OBS_SPEC
+        )
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+
+
+@app.post("/api/components/rollback")
+def component_rollback():
+    """Make the previous component active again.
+
+    Studio surfaces this; `tnkr rollback` is the CLI escape hatch for when a bad policy
+    has left the duck unable to walk and Studio is the wrong tool, because Studio needs
+    a working robot to be useful. That path must ALSO clear the systemd lockout
+    (`systemctl reset-failed`), or it restores a component onto a unit that still
+    refuses to start.
+    """
+    try:
+        return rollback_component()
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+
+
+@app.get("/api/components")
+def component_list():
+    """What is installed, what is running, and what was refused."""
+    from mini_bdx_runtime.components import ComponentManifest, catalogue_dir
+
+    installed = []
+    base = catalogue_dir()
+    if base.is_dir():
+        for entry in sorted(base.iterdir()):
+            manifest_path = entry / "manifest.json"
+            if not entry.is_dir() or entry.name.startswith(".") or not manifest_path.is_file():
+                continue
+            try:
+                installed.append(
+                    ComponentManifest.from_dict(json.loads(manifest_path.read_text())).to_dict()
+                )
+            except (ComponentError, OSError, json.JSONDecodeError):
+                # A broken entry is reported as broken rather than omitted: a component
+                # an operator installed and cannot see is worse than one they can see
+                # is damaged.
+                installed.append({"id": entry.name, "broken": True})
+    return {
+        "installed": installed,
+        **active_state(),
+        "invalid": invalid_components(),
+    }
+
+
 @app.post("/api/walk/start")
 def walk_start(body: WalkStartRequest = WalkStartRequest()):
     """Start the walk script with streaming enabled.
@@ -1707,7 +1774,10 @@ def _walk_start_locked(body: WalkStartRequest):
     # second file existed, and NOTHING checked that the model matched the loop feeding
     # it. A policy trained against a different observation order loads happily and
     # walks the duck into the floor. Only the spawn below is platform-specific now.
-    component_id = body.componentId or DEFAULT_COMPONENT_ID
+    # What the caller asked for, else whatever was last activated, else the policy
+    # shipped with the runtime. The middle term is the one Phase 1b adds: before it,
+    # installing a policy could not change what actually ran.
+    component_id = body.componentId or resolve_active(fallback=DEFAULT_COMPONENT_ID)
     try:
         component = prepare(
             component_id,

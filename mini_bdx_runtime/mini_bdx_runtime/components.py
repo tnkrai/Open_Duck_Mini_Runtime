@@ -358,6 +358,10 @@ def stage_manifest(component_id: str, data: dict, *, root: Path | None = None) -
         )
     base = staging_dir(root) / component_id
     base.mkdir(parents=True, exist_ok=True)
+    # Re-uploading is the ONLY way to clear a failed validation. Activation refuses a
+    # known-bad component outright rather than retrying it, so without this an operator
+    # who fixed and re-uploaded a policy could never activate it.
+    clear_invalid(component_id, root=root)
     # A new manifest invalidates any half-uploaded artifact staged against the old one.
     # Leaving it would let a hash from manifest A be checked against bytes uploaded for
     # manifest B, which is the one combination that could pass while being wrong.
@@ -490,3 +494,199 @@ def discard_staged(component_id: str, *, root: Path | None = None) -> None:
     base = staging_dir(root) / component_id
     if base.is_dir():
         _shutil.rmtree(base, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Activation: two-phase, crash-safe, and never retried
+# ---------------------------------------------------------------------------
+# Decision 6, and the reason it is two-phase rather than one.
+#
+# tnkr-robot.service.template has Restart=on-failure, StartLimitIntervalSec=300 and
+# StartLimitBurst=5. A component that crashes the server on load gets five restarts and
+# then systemd refuses to start the unit until someone runs `systemctl reset-failed`.
+# At that point the thing you would use to roll back is the thing that will not start,
+# and the duck is bricked until a person is physically at it.
+#
+# So an unloadable component must never become the persisted active choice. Validation
+# happens in a SUBPROCESS — the cgroup applies there, so an OOM is contained — and only
+# a clean exit promotes staging to active.
+#
+# AN OOM-KILLED VALIDATION IS `INVALID`, NEVER "transient, retry". This is the single
+# most important line in this file. Retrying is how you reach the lockout: five
+# attempts at a component that OOMs is exactly five restarts. A component that failed
+# validation is recorded as failed and is never validated again without being
+# re-uploaded.
+
+ACTIVE_FILE = "active.json"
+INVALID_FILE = "invalid.json"
+
+
+def _read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write-then-rename: a power cut mid-write must not leave a truncated active.json,
+    # because the file that says which policy to run is the file you cannot afford to
+    # lose. A Pi loses power by being unplugged, which is the normal way it is turned off.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def active_state(root: Path | None = None) -> dict:
+    """`{"active": id|None, "previous": id|None}`."""
+    state = _read_json(catalogue_dir(root) / ACTIVE_FILE, {})
+    return {"active": state.get("active"), "previous": state.get("previous")}
+
+
+def invalid_components(root: Path | None = None) -> dict:
+    """Components that failed validation, and why. Never retried."""
+    return _read_json(catalogue_dir(root) / INVALID_FILE, {})
+
+
+def mark_invalid(component_id: str, reason: str, *, root: Path | None = None) -> None:
+    record = invalid_components(root)
+    record[component_id] = reason
+    _write_json(catalogue_dir(root) / INVALID_FILE, record)
+
+
+def clear_invalid(component_id: str, *, root: Path | None = None) -> None:
+    """Only a fresh upload clears the mark — see stage_manifest."""
+    record = invalid_components(root)
+    if record.pop(component_id, None) is not None:
+        _write_json(catalogue_dir(root) / INVALID_FILE, record)
+
+
+def default_validator(component: Component) -> "subprocess.CompletedProcess":
+    """Load the component in a child process and see whether it survives.
+
+    A child, so an OOM kill lands on something disposable. The cgroup that caps this
+    service applies to its children, so a policy too large to load fails HERE — bounded,
+    reported, and with the running server untouched — rather than by taking the server
+    down on the next start and spending the restart budget doing it.
+    """
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "-c", _VALIDATE_SNIPPET, str(component.artifact_path)],
+        capture_output=True,
+        timeout=120,
+    )
+
+
+# Runs in the child. Imports onnxruntime only here, which is why none of this module
+# needs it: CI has no onnxruntime and tests substitute their own validator.
+_VALIDATE_SNIPPET = (
+    "import sys\n"
+    "import onnxruntime\n"
+    "onnxruntime.InferenceSession(sys.argv[1], providers=['CPUExecutionProvider'])\n"
+)
+
+
+def activate(
+    component_id: str,
+    *,
+    root: Path | None = None,
+    embodiment: str,
+    loop_spec: tuple[ObsBlock, ...],
+    validator=None,
+) -> dict:
+    """Promote a staged component to active, if it loads. Returns the new state.
+
+    Order: refuse anything already known bad, re-check the contract against the loop it
+    is about to feed, validate in a subprocess, and only then move files and repoint
+    active. Nothing before the final step changes what the robot runs, so every failure
+    leaves the previous policy in place and running.
+    """
+    if component_id in invalid_components(root):
+        # Never revalidated. Five attempts at a component that OOMs is five restarts,
+        # and five restarts is the lockout.
+        raise ComponentError(
+            "COMPONENT_VALIDATION_FAILED",
+            f"{component_id} already failed validation and will not be retried; "
+            "upload it again to try a different build",
+        )
+
+    component = staged_component(component_id, root=root)
+    check_embodiment(component.manifest, embodiment)
+    check_contract(component.manifest, loop_spec)
+    verify_hash(component)
+
+    result = (validator or default_validator)(component)
+    returncode = getattr(result, "returncode", 1)
+    if returncode != 0:
+        # Negative means a signal. -9 is SIGKILL, which on this device is
+        # overwhelmingly the OOM killer, and it is INVALID like any other failure —
+        # "the machine was busy, try again" is the reasoning that reaches the lockout.
+        how = f"killed by signal {-returncode}" if returncode < 0 else f"exit {returncode}"
+        stderr = getattr(result, "stderr", b"") or b""
+        detail = f"{component_id} failed to load ({how})"
+        if stderr:
+            detail += f": {stderr.decode('utf-8', 'replace')[:400]}"
+        mark_invalid(component_id, detail, root=root)
+        discard_staged(component_id, root=root)
+        raise ComponentError("COMPONENT_VALIDATION_FAILED", detail)
+
+    # It loads. Move it in, then repoint — in that order, so a crash between the two
+    # leaves the old policy active and the new one merely present.
+    import shutil as _shutil
+
+    installed = catalogue_dir(root) / component_id
+    if installed.exists():
+        _shutil.rmtree(installed, ignore_errors=True)
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.move(str(staging_dir(root) / component_id), str(installed))
+
+    state = active_state(root)
+    previous = state["active"]
+    _write_json(
+        catalogue_dir(root) / ACTIVE_FILE,
+        # The one being replaced becomes previous. A component that is re-activated
+        # must not become its own previous, or rollback is a no-op exactly when it is
+        # needed most.
+        {"active": component_id, "previous": previous if previous != component_id else state["previous"]},
+    )
+    return active_state(root)
+
+
+def rollback(*, root: Path | None = None) -> dict:
+    """Make the previous component active again. The escape hatch, robot-side.
+
+    Does NOT validate: previous was validated when it was activated and has been
+    running. Re-validating here would mean the recovery path can fail for a new reason
+    at the moment recovery is needed.
+    """
+    state = active_state(root)
+    previous = state["previous"]
+    if not previous:
+        raise ComponentError(
+            "COMPONENT_NO_PREVIOUS",
+            "nothing to roll back to; only one component has ever been active",
+        )
+    if not (catalogue_dir(root) / previous / "manifest.json").is_file():
+        raise ComponentError(
+            "COMPONENT_NOT_FOUND",
+            f"the previous component {previous!r} is no longer installed",
+        )
+    _write_json(
+        catalogue_dir(root) / ACTIVE_FILE, {"active": previous, "previous": state["active"]}
+    )
+    return active_state(root)
+
+
+def resolve_active(
+    *, root: Path | None = None, fallback: str | None = None
+) -> str:
+    """Which component the robot should run. The active one, or a named fallback."""
+    active = active_state(root)["active"]
+    if active:
+        return active
+    if fallback:
+        return fallback
+    raise ComponentError("COMPONENT_NOT_FOUND", "no component is active and no default is set")

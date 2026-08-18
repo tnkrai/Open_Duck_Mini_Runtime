@@ -327,6 +327,7 @@ TELEMETRY_EXCLUDED_PATHS = {
     "/api/head/puppet",           # on-screen joystick stream
     "/api/health",                # dashboard polling
     "/api/imu/calibrate/status",  # calibration UI polling
+    "/api/telemetry/identity",    # asking who we are is not an event about us
 }
 
 
@@ -471,6 +472,29 @@ app.add_middleware(
 )
 
 # ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/telemetry/identity")
+def telemetry_identity():
+    """This robot's anonymous telemetry id, so Studio knows which duck it reached.
+
+    Read-only and deliberately dull. It returns a random UUID and a boolean, and
+    nothing else — no owner, no account, no claim state. Ownership is decided in
+    tnkr-core behind a verified Supabase token, precisely because this server
+    authenticates nobody and is reachable from any page the operator visits.
+
+    There is no write counterpart, and adding one is not a small change: it would
+    let anything on the network (or any webpage) assert who owns this robot.
+
+    Telemetry off => {"enabled": false} with no id at all, so opting out on the
+    robot also prevents a signed-in Studio session from claiming it.
+    """
+    snapshot = telemetry.identity_snapshot()
+    body = {"enabled": bool(snapshot.get("enabled"))}
+    device = snapshot.get("device_id")
+    if device:
+        body["deviceId"] = device
+    return body
+
 
 @app.get("/api/health")
 def health():

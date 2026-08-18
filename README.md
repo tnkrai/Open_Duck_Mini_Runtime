@@ -209,3 +209,14 @@ is identified only by a random UUID generated on first install.
 The setup script shows a notice (with an opt-out prompt when run
 interactively) before sending anything. `~/.tnkr-telemetry.json` survives
 `setup.sh --clean` so reinstalls keep the same anonymous id.
+
+**`GET /api/telemetry/identity`** lets Tnkr Studio ask this robot which duck it
+is, so a signed-in owner's robot can be recognised as theirs. It returns the
+anonymous UUID and the on/off flag, and nothing else — no account, no owner, no
+name. It is read-only: there is no way to set an owner on the robot, because
+this server authenticates nobody. Ownership is recorded by Tnkr's backend, which
+does verify who is asking.
+
+If telemetry is off on this robot, the endpoint reports only `{"enabled":
+false}` and withholds the id, so opting out here also prevents the robot from
+being linked to any account.

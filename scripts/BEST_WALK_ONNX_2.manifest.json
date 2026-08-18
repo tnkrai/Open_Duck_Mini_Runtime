@@ -1,0 +1,80 @@
+{
+  "id": "walk-v2",
+  "version": "2.0.0",
+  "hash": "3c606f9381a1710cc8fecdb7442787dcbfce3ee9bc02a6f1224774ab2b3a1067",
+  "kind": "policy",
+  "embodiment": "open-duck-mini",
+  "obsSpec": [
+    {
+      "name": "gyro",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "name": "accelerometer",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "name": "commands",
+      "shape": [
+        7
+      ]
+    },
+    {
+      "name": "joint_positions_rel",
+      "shape": [
+        14
+      ]
+    },
+    {
+      "name": "joint_velocities_scaled",
+      "shape": [
+        14
+      ]
+    },
+    {
+      "name": "action_prev_1",
+      "shape": [
+        14
+      ]
+    },
+    {
+      "name": "action_prev_2",
+      "shape": [
+        14
+      ]
+    },
+    {
+      "name": "action_prev_3",
+      "shape": [
+        14
+      ]
+    },
+    {
+      "name": "motor_targets",
+      "shape": [
+        14
+      ]
+    },
+    {
+      "name": "feet_contacts",
+      "shape": [
+        2
+      ]
+    },
+    {
+      "name": "imitation_phase",
+      "shape": [
+        2
+      ]
+    }
+  ],
+  "rateHz": 50.0,
+  "assumes": {
+    "runtime": ">=2.0.0"
+  },
+  "provenance": "shipped with the runtime; the policy this repo has always run"
+}

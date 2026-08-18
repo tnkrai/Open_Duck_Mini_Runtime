@@ -39,6 +39,8 @@ import uvicorn
 
 # ── Runtime imports (available after pip install -e .) ────────────────────────
 
+from mini_bdx_runtime.components import ComponentError, prepare
+from mini_bdx_runtime.obs_spec import WALK_OBS_SPEC
 from mini_bdx_runtime.rustypot_position_hwi import HWI, find_servo_adapter
 from mini_bdx_runtime.duck_config import DuckConfig
 from mini_bdx_runtime import telemetry
@@ -51,6 +53,12 @@ from mini_bdx_runtime import walk_offsets
 HOME_DIR = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME_DIR, "duck_config.json")
 SCRIPTS_DIR = Path(__file__).parent
+
+# This robot, as Studio names it. Used to refuse a policy built for another one.
+EMBODIMENT = "open-duck-mini"
+# The policy shipped with the runtime. A caller that names nothing gets this,
+# which is exactly what the glob resolved to before ids existed.
+DEFAULT_COMPONENT_ID = "walk-v2"
 SERVER_PORT = 8000
 
 
@@ -1543,6 +1551,9 @@ class WalkStartRequest(BaseModel):
     sessionToken: str | None = None
     supabaseUrl: str | None = None
     supabaseKey: str | None = None
+    # Which policy to run. Absent means the shipped one, which is what every caller
+    # sends today and what the glob effectively chose before this was addressable.
+    componentId: str | None = None
 
 
 @app.post("/api/walk/start")
@@ -1591,15 +1602,40 @@ def _walk_start_locked(body: WalkStartRequest):
     venv_python = sys.executable
     is_pi = platform.machine() in ("aarch64", "armv7l")
 
+    # Resolve, verify and contract-check ABOVE the platform gate, so the answer is the
+    # same on a Pi and on a laptop and CI can execute all three. This used to be
+    # `SCRIPTS_DIR.glob("*.onnx")` and take `[0]`, inside `if is_pi:`. Two problems,
+    # and the second is the real one: which policy ran became arbitrary the moment a
+    # second file existed, and NOTHING checked that the model matched the loop feeding
+    # it. A policy trained against a different observation order loads happily and
+    # walks the duck into the floor. Only the spawn below is platform-specific now.
+    component_id = body.componentId or DEFAULT_COMPONENT_ID
+    try:
+        component = prepare(
+            component_id,
+            embodiment=EMBODIMENT,
+            loop_spec=WALK_OBS_SPEC,
+            builtin_dir=SCRIPTS_DIR,
+        )
+    except ComponentError as exc:
+        # 404 only for "no such component"; everything else is a 409, because the
+        # component exists and is refused, which is a different thing for a caller to
+        # handle.
+        #
+        # `detail` is an OBJECT here, not the usual string. Studio maps codes to
+        # operator sentences and reads status codes otherwise, so a refusal that
+        # travels as prose arrives as a generic fallback no matter how carefully the
+        # code was chosen. This is the shape tnkr-studio already uses internally
+        # ({code, detail}); the duck agent simply never spoke it. Studio's
+        # agent_client reads `detail.code` when it is present and falls back to its
+        # status mapping when it is not, so every other endpoint here is unaffected.
+        status = 404 if exc.code == "COMPONENT_NOT_FOUND" else 409
+        raise HTTPException(
+            status_code=status, detail={"code": exc.code, "detail": exc.detail}
+        )
+
     if is_pi:
-        # Find the ONNX model — look for any .onnx file in scripts/
-        onnx_files = list(SCRIPTS_DIR.glob("*.onnx"))
-        if not onnx_files:
-            raise HTTPException(
-                status_code=404,
-                detail="No ONNX model found in scripts/ directory",
-            )
-        onnx_path = str(onnx_files[0])
+        onnx_path = str(component.artifact_path)
         walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
 
         cmd = [

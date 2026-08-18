@@ -101,8 +101,37 @@ def fake_walk_dir(tmp_path, monkeypatch):
     # Pretend to be a Pi so walk_start takes the real walk-script path (the
     # non-Pi path spawns the mock fake_broadcaster, which needs cloud creds).
     monkeypatch.setattr(tnkr_server.platform, "machine", lambda: "aarch64")
-    (tmp_path / "model.onnx").write_bytes(b"")
+    # A real catalogue entry, not a bare .onnx. This used to write an empty
+    # `model.onnx` and rely on walk_start globbing the directory and taking the first
+    # match — the behaviour Phase 1b removes, because it made WHICH policy runs
+    # arbitrary and never checked the model against the loop feeding it. These tests
+    # are about the walk lifecycle rather than about resolution, so they get a
+    # correctly published component and go back to being about what they are about.
+    install_component(tmp_path)
     return tmp_path
+
+
+def install_component(d, component_id="walk-v2", payload=b"", **manifest_over):
+    """Publish an artifact plus its manifest into a shipped-catalogue directory."""
+    import hashlib
+    import json
+
+    from mini_bdx_runtime.obs_spec import WALK_OBS_SPEC
+
+    (d / "model.onnx").write_bytes(payload)
+    manifest = {
+        "id": component_id,
+        "version": "0.0.0-test",
+        "hash": hashlib.sha256(payload).hexdigest(),
+        "kind": "policy",
+        "embodiment": "open-duck-mini",
+        "obsSpec": [{"name": b.name, "shape": list(b.shape)} for b in WALK_OBS_SPEC],
+        "rateHz": 50.0,
+        "provenance": "test fixture",
+    }
+    manifest.update(manifest_over)
+    (d / "model.manifest.json").write_text(json.dumps(manifest))
+    return d
 
 
 def write_walk_script(d, body):

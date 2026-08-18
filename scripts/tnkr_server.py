@@ -39,7 +39,14 @@ import uvicorn
 
 # ── Runtime imports (available after pip install -e .) ────────────────────────
 
-from mini_bdx_runtime.components import ComponentError, prepare
+from mini_bdx_runtime.components import (
+    ArtifactWriter,
+    ComponentError,
+    discard_staged,
+    prepare,
+    stage_manifest,
+    staged_component,
+)
 from mini_bdx_runtime.obs_spec import WALK_OBS_SPEC
 from mini_bdx_runtime.rustypot_position_hwi import HWI, find_servo_adapter
 from mini_bdx_runtime.duck_config import DuckConfig
@@ -1554,6 +1561,97 @@ class WalkStartRequest(BaseModel):
     # Which policy to run. Absent means the shipped one, which is what every caller
     # sends today and what the glob effectively chose before this was addressable.
     componentId: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Components: installing a policy onto a running robot
+# ---------------------------------------------------------------------------
+# Studio drives these, not the CLI. tnkr-cli draws the boundary already: "needs a
+# machine provisioned" is the CLI's, "needs a live robot session" is Studio's. Putting
+# the runtime on a Pi is the first; installing a policy into a running robot's
+# catalogue, contract-checked against the loop it will feed, is the second. The CLI's
+# own README names this exact boundary as the thing most likely to erode, because "get
+# a file onto the robot" pulls hard toward SSH.
+
+
+def _component_http_error(exc: ComponentError) -> HTTPException:
+    """One place that decides the status, so every component endpoint agrees.
+
+    `detail` is an object rather than a string: Studio maps codes to operator
+    sentences, and a refusal that travels as prose arrives as a generic fallback.
+    """
+    status = 404 if exc.code == "COMPONENT_NOT_FOUND" else 409
+    return HTTPException(status_code=status, detail={"code": exc.code, "detail": exc.detail})
+
+
+@app.post("/api/components/{component_id}/manifest")
+def component_stage_manifest(component_id: str, manifest: dict):
+    """Declare what is about to be uploaded.
+
+    Separate from the bytes, and first, so a malformed manifest is refused before an
+    operator spends a Pi Zero's wifi on an 800K upload that was never going to be
+    accepted. Validated here rather than at activation for the same reason.
+    """
+    try:
+        staged = stage_manifest(component_id, manifest)
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+    return {"id": staged.id, "version": staged.version, "hash": staged.hash}
+
+
+@app.put("/api/components/{component_id}/artifact")
+async def component_upload_artifact(component_id: str, request: Request):
+    """Stream the artifact to staging, hashing as it lands.
+
+    Reads `request.stream()` rather than taking a `bytes` body or an UploadFile. The
+    difference is not stylistic: this process is capped at MemoryMax=384M on a 512MB Pi
+    Zero 2 W, and that device is documented to fail SILENTLY when it runs out, so an
+    OOM kill mid-upload looks like the robot simply stopping. 884K is fine today; a
+    camera-conditioned policy is not.
+
+    Not installed by this call. The bytes are staged and hash-verified; nothing runs
+    them and nothing points at them until activation has proved they load.
+    """
+    try:
+        writer = ArtifactWriter(component_id)
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+
+    try:
+        async for chunk in request.stream():
+            # written and forgotten before the next one arrives — no list, no join,
+            # no `await request.body()`. Each of those would put the whole artifact in
+            # memory while looking like streaming.
+            writer.write(chunk)
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+    except Exception:
+        # a dropped connection mid-upload leaves nothing behind to be mistaken for a
+        # verified artifact later
+        writer.abort()
+        raise
+
+    try:
+        written = writer.finish()
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+    return {"id": component_id, "bytes": written, "staged": True}
+
+
+@app.get("/api/components/{component_id}/staged")
+def component_staged(component_id: str):
+    try:
+        component = staged_component(component_id)
+    except ComponentError as exc:
+        raise _component_http_error(exc)
+    return {"manifest": component.manifest.to_dict(), "staged": True}
+
+
+@app.delete("/api/components/{component_id}/staged")
+def component_discard(component_id: str):
+    """Throw away a staged upload. Never touches what is installed."""
+    discard_staged(component_id)
+    return Response(status_code=204)
 
 
 @app.post("/api/walk/start")

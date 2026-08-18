@@ -35,7 +35,7 @@ SWAP_SIZE_MB=2048
 # Key is write-only (can send events, cannot read data). Key/host and the
 # property names must match mini_bdx_runtime/mini_bdx_runtime/telemetry.py.
 TELEMETRY_FILE="$HOME/.tnkr-telemetry.json"
-POSTHOG_KEY="phc_FarYZWwIbyZFV2iUKyl8WyRRdFFuw2MH3NZat4zPmEK"
+POSTHOG_KEY="phc_LrCqW1g9M4Ta49ZZaeLGN7rrHkTnLC40Ey2wv2IJ5fm"
 POSTHOG_HOST="https://us.i.posthog.com"
 TELEMETRY_PROMPT_TIMEOUT_S=15
 TELEMETRY_CURL_MAX_TIME_S=3

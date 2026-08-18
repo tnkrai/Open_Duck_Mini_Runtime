@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pathlib
 
 import pytest
 
@@ -37,11 +38,17 @@ from mini_bdx_runtime.obs_spec import WALK_OBS_SPEC
 
 @pytest.fixture
 def catalogue(tmp_path, monkeypatch):
-    """A catalogue rooted in a temp dir, so no test touches a real home."""
-    monkeypatch.setattr(
-        "mini_bdx_runtime.components.catalogue_dir",
-        lambda root=None: tmp_path / ".tnkr" / "components",
-    )
+    """A catalogue rooted in a temp dir, so no test touches a real home.
+
+    Patches Path.home rather than components.catalogue_dir. The first version patched
+    the function, which covers callers that look it up on the module at call time and
+    NOT callers holding a reference from `from ... import catalogue_dir` — including
+    this test file. So one test wrote an artifact into the developer's real
+    ~/.tnkr/components, beside the live robots.json the tnkr CLI keeps there, and only
+    failed once a second run found the directory already populated. Patching the root
+    catches every path into the catalogue, however it was imported.
+    """
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path
 
 

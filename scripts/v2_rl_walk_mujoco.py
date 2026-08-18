@@ -14,6 +14,7 @@ from mini_bdx_runtime.eyes import Eyes
 from mini_bdx_runtime.sounds import Sounds
 from mini_bdx_runtime.antennas import Antennas
 from mini_bdx_runtime.projector import Projector
+from mini_bdx_runtime.obs_spec import concatenate_observation
 from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
 # StateServer removed — cloud telemetry via CloudPublisher; local telemetry is a
@@ -207,20 +208,23 @@ class RLWalk:
 
         feet_contacts = self.feet_contacts.get()
 
-        obs = np.concatenate(
-            [
-                imu_data["gyro"],
-                imu_data["accelero"],
-                cmds,
-                dof_pos - self.init_pos,
-                dof_vel * 0.05,
-                self.last_action,
-                self.last_last_action,
-                self.last_last_last_action,
-                self.motor_targets,
-                feet_contacts,
-                self.imitation_phase,
-            ]
+        # The ordering moved to mini_bdx_runtime.obs_spec, unchanged, so that the
+        # contract this loop enforces has exactly one home and CI can import it —
+        # this module imports the hardware stack at module level and CI cannot.
+        # What reaches the model is byte-identical to the concatenate that was here.
+        obs = concatenate_observation(
+            gyro=imu_data["gyro"],
+            accelerometer=imu_data["accelero"],
+            commands=cmds,
+            dof_pos=dof_pos,
+            init_pos=self.init_pos,
+            dof_vel=dof_vel,
+            last_action=self.last_action,
+            last_last_action=self.last_last_action,
+            last_last_last_action=self.last_last_last_action,
+            motor_targets=self.motor_targets,
+            feet_contacts=feet_contacts,
+            imitation_phase=self.imitation_phase,
         )
 
         return obs

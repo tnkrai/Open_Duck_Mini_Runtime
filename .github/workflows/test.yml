@@ -1,10 +1,20 @@
 name: Tests
 
+# Every pull request, whatever it targets, plus pushes to the version lines.
+#
+# This used to be `branches: [v3]` on both. Development moved to v2 in June and the
+# trigger was never re-pointed, so for two months this workflow ran on nothing that
+# mattered: v2 is where origin/HEAD points and where every recent merge landed, and
+# not one of them was gated. PR #21 merged the day before this was noticed, untested.
+#
+# The pull_request filter is deliberately GONE rather than widened to [v2, v3, v4].
+# A branch allowlist is what went stale the first time, and it will go stale again
+# the day a v5 appears or a program runs on its own integration branch — which is
+# exactly what surfaced this. An unfiltered trigger cannot rot that way.
 on:
   push:
-    branches: [v3]
+    branches: [v2, v3, v4]
   pull_request:
-    branches: [v3]
 
 jobs:
   pytest:

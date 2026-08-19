@@ -36,7 +36,7 @@ from threading import Lock, Thread
 
 # Write-only ingestion key (can send events, cannot read data).
 # Must match POSTHOG_KEY / POSTHOG_HOST in scripts/setup.sh.
-POSTHOG_API_KEY = "phc_LrCqW1g9M4Ta49ZZaeLGN7rrHkTnLC40Ey2wv2IJ5fm"
+POSTHOG_API_KEY = "phc_FarYZWwIbyZFV2iUKyl8WyRRdFFuw2MH3NZat4zPmEK"
 POSTHOG_HOST = "https://us.i.posthog.com"
 TELEMETRY_FILE = Path.home() / ".tnkr-telemetry.json"
 SOURCE = "openduck-runtime"

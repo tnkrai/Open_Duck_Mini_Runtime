@@ -14,7 +14,7 @@ from mini_bdx_runtime.eyes import Eyes
 from mini_bdx_runtime.sounds import Sounds
 from mini_bdx_runtime.antennas import Antennas
 from mini_bdx_runtime.projector import Projector
-from mini_bdx_runtime.obs_spec import concatenate_observation
+from mini_bdx_runtime.obs_spec import build_observation, sources_from_state
 from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
 # StateServer removed — cloud telemetry via CloudPublisher; local telemetry is a
@@ -208,11 +208,14 @@ class RLWalk:
 
         feet_contacts = self.feet_contacts.get()
 
-        # The ordering moved to mini_bdx_runtime.obs_spec, unchanged, so that the
-        # contract this loop enforces has exactly one home and CI can import it —
-        # this module imports the hardware stack at module level and CI cannot.
-        # What reaches the model is byte-identical to the concatenate that was here.
-        obs = concatenate_observation(
+        # Built from WALK_OBS_SPEC, one named block at a time, rather than from a
+        # hand-written concatenate. Phase 7: the ordering is now derived from the
+        # contract instead of agreeing with it by inspection, which permanently
+        # removes the class of bug where a swapped policy meets a loop assembled for
+        # a different one. tests/fixtures/walk_observation_golden.json holds what the
+        # old hand-written path produced, so "byte-identical" is checked rather than
+        # claimed.
+        obs = build_observation(sources_from_state(
             gyro=imu_data["gyro"],
             accelerometer=imu_data["accelero"],
             commands=cmds,
@@ -225,7 +228,7 @@ class RLWalk:
             motor_targets=self.motor_targets,
             feet_contacts=feet_contacts,
             imitation_phase=self.imitation_phase,
-        )
+        ))
 
         return obs
 

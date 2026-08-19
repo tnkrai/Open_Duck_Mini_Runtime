@@ -16,12 +16,17 @@ the duck's workflow installs numpy, pydantic, fastapi and pytest, with no onnxru
 and no mujoco. A contract nothing can import is a contract nothing can test. This
 module imports numpy and nothing else.
 
-THE DOCUMENT CAN LIE, SO IT IS TESTED AGAINST THE CODE. Transcribing an order by hand
-is exactly the kind of work that goes subtly wrong, and a wrong transcription is worse
-than none: it is an authoritative-looking document asserting the wrong thing.
-`tests/test_obs_spec_equivalence.py` builds the vector both ways and asserts they are
-IDENTICAL, elementwise. Identical rather than same-length, because length equality is
-precisely the check a reordering slips past.
+THERE IS NOW ONE PATH, AND IT IS THIS ONE (Phase 7). The hand-written `np.concatenate`
+that used to live in `v2_rl_walk_mujoco.py` is deleted; the vector is derived from
+`WALK_OBS_SPEC` by walking the list. That removes the class of bug where a swapped
+policy meets a loop assembled for a different one — not by checking two paths agree,
+but by there being one.
+
+What the second path bought was evidence, and that is kept rather than lost:
+`tests/fixtures/walk_observation_golden.json` is the frozen output of the deleted
+concatenate, captured before it went. The generated path must still reproduce it value
+for value. A golden file regenerated from the code it checks is worthless, which is why
+that file says so in its own text.
 """
 
 from __future__ import annotations
@@ -83,44 +88,6 @@ WALK_OBS_SPEC: tuple[ObsBlock, ...] = (
 )
 
 OBS_SIZE = sum(b.size for b in WALK_OBS_SPEC)
-
-
-def concatenate_observation(
-    *,
-    gyro,
-    accelerometer,
-    commands,
-    dof_pos,
-    init_pos,
-    dof_vel,
-    last_action,
-    last_last_action,
-    last_last_last_action,
-    motor_targets,
-    feet_contacts,
-    imitation_phase,
-) -> np.ndarray:
-    """The vector the policy actually eats, verbatim.
-
-    Lifted unchanged out of `RLWalk.get_obs` so the ordering has exactly one home and
-    a reader can still diff it against the original. The script calls this; nothing
-    about what reaches the model changed when it moved.
-    """
-    return np.concatenate(
-        [
-            gyro,
-            accelerometer,
-            commands,
-            dof_pos - init_pos,
-            dof_vel * DOF_VEL_SCALE,
-            last_action,
-            last_last_action,
-            last_last_last_action,
-            motor_targets,
-            feet_contacts,
-            imitation_phase,
-        ]
-    )
 
 
 def build_observation(sources: dict[str, np.ndarray]) -> np.ndarray:

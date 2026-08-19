@@ -41,14 +41,15 @@ so the available proof of possession is a locality test.
 
 ## Consequences for this repo
 
-- **The project is Tnkr Prod**, not a separate robots project. A PostHog merge
-  cannot cross projects, so a robot's history and its owner have to be in the
-  same one. `setup.sh` and `telemetry.py` carry the same key and a test asserts
-  they match.
-- **Ducks installed before that key swap keep reporting to the old project**
-  until `setup.sh` is re-run. There is no remote reconfiguration and there should
-  not be. Expect the funnel to look thin for a while; that is a split fleet, not
-  a product problem.
+- **The project is Tnkr Prod**, and always has been. A PostHog merge cannot
+  cross projects, so a robot's history and its owner have to be in the same one
+  — and they already are: every event the fleet has ever sent is in Tnkr Prod
+  (250061), the same project the dashboard reports to. Nothing had to change for
+  the alias to be possible. `setup.sh` and `telemetry.py` carry the same key and
+  a test asserts they match, but note what that test can and cannot do: it proves
+  the two files agree with each other, not that they name the right project. A
+  key is opaque, so verify a change to it against the PostHog API, never against
+  a green suite.
 - **Reflashing the SD card mints a new id** and unlinks the robot from whoever
   owned it. `setup.sh --clean` deliberately does NOT, because that file holds the
   opt-out and a reinstall must not silently re-enable telemetry. This is why

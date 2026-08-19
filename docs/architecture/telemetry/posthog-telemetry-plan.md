@@ -6,12 +6,19 @@
 > [`identity-and-ownership.md`](identity-and-ownership.md), which points at the
 > cross-repo design of record:
 >
-> 1. **The project.** This plan created a separate "Tnkr Robots" project to keep
->    robot events out of Tnkr Prod. The runtime now reports to **Tnkr Prod**
->    instead. A merge in PostHog is scoped to one project, so a robot's history
->    and the account that owns it have to be in the same one or they can never be
->    joined. Mentions of "Tnkr Robots" below, including the dashboard plan, read
->    as Tnkr Prod.
+> 1. **The project.** This plan proposed a separate "Tnkr Robots" project to keep
+>    robot events out of Tnkr Prod. **That project was never created.** The Tnkr
+>    organization has exactly two projects — Tnkr Dev (250068) and Tnkr Prod
+>    (250061) — and the runtime has reported to **Tnkr Prod** from the first
+>    event onward. Every mention of "Tnkr Robots" below, including in the
+>    dashboard plan, describes an intention that was never carried out; read them
+>    all as Tnkr Prod.
+>
+>    This turns out to be lucky rather than planned. A merge in PostHog is scoped
+>    to one project, so a robot's history and the account that owns it have to be
+>    in the same one or they can never be joined — and because the runtime was
+>    already where the dashboard is, the ownership alias works with no migration
+>    and no abandoned history.
 > 2. **Anonymity is now conditional.** This plan assumed a `device_id` that is
 >    anonymous forever. It still is on the robot, but a signed-in owner
 >    connecting the robot in Tnkr Studio links it to their Tnkr account, which

@@ -1689,8 +1689,17 @@ def component_rollback():
     refuses to start.
     """
     try:
-        return rollback_component()
+        state = rollback_component()
+        # The other half of the same signal. A component that was accepted and then
+        # rolled back is a catalogue entry that passed validation and failed in use,
+        # which is worth more than a refusal: the refusal was caught, this one was not.
+        telemetry.capture(
+            "component_rolled_back",
+            {"from_component": state.get("previous"), "to_component": state.get("active")},
+        )
+        return state
     except ComponentError as exc:
+        telemetry.capture("component_rollback_refused", {"reason": exc.code})
         raise _component_http_error(exc)
 
 
@@ -1787,6 +1796,16 @@ def _walk_start_locked(body: WalkStartRequest):
             builtin_dir=SCRIPTS_DIR,
         )
     except ComponentError as exc:
+        # A refused swap is the single highest-value fleet signal in this program: it
+        # says a catalogue entry tnkr vouched for is bad on somebody else's robot, which
+        # is exactly the responsibility decision d1 takes on. Component id and reason
+        # only — no paths, no filenames, nothing about the operator. Rate-capped and
+        # fail-silent through the existing stream, and silent entirely when the
+        # ~/.tnkr-telemetry.json opt-out says so.
+        telemetry.capture(
+            "component_start_refused",
+            {"component_id": component_id, "reason": exc.code},
+        )
         # 404 only for "no such component"; everything else is a 409, because the
         # component exists and is refused, which is a different thing for a caller to
         # handle.

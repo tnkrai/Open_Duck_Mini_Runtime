@@ -23,10 +23,12 @@ from mini_bdx_runtime.duck_config import DuckConfig
 from mini_bdx_runtime.envelope import (
     ABORT_CODE,
     DEFAULT_BUDGET_OVERRUN_TICKS,
+    DEFAULT_IMU_MAX_AGE_S,
     DEFAULT_TILT_ABORT_TICKS,
     DEFAULT_TILT_LIMIT_DEG,
     AbortMonitor,
     PolicyAbort,
+    imu_quaternion,
     is_armed,
     tilt_deg,
 )
@@ -164,8 +166,17 @@ def test_transient_tilt_recovers() -> None:
 
 
 def test_exactly_at_the_tilt_limit_is_not_a_fall() -> None:
-    m = monitor(tilt_limit_deg=60.0, tilt_ticks=1)
-    assert m.check_tilt(quat_from_pitch_roll(60.0)) is None
+    """The comparison is ``<=``, and the boundary is tested where it actually falls.
+
+    ``quat_from_pitch_roll(60.0)`` does not round-trip to 60.0 -- half-angle sin/cos out,
+    ``asin`` back, 59.99999999999999 -- so a limit of exactly 60.0 leaves ``<=`` and ``<``
+    indistinguishable. The limit is set to the value the monitor will actually be handed,
+    which is the only way this test says anything.
+    """
+    tilted = quat_from_pitch_roll(60.0)
+    pitch, _ = tilt_deg(tilted)
+    m = monitor(tilt_limit_deg=pitch, tilt_ticks=1)
+    assert m.check_tilt(tilted) is None, "a duck exactly at the limit has not fallen"
     assert m.check_tilt(quat_from_pitch_roll(60.5)) is not None
 
 
@@ -181,6 +192,172 @@ def test_imu_none_counts_toward_the_abort() -> None:
     detail = m.check_tilt(None)
     assert detail is not None
     assert "orientation unknown" in detail, detail
+
+
+# ── F4, the reachable half: the driver never says "None" ────────────────────────
+#
+# check_tilt(None) is the guard; these are about whether anything can ever call it that
+# way. raw_imu's worker wraps the fused read in its own try/except and keeps the previous
+# quaternion on failure -- on purpose, because the policy's gyro and accel must keep
+# flowing -- and the first "previous" is identity. So the live path cannot produce the
+# None the tests above pass by hand. imu_quaternion is what closes that: it asks how old
+# the reading is, using the stamp the driver now writes beside it.
+
+
+def reading(quaternion=UPRIGHT, at=100.0, **extra) -> dict:
+    """One raw_imu.Imu.get_data() dict, as the walk receives it."""
+    return {
+        "gyro": [0.0, 0.0, 0.0],
+        "accelero": [0.0, 0.0, 9.81],
+        "quaternion": quaternion,
+        "quaternion_t": at,
+        **extra,
+    }
+
+
+def test_a_fresh_reading_is_used_as_is() -> None:
+    assert imu_quaternion(reading(at=100.0), 100.01) == UPRIGHT
+
+
+def test_a_reading_older_than_the_window_is_unknown() -> None:
+    """The failure the guard exists for: the BNO055's fused register stops answering while
+    gyro and accel keep streaming, so the walk keeps running on a quaternion that stopped
+    moving.
+
+    The window is a ceiling, not a limit one sample below itself -- a reading exactly
+    ``max_age_s`` old is still the reading.
+    """
+    stale = reading(at=0.0)
+    assert imu_quaternion(stale, DEFAULT_IMU_MAX_AGE_S) is not None
+    assert imu_quaternion(stale, DEFAULT_IMU_MAX_AGE_S * 1.01) is None
+
+
+def test_a_stale_identity_quaternion_aborts_instead_of_reading_as_level() -> None:
+    """End to end through the two pieces the loop composes, because separately they both
+    look fine: tilt_deg calls identity level (correctly -- a still duck reads identity),
+    and check_tilt only distrusts None. The dead sensor is only visible in the age."""
+    m = monitor(tilt_ticks=8)
+    frozen = reading(quaternion=UPRIGHT, at=100.0)
+
+    # 0.2 s of a sensor that has gone quiet: nothing has aborted yet, deliberately.
+    for tick in range(10):
+        now = 100.0 + tick * 0.02
+        assert m.check_tilt(imu_quaternion(frozen, now)) is None, tick
+
+    # and then it does, without the duck's orientation ever having "changed"
+    detail = None
+    for tick in range(10, 30):
+        detail = m.check_tilt(imu_quaternion(frozen, 100.0 + tick * 0.02))
+        if detail is not None:
+            break
+    assert detail is not None, "a fused read that stopped answering never aborted"
+    assert "orientation unknown" in detail, detail
+
+
+def test_a_reading_that_keeps_arriving_fresh_never_aborts() -> None:
+    """The other side of it: a working IMU produces a new stamp every sample, and a duck
+    standing level for a minute is not an event."""
+    m = monitor(tilt_ticks=8)
+    for tick in range(3000):
+        now = 100.0 + tick * 0.02
+        assert m.check_tilt(imu_quaternion(reading(at=now), now)) is None
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        None,
+        {},
+        {"gyro": [0, 0, 0], "accelero": [0, 0, 0]},          # no quaternion at all
+        {"quaternion": UPRIGHT},                              # a driver that never stamps
+        {"quaternion": UPRIGHT, "quaternion_t": None},        # no fused read has succeeded
+        {"quaternion": UPRIGHT, "quaternion_t": "100.0"},     # a stamp that is not a time
+        {"quaternion": UPRIGHT, "quaternion_t": True},        # bool is an int, and is not
+        {"quaternion": UPRIGHT, "quaternion_t": float("nan")},
+        {"quaternion": None, "quaternion_t": 100.0},
+        [1.0, 0.0, 0.0, 0.0],                                 # the quaternion, not the dict
+    ],
+    ids=[
+        "none",
+        "empty",
+        "no-quaternion",
+        "unstamped",
+        "never-read",
+        "string-stamp",
+        "bool-stamp",
+        "nan-stamp",
+        "null-quaternion",
+        "not-a-reading",
+    ],
+)
+def test_a_reading_that_cannot_be_dated_is_unknown(sample) -> None:
+    """Unknown, never "probably fine". A driver that does not stamp is the case that
+    matters: this must not silently fail open for whichever IMU class comes next."""
+    assert imu_quaternion(sample, 100.0) is None
+    m = monitor(tilt_ticks=1)
+    assert m.check_tilt(imu_quaternion(sample, 100.0)) is not None
+
+
+def test_a_stamp_from_the_future_is_still_usable() -> None:
+    """A clock that ran backwards by a hair (or a sample stamped between the read and the
+    ask) is not a reason to abort a walk."""
+    assert imu_quaternion(reading(at=100.1), 100.0) == UPRIGHT
+
+
+def test_the_driver_stamps_the_fused_read_and_only_the_fused_read() -> None:
+    """The producer half, read from the source: raw_imu cannot be imported off-Pi (its
+    ``board`` import raises on any machine Blinka does not recognise), which is why the
+    walk script is read with ast in this suite too.
+
+    Two things are asserted, and both are load-bearing. The published sample carries the
+    stamp -- without it every consumer is back to guessing -- and the stamp is written in
+    the same block as the quaternion it describes, so a read that failed cannot leave a
+    fresh timestamp on a stale value.
+    """
+    source = (
+        Path(__file__).parent.parent
+        / "mini_bdx_runtime"
+        / "mini_bdx_runtime"
+        / "raw_imu.py"
+    )
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Imu"
+    )
+
+    published = [
+        node
+        for node in ast.walk(cls)
+        if isinstance(node, ast.Dict)
+        and "quaternion" in [ast.unparse(k).strip("'\"") for k in node.keys if k]
+    ]
+    assert published, "no IMU sample dict found in raw_imu.Imu"
+    for sample in published:
+        keys = [ast.unparse(k).strip("'\"") for k in sample.keys if k]
+        assert "quaternion_t" in keys, (
+            "an IMU sample is published without the age of its fused read, so a "
+            "consumer cannot tell a level duck from a sensor that stopped answering "
+            "(failure mode F4)"
+        )
+
+    blocks = [
+        node.body
+        for node in ast.walk(cls)
+        if hasattr(node, "body") and isinstance(getattr(node, "body", None), list)
+    ]
+    homes = [
+        block
+        for block in blocks
+        if any("self._last_quat = " in ast.unparse(st) for st in block)
+    ]
+    assert homes, "raw_imu never assigns self._last_quat"
+    for block in homes:
+        assert any(
+            "self._last_quat_t = " in ast.unparse(st) for st in block
+        ), (
+            "the fused quaternion is refreshed without refreshing its timestamp in the "
+            "same block, so a failed read would keep passing as fresh"
+        )
 
 
 def test_imu_recovering_from_none_resets_the_streak() -> None:
@@ -390,7 +567,7 @@ def test_the_pose_snapshot_omits_the_envelope_key_for_a_builtin_walk(
 
 
 def test_builtin_policy_does_not_arm_the_aborts() -> None:
-    assert is_armed(False, {}) is False
+    assert is_armed(False, "scripts/BEST_WALK_ONNX_2.onnx", env={}) is False
 
 
 def _run_body() -> ast.FunctionDef:
@@ -426,6 +603,120 @@ def test_every_abort_check_is_gated_on_the_monitor_existing() -> None:
     assert len(found) == 2, f"expected one tilt and one budget check, got {found}"
     for guard in found:
         assert "self.abort_monitor is not None" in guard, guard
+
+
+def test_the_loop_asks_for_a_fresh_orientation_not_merely_a_present_one() -> None:
+    """Where F4 actually lives. ``check_tilt``'s ``None`` branch is unreachable from the
+    loop unless the loop passes the reading through ``imu_quaternion`` -- handing it
+    ``last_imu_data["quaternion"]`` directly puts a dead sensor's last identity quaternion
+    into a guard that will call it level for as long as the walk runs."""
+    calls = [
+        node
+        for node in ast.walk(_run_body())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "check_tilt"
+    ]
+    assert len(calls) == 1, f"expected one tilt check, got {len(calls)}"
+    argument = ast.unparse(calls[0].args[0])
+    assert argument.startswith("imu_quaternion("), argument
+    assert "self.last_imu_data" in argument, argument
+    # the age has to be measured against the same clock raw_imu stamps with
+    assert "time.monotonic()" in argument, argument
+
+
+def test_a_tripped_guard_raises_rather_than_printing() -> None:
+    """The whole point of the story, and the one thing the gate test above does not say.
+
+    ``:434-439`` already computed the budget overrun and printed it -- and then did
+    nothing, for as long as this file has existed. Both guards can be returned to exactly
+    that with a one-line edit, so each guard's result is followed here from the call that
+    produces it to the ``raise`` that acts on it.
+    """
+    reasons: list[str] = []
+
+    def blocks_of(stmt: ast.stmt) -> list[list[ast.stmt]]:
+        """The statement lists a compound statement owns."""
+        found = []
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            value = getattr(stmt, field, None)
+            if isinstance(value, list) and value:
+                if isinstance(value[0], ast.excepthandler):
+                    found.extend(h.body for h in value)
+                else:
+                    found.append(value)
+        return found
+
+    def visit(body: list[ast.stmt]) -> None:
+        for i, stmt in enumerate(body):
+            nested = blocks_of(stmt)
+            if nested:
+                for block in nested:
+                    visit(block)
+                continue
+            # `<name> = self.abort_monitor.check_*(...)`
+            produced = [
+                node
+                for node in ast.walk(stmt)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("check_tilt", "check_budget")
+            ]
+            if produced:
+                assert isinstance(stmt, ast.Assign) and isinstance(
+                    stmt.targets[0], ast.Name
+                ), f"a guard's answer is discarded: {ast.unparse(stmt)}"
+                name = stmt.targets[0].id
+                rest = body[i + 1 :]
+                assert rest, f"nothing follows the {name} check"
+                acted_on = rest[0]
+                assert isinstance(acted_on, ast.If), (
+                    f"the {name} check's answer is not tested: "
+                    f"{ast.unparse(acted_on)}"
+                )
+                assert ast.unparse(acted_on.test) == f"{name} is not None", (
+                    ast.unparse(acted_on.test)
+                )
+                raises = [
+                    node
+                    for node in ast.walk(acted_on)
+                    if isinstance(node, ast.Raise)
+                    and isinstance(node.exc, ast.Call)
+                    and isinstance(node.exc.func, ast.Attribute)
+                    and node.exc.func.attr == "abort"
+                ]
+                assert raises, (
+                    f"a tripped guard ({name}) does not raise. Printing and carrying on "
+                    f"is the behaviour story 1.3 exists to replace."
+                )
+                reasons.append(ast.literal_eval(raises[0].exc.args[0]))
+
+    visit(_run_body().body)
+    assert sorted(reasons) == ["budget", "tilt"], reasons
+    for reason in reasons:
+        assert reason in AbortMonitor.OPERATOR, (
+            f"the loop raises {reason!r}, which has no operator sentence beside it"
+        )
+
+
+def test_the_reason_is_recorded_before_the_teardown_runs() -> None:
+    """"Machine-readable reason" only counts if the loop writes one. The server asks why
+    a walk stopped after the process is gone, so an abort that skipped this is reported as
+    "the process died" -- which is what the guard was built to stop happening."""
+    run = _run_body()
+    handler = next(
+        h
+        for h in next(n for n in ast.walk(run) if isinstance(n, ast.Try)).handlers
+        if h.type is not None and ast.unparse(h.type) == "PolicyAbort"
+    )
+    written = [
+        ast.unparse(node.func)
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "write_abort"
+    ]
+    assert written == ["local_telemetry.write_abort"], written
 
 
 def test_the_abort_handler_precedes_the_generic_system_exit_handler() -> None:

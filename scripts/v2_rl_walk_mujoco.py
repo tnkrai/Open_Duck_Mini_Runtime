@@ -21,6 +21,7 @@ from mini_bdx_runtime.envelope import (
     ActionEnvelope,
     PolicyAbort,
     format_counts,
+    imu_quaternion,
     is_armed,
     joint_limits_from_urdf,
 )
@@ -143,7 +144,7 @@ class RLWalk:
         self.envelope_prev_targets = None
         self.envelope_telemetry = None
         self._envelope_flushed_at = 0.0
-        if is_armed(custom_policy):
+        if is_armed(custom_policy, onnx_model_path):
             joint_names = list(self.hwi.joints.keys())
             lower, upper = joint_limits_from_urdf(urdf_path, joint_names)
             self.envelope = ActionEnvelope(
@@ -171,6 +172,13 @@ class RLWalk:
                 f"{self.max_motor_velocity} rad/s, "
                 f"tilt limit {self.duck_config.tilt_limit_deg:.0f} deg, "
                 f"abort after {self.duck_config.budget_overrun_ticks} slow ticks"
+            )
+        else:
+            # Say it out loud. "Ran with the guards off" must never be something a
+            # log has to be read backwards to work out.
+            print(
+                f"[envelope] not armed: {os.path.basename(onnx_model_path)} is a "
+                f"policy this robot shipped with"
             )
 
         self.paused = self.duck_config.start_paused
@@ -393,11 +401,15 @@ class RLWalk:
                     continue
 
                 if self.abort_monitor is not None:
-                    # get_obs already read the IMU; a missing quaternion is unknown
-                    # orientation, which counts toward the abort rather than reading as
-                    # upright (failure mode F4).
+                    # get_obs already read the IMU. Freshness, not presence: raw_imu
+                    # never drops the quaternion key — a failed fused read repeats the
+                    # previous value, and the first of those is identity — so asking
+                    # only whether it is there would accept a dead sensor as a level
+                    # duck (failure mode F4). imu_quaternion answers None when the
+                    # reading is too old to mean anything, which is what counts toward
+                    # the abort.
                     tilt = self.abort_monitor.check_tilt(
-                        (self.last_imu_data or {}).get("quaternion")
+                        imu_quaternion(self.last_imu_data, time.monotonic())
                     )
                     if tilt is not None:
                         raise self.abort_monitor.abort("tilt", tilt)

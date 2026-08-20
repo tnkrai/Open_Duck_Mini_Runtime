@@ -36,7 +36,9 @@ which is strictly worse than not shipping it. Both counters reset on the first g
 
 **Missing IMU data counts toward the tilt abort.** Treating an unreadable orientation as
 "upright" is a silent fall (failure mode F4 in the eng review). ``check_tilt(None)`` is not
-a no-op.
+a no-op — and because the driver never actually hands back ``None`` (it repeats its last
+fused quaternion, starting at identity), ``imu_quaternion`` is what turns a stale reading
+into the ``None`` the guard was written for. Without it the guard is unreachable code.
 
 See ``tnkr-studio/docs/plans/custom-policy/_architecture.md``, Decision 9 and amendment A8.
 """
@@ -72,6 +74,12 @@ DEFAULT_JOINT_LIMIT_RAD: float = 2.0
 DEFAULT_TILT_LIMIT_DEG: float = 60.0
 DEFAULT_TILT_ABORT_TICKS: int = 8
 DEFAULT_BUDGET_OVERRUN_TICKS: int = 10
+
+# How old a fused-orientation reading may be and still answer the question "is the duck
+# upright". 0.2 s is ten samples at 50 Hz — long enough that a couple of dropped reads
+# are not an event, short enough that the tilt streak still needs its own 8 ticks on top
+# before anything aborts (so ~0.36 s from "the IMU went quiet" to "torque off").
+DEFAULT_IMU_MAX_AGE_S: float = 0.2
 
 # The one reason code this module raises. Mirrors the ErrorCode of the same name that
 # story 2.5 adds on the Studio side; the runtime emits the code, Studio owns the sentence.
@@ -113,17 +121,61 @@ class PolicyAbort(SystemExit):
 # exercising the guards against a policy already known to be good.
 FORCE_ENVELOPE_ENV: str = "TNKR_FORCE_ENVELOPE"
 
+# The policies that shipped with the robot, by file name. These are the only files
+# trusted by construction (architecture Decision 11): one of them has run on every duck
+# sold, which is the whole argument for leaving their code path alone. Antoine published
+# exactly two, BEST_WALK_ONNX.onnx and BEST_WALK_ONNX_2.onnx, and this repo ships the
+# second in scripts/; anything else is somebody's upload.
+BUILTIN_POLICY_FILENAMES: frozenset[str] = frozenset(
+    {"BEST_WALK_ONNX.onnx", "BEST_WALK_ONNX_2.onnx"}
+)
 
-def is_armed(custom_policy: bool, env: Mapping[str, str] | None = None) -> bool:
+
+def is_builtin_policy(onnx_model_path: str | None) -> bool:
+    """Whether this path names a policy that shipped with the robot.
+
+    By file name, not by digest: the two published files have no digest anybody wrote
+    down, and a name is what the one production caller has. A user who renames a
+    downloaded model to ``BEST_WALK_ONNX_2.onnx`` defeats it — and gets the same
+    behaviour they get today by overwriting the built-in, which is a deliberate act
+    rather than the accident this guard is for.
+
+    A path we know nothing about is **not** the built-in. That is the direction the
+    error has to fall: an unrecognised policy running with the guards armed costs a
+    clamp that never trips, and the reverse costs a duck.
+    """
+    if not onnx_model_path:
+        return False
+    return os.path.basename(str(onnx_model_path)) in BUILTIN_POLICY_FILENAMES
+
+
+def is_armed(
+    custom_policy: bool,
+    onnx_model_path: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
     """Whether the envelope applies to this run (amendment A8).
 
     A predicate, not a branch inside the envelope: the ``if`` still lives at the single
     call site in the walk loop, and this exists so both of its answers can be tested
     without a robot. The envelope itself never asks who loaded the policy.
+
+    **The flag is not trusted on its own, because nothing in production sets it.**
+    ``/api/walk/start`` globs ``scripts/*.onnx``, takes the first hit and spawns the walk
+    with no ``--custom_policy`` (``tnkr_server.py``), which is exactly how a user runs a
+    downloaded policy today: drop the file in ``scripts/`` and press Walk. Trusting the
+    flag would leave that run with every guard disarmed and nothing logged — fail-open
+    safety with no detection. So provenance comes from the artifact: a policy this repo
+    did not ship is custom, whoever spawned it and however they spelled the arguments.
     """
     if env is None:
         env = os.environ
-    return bool(custom_policy) or env.get(FORCE_ENVELOPE_ENV) == "1"
+    if env.get(FORCE_ENVELOPE_ENV) == "1":
+        return True
+    if custom_policy:
+        return True
+    return not is_builtin_policy(onnx_model_path)
 
 
 # ── Joint limits ────────────────────────────────────────────────────────────────
@@ -329,6 +381,46 @@ def format_counts(counts: dict[str, int], limit: int = 4) -> str:
 # ── Aborting ────────────────────────────────────────────────────────────────────
 
 
+def imu_quaternion(
+    reading: Mapping[str, object] | None,
+    now_s: float,
+    max_age_s: float = DEFAULT_IMU_MAX_AGE_S,
+) -> Sequence[float] | None:
+    """The orientation out of one ``raw_imu.Imu.get_data()`` dict, or ``None``.
+
+    This exists because "the quaternion is missing" is not a state the driver can
+    produce, and the tilt guard was written as if it were. ``raw_imu``'s worker wraps the
+    fused read in its own ``try`` and keeps the previous value on failure — deliberately,
+    because the policy's gyro and accelerometer must keep flowing — and that previous
+    value starts life as identity. So a BNO055 whose fused-orientation register stops
+    answering hands out a perfectly level quaternion forever, and a worker thread that
+    stalls hands out the same dict forever. Both read as "upright" to anything that only
+    checks for ``None``, which is failure mode F4 with the guard still switched on.
+
+    What separates the two cases is *age*, so the driver stamps each sample with when its
+    fused read last succeeded and this asks how long ago that was. Unknown means: no
+    reading, no quaternion in it, a driver that does not stamp, a fused read that has
+    never once succeeded, or a stamp older than ``max_age_s``. Every one of those is an
+    orientation nobody knows, which is what ``AbortMonitor.check_tilt(None)`` is for.
+
+    ``now_s`` and the stamp must come from the same clock (``time.monotonic()``); the
+    walk and the IMU worker share a process, so they do.
+    """
+    if not isinstance(reading, Mapping):
+        return None
+    quaternion = reading.get("quaternion")
+    if quaternion is None:
+        return None
+    stamped_at = reading.get("quaternion_t")
+    if not isinstance(stamped_at, (int, float)) or isinstance(stamped_at, bool):
+        return None
+    if not math.isfinite(float(stamped_at)):
+        return None
+    if now_s - float(stamped_at) > max_age_s:
+        return None
+    return quaternion  # type: ignore[return-value]
+
+
 def tilt_deg(quaternion: Sequence[float] | None) -> tuple[float, float] | None:
     """``(pitch, roll)`` in degrees from a ``(w, x, y, z)`` quaternion, or ``None``.
 
@@ -336,9 +428,11 @@ def tilt_deg(quaternion: Sequence[float] | None) -> tuple[float, float] | None:
     zero/degenerate quaternion that cannot be normalised. The caller must treat that as
     unsafe, not as level.
 
-    Identity ``[1, 0, 0, 0]`` is genuinely level and is reported as ``(0, 0)``:
-    ``raw_imu`` hands back identity before its first real reading, so calling it unknown
-    would abort every walk in its first 8 ticks.
+    Identity ``[1, 0, 0, 0]`` is genuinely level and is reported as ``(0, 0)``. A duck
+    standing still really does read identity, so refusing it here would abort every walk
+    in its first 8 ticks; identity that is merely *left over* from a fused read that
+    never happened is ``imu_quaternion``'s problem, one layer up, and never reaches
+    here.
 
     Standard ZYX (yaw-pitch-roll) convention, matching ``imu.py``'s ``as_euler("xyz")``
     for the pitch/roll pair. A disagreement with the physical axis remap could only swap

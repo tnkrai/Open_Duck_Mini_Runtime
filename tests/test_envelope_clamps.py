@@ -23,10 +23,12 @@ import numpy as np
 import pytest
 
 from mini_bdx_runtime.envelope import (
+    BUILTIN_POLICY_FILENAMES,
     DEFAULT_JOINT_LIMIT_RAD,
     ActionEnvelope,
     format_counts,
     is_armed,
+    is_builtin_policy,
     joint_limits_from_urdf,
 )
 from mini_bdx_runtime.policy_contract import ACT_DIM, CONTROL_HZ
@@ -380,32 +382,90 @@ def test_unparseable_urdf_falls_back_and_never_raises(tmp_path) -> None:
 
 # ── Amendment A8: the gate ──────────────────────────────────────────────────────
 
+# What /api/walk/start actually passes: the first hit of scripts/*.onnx, which on a duck
+# that has never installed anything is the file this repo ships.
+BUILTIN = "/home/pi/Open_Duck_Mini_Runtime/scripts/BEST_WALK_ONNX_2.onnx"
+# What a downloaded policy looks like once story 2.3's store has it.
+INSTALLED = "/home/pi/.tnkr/policies/9f2c/model.onnx"
+
 
 def test_builtin_policy_is_not_clamped() -> None:
     """No custom policy and no force flag -> the envelope is never built, so the loop
     runs the instructions every duck in the field runs today."""
-    assert is_armed(False, {}) is False
+    assert is_armed(False, BUILTIN, env={}) is False
 
 
 def test_custom_policy_arms_it() -> None:
-    assert is_armed(True, {}) is True
+    assert is_armed(True, BUILTIN, env={}) is True
 
 
 def test_force_envelope_arms_it() -> None:
-    assert is_armed(False, {"TNKR_FORCE_ENVELOPE": "1"}) is True
+    assert is_armed(False, BUILTIN, env={"TNKR_FORCE_ENVELOPE": "1"}) is True
 
 
 def test_force_envelope_needs_exactly_one() -> None:
     """A stale ``TNKR_FORCE_ENVELOPE=0`` in a service file must not arm anything."""
-    assert is_armed(False, {"TNKR_FORCE_ENVELOPE": "0"}) is False
-    assert is_armed(False, {"TNKR_FORCE_ENVELOPE": ""}) is False
+    assert is_armed(False, BUILTIN, env={"TNKR_FORCE_ENVELOPE": "0"}) is False
+    assert is_armed(False, BUILTIN, env={"TNKR_FORCE_ENVELOPE": ""}) is False
 
 
 def test_force_envelope_reads_the_real_environment(monkeypatch) -> None:
     monkeypatch.delenv("TNKR_FORCE_ENVELOPE", raising=False)
-    assert is_armed(False) is False
+    assert is_armed(False, BUILTIN) is False
     monkeypatch.setenv("TNKR_FORCE_ENVELOPE", "1")
-    assert is_armed(False) is True
+    assert is_armed(False, BUILTIN) is True
+
+
+# ── The flag is not the only way in: provenance comes from the artifact ─────────
+#
+# The flag alone was fail-open with no detection. Nothing in production sets it:
+# /api/walk/start globs scripts/*.onnx and spawns the walk with --remote --commands and
+# no --custom_policy (tnkr_server.py, walk_start). So the run these tests describe --
+# drop a downloaded .onnx in scripts/, press Walk -- is the way a custom policy actually
+# reaches a duck, and it must not be the way the guards get skipped.
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        INSTALLED,
+        "/home/pi/Open_Duck_Mini_Runtime/scripts/from_discord.onnx",
+        "/home/pi/Open_Duck_Mini_Runtime/scripts/duck_walk_120000.onnx",
+        "BEST_WALK_ONNX_3.onnx",
+        "best_walk_onnx_2.onnx",  # case matters: the shipped file is upper-case
+    ],
+    ids=["installed", "discord", "playground-checkpoint", "lookalike", "wrong-case"],
+)
+def test_a_policy_this_repo_did_not_ship_arms_the_envelope(path) -> None:
+    """No flag, no env var, and the guards are on anyway."""
+    assert is_builtin_policy(path) is False
+    assert is_armed(False, path, env={}) is True
+
+
+@pytest.mark.parametrize("name", sorted(BUILTIN_POLICY_FILENAMES))
+def test_every_shipped_policy_is_recognised_wherever_it_sits(name) -> None:
+    """Matched by file name, so moving the built-in does not silently arm the envelope
+    for the one policy amendment A8 exists to leave alone."""
+    for path in (name, f"./{name}", f"/home/pi/Open_Duck_Mini_Runtime/scripts/{name}"):
+        assert is_builtin_policy(path) is True
+        assert is_armed(False, path, env={}) is False
+
+
+def test_the_shipped_file_is_one_of_the_names_we_recognise() -> None:
+    """Names go stale. If the repo ever ships a differently-named built-in, this fails
+    here rather than by arming the envelope on every duck in the field."""
+    shipped = [p.name for p in (WALK_SCRIPT.parent).glob("*.onnx")]
+    assert shipped, "no .onnx in scripts/ -- has the built-in moved?"
+    assert set(shipped) <= set(BUILTIN_POLICY_FILENAMES), shipped
+
+
+@pytest.mark.parametrize("path", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_a_policy_of_unknown_provenance_arms_the_envelope(path) -> None:
+    """The fail-safe direction. A caller that does not say what it loaded gets the
+    guards: an unrecognised policy running clamped costs a clamp that never trips, and
+    the other way round costs a duck."""
+    assert is_builtin_policy(path) is False
+    assert is_armed(False, path, env={}) is True
 
 
 # ── The gate is where the story says it is ──────────────────────────────────────
@@ -489,6 +549,88 @@ def test_the_envelope_is_only_built_when_armed() -> None:
             "the safety envelope is constructed unconditionally. It must arm only for a "
             "custom policy or under TNKR_FORCE_ENVELOPE (amendment A8)."
         )
+
+
+def test_the_gate_is_asked_about_the_policy_that_was_loaded() -> None:
+    """``is_armed`` reads provenance off the artifact, so it has to be handed it.
+
+    Called with the flag alone it would fall back to trusting a caller that, in the one
+    path that starts a walk on a real duck, never sets it.
+    """
+    tree = ast.parse(WALK_SCRIPT.read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "is_armed"
+    ]
+    assert len(calls) == 1, f"expected exactly one is_armed call, got {len(calls)}"
+    args = [ast.unparse(a) for a in calls[0].args]
+    assert args == ["custom_policy", "onnx_model_path"], args
+
+
+def test_the_clamp_is_the_last_thing_to_touch_the_targets() -> None:
+    """The clamp order AC, structurally: after the operator's head override, before the
+    servos are written.
+
+    Clamping before the head override would let a head command out past both a joint stop
+    and the velocity limit -- and the head is the joint this file already special-cases
+    twice (kps 8 vs 30, and the override itself) because it is heavy enough to damage
+    itself. Behaviourally invisible: ``ActionEnvelope`` is handed whatever it is handed, so
+    only the call site can say when. Compared by line number, which is exactly the
+    question for three statements in one straight-line loop body.
+    """
+    body = _run_body()
+
+    def line_of(predicate, what: str) -> int:
+        hits = [node.lineno for node in ast.walk(body) if predicate(node)]
+        assert hits, f"{what} not found in RLWalk.run"
+        assert len(hits) == 1, f"{what} appears {len(hits)} times: lines {hits}"
+        return hits[0]
+
+    head_override = line_of(
+        lambda n: isinstance(n, ast.Assign)
+        and [ast.unparse(t) for t in n.targets] == ["self.motor_targets[5:9]"],
+        "the operator head override",
+    )
+    clamp = line_of(
+        lambda n: isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "clamp",
+        "the envelope clamp",
+    )
+    written = line_of(
+        lambda n: isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "set_position_all",
+        "the servo write",
+    )
+
+    assert head_override < clamp, (
+        "the clamp runs BEFORE the operator head override, so a head command can leave "
+        "the loop past a joint stop and past the velocity limit"
+    )
+    assert clamp < written, "the targets are written to the servos before they are clamped"
+
+
+def test_the_velocity_baseline_is_the_last_value_we_commanded() -> None:
+    """``prev_motor_targets`` is re-assigned before the head override, so by the clamp it
+    holds THIS tick's value. Clamping against it caps a held head command at one tick of
+    travel for as long as the operator holds it -- see
+    ``test_a_held_head_command_is_not_capped_at_one_ticks_travel`` for what that feels
+    like. The behavioural test drives the envelope directly and cannot see which attribute
+    the loop passes, so the choice is pinned here."""
+    calls = [
+        node
+        for node in ast.walk(_run_body())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "clamp"
+    ]
+    assert len(calls) == 1, f"expected one clamp call, got {len(calls)}"
+    args = [ast.unparse(a) for a in calls[0].args]
+    assert args == ["self.motor_targets", "self.envelope_prev_targets"], args
 
 
 # ── Cost ────────────────────────────────────────────────────────────────────────

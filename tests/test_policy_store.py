@@ -388,6 +388,51 @@ def test_a_small_declared_size_still_respects_the_floor(store, onnx_specs, monke
     assert result.code == POLICY_STORE_FULL
 
 
+@pytest.mark.parametrize("declared", [None, {"size_bytes": 1}, {"size_bytes": -5}])
+def test_a_declared_size_cannot_talk_the_floor_down(
+    store, onnx_specs, monkeypatch, declared
+):
+    """One byte above the floor is below the floor plus anything the download can write, so
+    every one of these is the same refusal.
+
+    The size in a request is a claim, not a measurement, and this endpoint has no auth --
+    so a request declaring one byte must not buy the same install a request declaring
+    nothing is refused. Trusting it would let the card end up ``MAX_POLICY_BYTES`` under
+    the floor, because ``stream_to_file`` enforces the ceiling and knows nothing about
+    free space. The test above cannot see this: 199 MB is under a 200 MB floor whatever the
+    reserve is.
+    """
+    fetch = fake_fetch(onnx_specs, payload=b"tiny")
+    store.fetch = fetch
+    monkeypatch.setattr(store, "free_bytes", lambda: store.free_floor_bytes + 1)
+
+    result = store.install("9f2a", URL, digest(b"tiny"), declared)
+
+    assert not result.ok
+    assert result.code == POLICY_STORE_FULL
+    assert fetch.calls == [], "a declared size got the download started below the floor"
+
+
+def test_a_declared_size_larger_than_the_ceiling_only_raises_the_reserve(
+    store, onnx_specs, monkeypatch
+):
+    """The one sound use of the declaration: a file that says it is bigger than the ceiling
+    makes the refusal stricter, never looser. It never gets downloaded either way -- the
+    stream would refuse it -- but the floor should not have to find that out the hard way."""
+    monkeypatch.setattr(
+        store, "free_bytes", lambda: store.free_floor_bytes + store.max_policy_bytes + 1
+    )
+    store.fetch = fake_fetch(onnx_specs, payload=b"tiny")
+
+    fits = store.install("9f2a", URL, digest(b"tiny"))
+    claims_more = store.install(
+        "b17c", URL, digest(b"tiny"), {"size_bytes": store.max_policy_bytes * 4}
+    )
+
+    assert fits.ok is True
+    assert claims_more.ok is False and claims_more.code == POLICY_STORE_FULL
+
+
 def test_the_floor_does_not_block_an_install_that_already_happened(
     store, onnx_specs, monkeypatch
 ):
@@ -518,6 +563,59 @@ def test_reverting_does_not_verify_anything(store, onnx_specs, monkeypatch):
 @pytest.mark.parametrize("value", ["", "   ", BUILTIN_ID, " builtin\n"])
 def test_every_spelling_of_the_builtin_reverts(store, value):
     assert store.select(value) == BUILTIN_ID
+
+
+def test_the_active_pointer_is_replaced_not_written_in_place(store, onnx_specs, monkeypatch):
+    """Story 2.3's "atomic activation" AC, as a behaviour rather than as prose.
+
+    A plain ``write_text`` onto the pointer passes every other test in this file, so this is
+    the one that notices: the new id goes to a temp file inside the store and arrives at
+    ``active`` by rename. On a Pi, power is cut by a human pulling a battery, and the
+    truncated pointer that a half-written file leaves behind is the state the rename exists
+    to make unreachable.
+    """
+    install(store, onnx_specs, "9f2a")
+    register_stored(onnx_specs, store, "9f2a")
+    active = store.root / policy_store.ACTIVE_FILENAME
+    renames = []
+    real_replace = policy_store.os.replace
+    monkeypatch.setattr(
+        policy_store.os,
+        "replace",
+        lambda src, dst: (renames.append((Path(src), Path(dst))), real_replace(src, dst))[1],
+    )
+
+    store.select("9f2a")
+
+    assert renames, "the active pointer was written in place instead of renamed into place"
+    src, dst = renames[-1]
+    assert dst == active
+    assert src != active and src.parent == store.root  # same filesystem, so rename is atomic
+    assert active.read_text().strip() == "9f2a"
+
+
+def test_a_crash_before_the_rename_leaves_the_previous_pointer_intact(
+    store, onnx_specs, monkeypatch
+):
+    """The failure the rename buys: the write lands, the machine dies, and the pointer is
+    still the id that was working. With a plain ``write_text`` there is no rename to fail,
+    the old id is already gone, and what survives a real power cut is a truncated file."""
+    install(store, onnx_specs, "9f2a")
+    install(store, onnx_specs, "b17c")
+    register_stored(onnx_specs, store, "9f2a")
+    register_stored(onnx_specs, store, "b17c")
+    store.select("9f2a")
+
+    def power_cut(src, dst):
+        raise OSError("the battery came out between the write and the rename")
+
+    monkeypatch.setattr(policy_store.os, "replace", power_cut)
+
+    with pytest.raises(OSError):
+        store.select("b17c")
+
+    assert store.active_id() == "9f2a", "the pointer moved without the rename succeeding"
+    assert temp_leftovers(store.root) == [], "a half-written pointer was left in the store"
 
 
 # ── the active pointer, read back ──────────────────────────────────────────────
@@ -835,6 +933,22 @@ def test_install_telemetry_carries_no_url_and_no_id(api, onnx_specs, monkeypatch
     assert event["properties"]["ok"] is True
 
 
+def test_the_walk_script_stub_cannot_be_written_over_the_real_one():
+    """The guard that stops a forgotten monkeypatch from clobbering the walk loop.
+
+    A round of this plan shipped a working tree where scripts/v2_rl_walk_mujoco.py had been
+    replaced by a three-line argv dumper. The suite was still green -- every test that reads
+    the walk script reads its own tmp_path copy -- and the duck in that checkout would have
+    slept for 30 s instead of walking. This is the assertion that turns that into a failure
+    at the moment the write is attempted.
+    """
+    with pytest.raises(AssertionError, match="real scripts"):
+        write_walk_script(Path(tnkr_server.__file__).parent, "import time; time.sleep(30)\n")
+
+    real = Path(tnkr_server.__file__).parent / "v2_rl_walk_mujoco.py"
+    assert real.read_text().count("\n") > 100, "the real walk script is not a stub"
+
+
 # ── the spawn path: arming, end to end ─────────────────────────────────────────
 #
 # The seam this section exists for was fail-open once already. Arming used to be read off
@@ -942,6 +1056,77 @@ def test_walk_start_refuses_a_policy_the_robot_does_not_have(spawning):
 
     assert response.status_code == 404
     assert not tnkr_server.is_walking()
+
+
+def test_a_refused_policy_does_not_stop_the_walk_that_is_already_running(spawning):
+    """The 404 has to cost nothing, and "nothing" means torque too.
+
+    This is the live version of the test above, and the only one that can see the bug: a
+    404 raised *after* stopping the running walk SIGTERMs the walk script, whose handler
+    turns the servos off, so a duck mid-stride goes limp for a request that never starts a
+    walk. Studio sending an id this robot no longer has is routine -- the store is bounded,
+    so installs evict policies a cached list still shows.
+    """
+    assert (
+        spawning.post("/api/walk/start", json={"sessionToken": "sess-1"}).status_code
+        == 200
+    )
+    spawned_argv(tnkr_server.SCRIPTS_DIR)
+    assert tnkr_server.is_walking()
+
+    response = spawning.post(
+        "/api/walk/start", json={"sessionToken": "sess-2", "policyId": "gone"}
+    )
+
+    assert response.status_code == 404
+    assert tnkr_server.is_walking(), (
+        "a 404 for an unknown policy killed the walk that was already running"
+    )
+
+
+def test_a_stale_policy_id_does_not_break_an_idempotent_retry(spawning, onnx_specs, monkeypatch):
+    """Same token, same walk: the retry starts nothing, so it resolves nothing.
+
+    Resolving first must not turn the no-op into a 404 for a policy the running walk does
+    not need, which is exactly what a Studio tab retrying with its own stale list sends.
+    """
+    api_install(spawning, onnx_specs, monkeypatch)
+    assert (
+        spawning.post(
+            "/api/walk/start", json={"sessionToken": "sess-1", "policyId": "9f2a"}
+        ).status_code
+        == 200
+    )
+    spawned_argv(tnkr_server.SCRIPTS_DIR)
+
+    response = spawning.post(
+        "/api/walk/start", json={"sessionToken": "sess-1", "policyId": "evicted-since"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "Walk is already running"
+    assert tnkr_server.is_walking()
+
+
+def test_a_new_session_still_replaces_the_running_walk(spawning, captured):
+    """The reordering must not cost the stop it was ordered around: a different token is
+    still a walk bound to a channel nobody is listening to, and it still gets stopped."""
+    assert (
+        spawning.post("/api/walk/start", json={"sessionToken": "sess-1"}).status_code
+        == 200
+    )
+    first = spawned_argv(tnkr_server.SCRIPTS_DIR)
+    (tnkr_server.SCRIPTS_DIR / "argv.json").unlink()
+
+    assert (
+        spawning.post("/api/walk/start", json={"sessionToken": "sess-2"}).status_code
+        == 200
+    )
+
+    assert spawned_argv(tnkr_server.SCRIPTS_DIR)  # a second process really did start
+    ended = wait_for_walk_ended(captured)[0]["properties"]
+    assert ended["stop_requested"] is True and ended["crashed"] is False
+    assert value_after(first, "--cloud_channel").endswith("sess-1")
 
 
 def test_walk_start_falls_back_when_the_active_policy_vanished(

@@ -554,9 +554,20 @@ DEFAULT_ITERATIONS: int = 50
 # look slower than it runs.
 DEFAULT_WARMUP: int = 5
 
-# Hard wall-clock cap. 50 iterations of a 30 ms policy is 1.5 s, which is the budget the
-# story sets for install responsiveness; a 200 ms policy would otherwise spend 11 s here.
-# Stopping early costs precision on exactly the policies whose slowness is already obvious.
+# Hard wall-clock cap on the whole of measurement, warm-up included. 50 iterations of a
+# 30 ms policy is 1.5 s, which is the budget the story sets for install responsiveness; a
+# 200 ms policy would otherwise spend 11 s here. Stopping early costs precision on exactly
+# the policies whose slowness is already obvious.
+#
+# The warm-up has to be inside the cap and not beside it: `warmup * cost` is unbounded in
+# cost, and 1 s per inference is a real possibility for a large community ONNX on a Pi
+# Zero 2W -- five untimed inferences would then be five seconds of an install nobody was
+# told about. The cap is a ceiling on when to STOP rather than on when to finish, so it can
+# be overshot by at most two inferences: the warm-up in flight when the deadline passes
+# runs to completion, and one timed inference always follows it. Both are inherent -- the
+# only way to learn what an inference costs is to pay for one -- and the alternative is
+# that a policy slower than the whole cap reports no number, which is the case most worth
+# reporting.
 MAX_MEASURE_SECONDS: float = 2.0
 
 
@@ -602,6 +613,28 @@ class LatencyReport:
     detail: str
     warning_code: str = POLICY_SLOW
 
+    def as_warning(self) -> dict | None:
+        """The install response's ``warning``, or ``None`` when there is nothing to say.
+
+        Two outcomes are worth warning about and one is not. **Over budget** is a measured
+        fact and rides ``POLICY_SLOW``. **Unmeasured** is the absence of a fact, and it
+        warns too: story 2.6 says the response says latency is unknown, and a caller that
+        checks only this field must not read silence as "fast enough" -- which is exactly
+        what a ``None`` here shared with a healthy 7 ms policy would tell it.
+
+        The unknown case carries ``code: None`` rather than a code of its own. The six
+        ``POLICY_*`` members are a closed set (the architecture's mandatory list, and
+        Studio's ``satisfies Record<ErrorCode, ...>`` is what makes a missing sentence a
+        build failure), ``POLICY_SLOW`` would assert a slowness nobody measured, and
+        ``code: None`` is already this plan's shape for "no code fits" -- Studio's
+        ``/policies/inspect`` answers a truncated upload the same way.
+        """
+        if self.over_budget:
+            return {"code": self.warning_code, "detail": self.detail}
+        if not self.measured:
+            return {"code": None, "detail": self.detail}
+        return None
+
     def as_manifest_fields(self) -> dict:
         """The subset written into a policy's ``manifest.json``.
 
@@ -625,6 +658,11 @@ class LatencyReport:
             "latency_samples": self.samples,
             "latency_measured": self.measured,
             "latency_over_budget": self.over_budget,
+            # Why, in the policy's own file. Story 2.6 says an unmeasurable policy has its
+            # failure *recorded*, and the response is gone the moment Studio has read it,
+            # so the reason has to outlive it: "the graph refused a zeros observation" is
+            # the whole diagnosis, and `latency_measured: false` on its own is not.
+            "latency_detail": self.detail,
             "machine": self.machine,
         }
 
@@ -682,14 +720,22 @@ def measure_latency(
     samples: list[float] = []
     deadline = time.perf_counter() + max_seconds
     try:
-        for i in range(warmup + max(1, iterations)):
+        # Warm-up: untimed, and on the same clock as the measurement rather than beside it.
+        # A policy slow enough to spend the whole cap on inferences nobody records would
+        # otherwise get its budget silently multiplied by `warmup` (see MAX_MEASURE_SECONDS).
+        # Out of time here means straight to timing: a number off a cold graph is
+        # pessimistic, and pessimistic beats absent for a policy this slow.
+        for _ in range(max(0, warmup)):
+            if time.perf_counter() >= deadline:
+                break
+            session.run(output_names, feed)
+
+        for _ in range(max(1, iterations)):
             start = time.perf_counter()
             session.run(output_names, feed)
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if i >= warmup:
-                samples.append(elapsed_ms)
+            samples.append((time.perf_counter() - start) * 1000.0)
             # Checked after recording, so the cap can never produce zero samples.
-            if time.perf_counter() > deadline and samples:
+            if time.perf_counter() >= deadline:
                 break
     except Exception as exc:
         # The graph refused a zeros input, or the runtime failed mid-measurement. Story

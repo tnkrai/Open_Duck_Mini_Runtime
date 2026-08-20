@@ -642,15 +642,17 @@ class PolicyStore:
             )
 
         # The floor is checked BEFORE the download, so a card that is nearly full is a
-        # refusal rather than a card that is full. The size comes from the sidecar manifest
-        # when there is one and from the contract's ceiling when there is not -- assuming
-        # the worst case is the only honest guess about a file we have not fetched.
+        # refusal rather than a card that is full. The worst case is the only honest guess
+        # about a file we have not fetched, and the worst case is the ceiling the stream
+        # enforces -- so a declared size may only ever RAISE the reserve, never lower it.
+        # A declaration that lowered it would be a way to walk past the floor by asking
+        # nicely: this endpoint has no auth and its CORS reflects any origin (amendment
+        # A1's premise), so `size_bytes: 1` is a value an attacker picks, and the download
+        # ceiling is the only bound that holds when the number turns out to be a lie.
         declared = manifest.get("size_bytes") if isinstance(manifest, dict) else None
-        reserve = (
-            int(declared)
-            if isinstance(declared, int) and declared > 0
-            else self.max_policy_bytes
-        )
+        reserve = self.max_policy_bytes
+        if isinstance(declared, int) and declared > reserve:
+            reserve = declared
         free = self.free_bytes()
         if free < self.free_floor_bytes + reserve:
             return InstallResult(
@@ -706,6 +708,11 @@ class PolicyStore:
         # over-budget policy installs and is flagged, and a measurement that could not run
         # at all still installs.
         latency = measure_latency_at(temp)
+        if not latency.measured:
+            # A measurement that could not run is not a failure of the install, but it is
+            # not nothing either: this is the only line that says *why* on the robot's own
+            # console, which is where an owner debugging a policy that walks badly looks.
+            print(f"[policy_store] {candidate}: {latency.detail}")
 
         merged: dict = dict(result.manifest)
         if isinstance(manifest, dict):
@@ -756,16 +763,16 @@ class PolicyStore:
             )
 
         self.mark_used(candidate)
-        warning = None
-        if latency.over_budget:
-            warning = {"code": latency.warning_code, "detail": latency.detail}
         return InstallResult(
             ok=True,
             id=candidate,
             manifest=merged,
             detail=result.detail,
             evicted=evicted,
-            warning=warning,
+            # The report decides what is worth warning about -- over budget and unknown
+            # both are, and this file must not learn the codes (see
+            # test_slowness_is_never_an_http_failure).
+            warning=latency.as_warning(),
         )
 
     def _matches_digest(self, path: Path, sha256: str) -> bool:

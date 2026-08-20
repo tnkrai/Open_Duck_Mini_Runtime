@@ -1727,13 +1727,17 @@ def install_policy(body: PolicyInstallRequest):
         except policy_store.StoreError as exc:
             return _policy_failure(exc.code, exc.detail)
 
-    latency = (result.manifest or {}).get("latency_p99_ms")
+    stored = result.manifest or {}
     add_telemetry_props(
         ok=result.ok,
         already_installed=result.already_installed,
         evicted=result.evicted is not None,
-        over_budget=bool(result.warning),
-        latency_p99_ms=latency,
+        # Read off the manifest, not off `warning`: a warning also rides an install whose
+        # latency could not be measured at all, and counting those as slow policies would
+        # make the one number this feature exists to gather wrong.
+        over_budget=bool(stored.get("latency_over_budget")),
+        latency_measured=bool(stored.get("latency_measured")),
+        latency_p99_ms=stored.get("latency_p99_ms"),
     )
     if not result.ok:
         return _policy_failure(result.code or policy_contract.POLICY_INSTALL_FAILED,
@@ -1854,18 +1858,22 @@ def _walk_start_locked(body: WalkStartRequest):
             detail="Servo rehoming session in progress — finish it before walking",
         )
 
-    if walk_session is not None and walk_session.proc.poll() is None:
-        if body.sessionToken and body.sessionToken == walk_session.session_token:
-            add_telemetry_props(already_running=True)
-            return {"success": True, "message": "Walk is already running"}
-        stop_walk_process()
+    running = walk_session is not None and walk_session.proc.poll() is None
+    if running and body.sessionToken and body.sessionToken == walk_session.session_token:
+        # An idempotent retry of the walk that is already running. It starts nothing, so
+        # it resolves nothing: a stale policyId must not turn a no-op into a 404.
+        add_telemetry_props(already_running=True)
+        return {"success": True, "message": "Walk is already running"}
 
     venv_python = sys.executable
     is_pi = platform.machine() in ("aarch64", "armv7l")
 
-    # Resolve the policy BEFORE releasing the buses. A request naming a policy this robot
-    # does not have is a 404 that should cost nothing; releasing HWI first would drop
-    # torque and leave the duck sagging for a request that never starts a walk.
+    # Resolve the policy BEFORE stopping the running walk and before releasing the buses.
+    # A request naming a policy this robot does not have is a 404 that should cost
+    # nothing, and both of those cost torque: stopping first cuts it on a duck mid-stride
+    # for a request that never starts a walk, and Studio sending an id this robot no
+    # longer has is routine, because a bounded store evicts policies its cached list
+    # still shows.
     resolved = None
     if is_pi:
         store = get_policy_store()
@@ -1883,6 +1891,12 @@ def _walk_start_locked(body: WalkStartRequest):
                 status_code=404,
                 detail="No ONNX model found in scripts/ directory",
             )
+
+    if running:
+        # A different session token: the old walk is bound to a channel nobody is
+        # listening to any more. Only now, with a policy in hand and a walk certain to
+        # start, is it worth stopping.
+        stop_walk_process()
 
     # Release HWI + BNO055 so the walk script owns both buses (serial + I2C);
     # /api/state serves the walk's telemetry snapshot while it runs.

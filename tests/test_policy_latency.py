@@ -218,6 +218,43 @@ def test_measurement_stops_at_the_wall_clock_cap(clock):
     assert report.over_budget is True
 
 
+def test_the_cap_bounds_the_warm_up_too_at_production_defaults(clock):
+    """The cap has to cover the untimed inferences, and this is the only test that would
+    notice if it did not: it passes NO kwargs, so `warmup=5` is the real default.
+
+    A 1 s policy paying five untimed warm-ups before the first timed one spends 6 s inside
+    an install request that holds the policy lock -- three times the ~2 s the story budgets,
+    for a robot whose owner was told nothing. `warmup * cost` is unbounded in cost.
+    """
+    session = ScriptedSession(clock, [1000.0] * 60)
+    started = clock.now
+
+    report = measure_latency(session, OBS_DIM)
+
+    consumed = clock.now - started
+    # 1 s inferences and a 2 s cap: two warm-ups fit, then one timed one. The general
+    # ceiling is the cap plus two inferences -- the warm-up in flight when the deadline
+    # passes, and the timed one that must follow it -- and both are inherent.
+    assert consumed == 3.0, (
+        f"measurement spent {consumed}s against a {policy_contract.MAX_MEASURE_SECONDS}s cap"
+    )
+    assert report.measured is True and report.samples == 1
+    assert report.over_budget is True
+
+
+def test_a_slow_policy_still_gets_measured_rather_than_skipped(clock):
+    """The warm-up cap must not turn a slow policy into an unknown one. Slow policies are
+    the whole reason story 2.6 exists, so "ran out of time warming up" means start timing,
+    never give up: `measured=False` here would hide the exact case worth reporting."""
+    report = measure_latency(
+        ScriptedSession(clock, [5000.0] * 10), OBS_DIM, max_seconds=0.5
+    )
+
+    assert report.measured is True
+    assert report.samples == 1
+    assert report.p99_ms == 5000.0
+
+
 def test_the_cap_never_produces_a_report_with_no_samples(clock):
     """One inference slower than the whole cap still yields a number, because the deadline
     is checked after the sample is recorded rather than before it is taken."""
@@ -289,6 +326,7 @@ def test_the_manifest_fields_are_the_ones_studio_reads(clock):
         "latency_samples",
         "latency_measured",
         "latency_over_budget",
+        "latency_detail",
         "machine",
     }
     assert fields["latency_budget_ms"] == 20.0
@@ -356,7 +394,48 @@ def test_an_unmeasurable_policy_still_installs(store, onnx_specs):
     assert (store.root / "9f2a" / "model.onnx").exists()
     assert result.manifest["latency_measured"] is False
     assert result.manifest["latency_p99_ms"] is None
-    assert result.warning is None, "unknown latency is not a slowness warning"
+
+
+def test_an_unmeasurable_policy_says_latency_is_unknown(store, onnx_specs):
+    """Story 2.6's error scenario ends "warning says latency is unknown", and this is the
+    half that is easy to lose: `warning: None` is what a healthy 7 ms policy sends, so a
+    caller that checks only `warning` would read "the stopwatch failed" as "fast enough".
+    It carries no code -- unknown is not POLICY_SLOW, which would assert a slowness nobody
+    measured.
+    """
+    healthy = install(store, onnx_specs, "fast")
+
+    result = install(store, onnx_specs, run_error=ValueError)
+
+    assert healthy.warning is None
+    assert result.warning is not None, (
+        "an unknown latency is indistinguishable from a fast policy"
+    )
+    assert result.warning["code"] is None
+    assert "unknown" in result.warning["detail"]
+    assert result.warning["code"] != POLICY_SLOW
+
+
+def test_the_reason_measurement_failed_outlives_the_response(store, onnx_specs, capsys):
+    """The response is gone once Studio has read it, so the *why* is recorded twice: in the
+    policy's own manifest.json and on the robot's console. `latency_measured: false` three
+    fields deep does not say the graph refused a zeros observation."""
+    result = install(store, onnx_specs, run_error=ValueError)
+
+    on_disk = json.loads((store.root / "9f2a" / "manifest.json").read_text())
+    assert "zeros observation" in on_disk["latency_detail"]
+    assert "ValueError" in on_disk["latency_detail"]
+    assert "9f2a" in capsys.readouterr().out
+
+
+def test_a_healthy_policy_records_its_numbers_in_the_manifest_detail(store, onnx_specs):
+    """The same field on a policy that measured: recorded either way, so a manifest read
+    months later never has to guess whether the field is missing or the measurement was."""
+    result = install(store, onnx_specs)
+
+    assert result.manifest["latency_measured"] is True
+    assert "budget" in result.manifest["latency_detail"]
+    assert result.warning is None
 
 
 def test_slowness_is_never_an_http_failure():
@@ -395,3 +474,41 @@ def test_the_slow_install_still_reports_over_budget_over_the_api(
     assert body["ok"] is True
     assert body["warning"]["code"] == POLICY_SLOW
     assert body["manifest"]["latency_p99_ms"] > 20.0
+
+
+def test_an_unmeasurable_install_says_so_over_the_api(
+    client, tmp_path, monkeypatch, onnx_specs, captured
+):
+    """The wire, not just the dataclass: what Studio actually receives for a policy whose
+    graph will not run on zeros. `ok: true` with `warning: null` would be the same body a
+    7 ms policy sends, and the reason would exist nowhere in the response."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "BEST_WALK_ONNX_2.onnx").write_bytes(b"builtin")
+    monkeypatch.setattr(tnkr_server, "SCRIPTS_DIR", scripts)
+    monkeypatch.setattr(tnkr_server, "POLICY_ROOT", tmp_path / "policies")
+    monkeypatch.setattr(
+        tnkr_server,
+        "POLICY_FETCH",
+        fake_fetch(onnx_specs, payload=b"picky model", run_error=ValueError),
+    )
+
+    response = client.post(
+        "/api/policy/install",
+        json={"id": "picky", "url": URL, "sha256": digest(b"picky model")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["warning"] is not None and body["warning"]["code"] is None
+    assert "unknown" in body["warning"]["detail"]
+    assert body["manifest"]["latency_measured"] is False
+    # A policy nobody could time is not a slow policy. `over_budget` is the number this
+    # feature exists to gather -- A7 says measure now and set a threshold once there is
+    # data -- so counting unmeasurable installs into it would poison exactly that data.
+    props = next(
+        e["properties"] for e in captured if e["properties"]["endpoint"].endswith("/install")
+    )
+    assert props["over_budget"] is False
+    assert props["latency_measured"] is False

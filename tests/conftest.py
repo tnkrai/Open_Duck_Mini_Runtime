@@ -263,7 +263,27 @@ def fake_walk_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+#: The repo's real ``scripts/``. A stand-in walk script must never be written here.
+REAL_SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+
 def write_walk_script(d, body):
+    """Write a stand-in walk script into a throwaway directory.
+
+    The guard is not paranoia. A test that forgets to monkeypatch
+    ``tnkr_server.SCRIPTS_DIR`` passes the real ``scripts/`` in here, and this call then
+    replaces the 728-line 50 Hz walk loop -- the most flight-critical file in the repo --
+    with whatever stub the test wanted. It leaves a dirty tree that still runs green,
+    because every test that reads the walk script does so through its own tmp_path, and a
+    duck run from that checkout sleeps instead of walking. Cheaper to refuse than to
+    notice.
+    """
+    d = Path(d).resolve()
+    if d == REAL_SCRIPTS_DIR.resolve():
+        raise AssertionError(
+            "write_walk_script would overwrite the real scripts/v2_rl_walk_mujoco.py -- "
+            "monkeypatch tnkr_server.SCRIPTS_DIR onto a tmp_path first"
+        )
     (d / "v2_rl_walk_mujoco.py").write_text(body)
 
 

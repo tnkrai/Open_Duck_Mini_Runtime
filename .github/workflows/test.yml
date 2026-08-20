@@ -2,9 +2,12 @@ name: Tests
 
 on:
   push:
-    branches: [v3]
+    # v2 is origin/HEAD and the branch scripts/setup.sh git-pulls onto real ducks,
+    # so it is what the fleet actually runs -- but it was not tested. A PR into v2
+    # ran zero jobs. v3 kept for whatever is being developed there.
+    branches: [v2, v3]
   pull_request:
-    branches: [v3]
+    branches: [v2, v3]
 
 jobs:
   pytest:

@@ -25,6 +25,7 @@ from mini_bdx_runtime.envelope import (
     is_armed,
     joint_limits_from_urdf,
 )
+from mini_bdx_runtime import bench as bench_mode
 # StateServer removed — cloud telemetry via CloudPublisher; local telemetry is a
 # one-slot /dev/shm snapshot the server's /api/state reads while we own the bus
 from mini_bdx_runtime import walk_telemetry as local_telemetry
@@ -141,6 +142,10 @@ class RLWalk:
         # policy already known to be good.
         self.envelope = None
         self.abort_monitor = None
+        # The supervised bench run (story 4.3). A MODE of this loop, never a second one:
+        # None for ordinary walking, a BenchRun while a bench is in progress. Set in run(),
+        # declared here so every attribute this class owns exists after construction.
+        self.bench = None
         self.envelope_prev_targets = None
         self.envelope_telemetry = None
         self._envelope_flushed_at = 0.0
@@ -297,6 +302,11 @@ class RLWalk:
             self._envelope_flushed_at = now
             counts = self.envelope.clamp_counts()
             self.envelope_telemetry["clamped"] = counts
+            if self.bench is not None:
+                # The counters are reset below, so a bench total has to be summed as the
+                # windows go by. Not a verdict -- a number for the operator who is about
+                # to be asked whether that looked like walking (story 4.3).
+                self.bench.add_clamps(counts)
             if counts:
                 limits = self.envelope.clamp_counts("limit")
                 velocity = self.envelope.clamp_counts("velocity")
@@ -334,18 +344,52 @@ class RLWalk:
 
         return freq
 
-    def run(self):
+    def run(
+        self,
+        *,
+        mode: str = bench_mode.MODE_FREE,
+        bench_seconds: float | None = None,
+        policy_id: str | None = None,
+    ) -> bench_mode.BenchReport:
+        """The 50 Hz control loop. ``mode="bench"`` bounds it and reports (story 4.3).
+
+        Bench is a flag on THIS loop, not a loop of its own: the clamps and aborts that
+        make a bench run safe to watch are the ones armed here, and a second loop would be
+        a second, untested envelope. What the flag adds is a deadline, a stop flag the
+        server can set, and a report — and the report is facts, never a verdict. "Did not
+        abort" is not "walked well"; the operator answers that.
+
+        Returns the report either way, so a caller never has to ask which mode it asked
+        for. In free mode it carries no ticks: counting them would be work the built-in
+        policy's loop does not do today (amendment A8).
+        """
         # Convert SIGTERM to SystemExit so the finally block runs cleanup
         def handle_sigterm(signum, frame):
             raise SystemExit(0)
         signal.signal(signal.SIGTERM, handle_sigterm)
 
+        mode = bench_mode.parse_mode(mode)
+        if mode == bench_mode.MODE_BENCH:
+            # Cleared before the deadline starts, not after: a stop request left behind by
+            # the previous bench would otherwise end this one on its first tick, and the
+            # operator would be holding a duck that never moved.
+            bench_mode.clear_stop()
+            bench_mode.clear_report()
+            self.bench = bench_mode.BenchRun(bench_seconds, policy_id)
+
+        # How this walk ended, for the report a bench returns. In free mode the loop does
+        # no bookkeeping at all (A8), so this is the only thing the free-mode report can
+        # say -- and the default means "the loop left on its own terms".
+        ending = bench_mode.ENDED_TIMER
         i = 0
         try:
             # A previous walk's abort must never be read as this walk's outcome —
             # including when this walk is a built-in one that cannot abort at all.
             local_telemetry.clear_abort()
-            print("Starting")
+            if self.bench is not None:
+                print(f"Starting (bench, {self.bench.seconds:g}s)")
+            else:
+                print("Starting")
             start_t = time.time()
             while True:
                 left_trigger = 0
@@ -575,6 +619,16 @@ class RLWalk:
                     overrun = self.abort_monitor.check_budget(took)
                     if overrun is not None:
                         raise self.abort_monitor.abort("budget", overrun)
+                if self.bench is not None:
+                    # One counter, one addition and one stat on tmpfs. Placed after the
+                    # abort checks so a guard that trips on the last tick of the bench
+                    # still fails it, and it BREAKS rather than raising: the deadline
+                    # arriving is not an error, and the loop's own finally is the teardown
+                    # either way.
+                    ended = self.bench.tick(took)
+                    if ended is not None:
+                        print(f"[bench] {ended}: {self.bench.detail}")
+                        break
                 time.sleep(max(0, 1 / self.control_freq - took))
 
         except PolicyAbort as abort:
@@ -583,13 +637,34 @@ class RLWalk:
             # SystemExit because that is how SIGTERM ends a walk. Record the reason
             # HERE, before that teardown, because the server only asks why after the
             # process is gone.
+            ending = bench_mode.ENDED_ABORT
             print(f"[abort] {abort.code} {abort.reason}: {abort.detail}")
             local_telemetry.write_abort(
                 abort.code, abort.reason, abort.detail, abort.operator
             )
+            if self.bench is not None:
+                # A guard tripping fails the bench on its own. The envelope has already
+                # answered the question the operator was about to be asked.
+                self.bench.aborted(abort)
+                print(f"[bench] failed: abort during bench ({abort.reason})")
             print("[abort] torque off")
         except (KeyboardInterrupt, SystemExit):
-            pass
+            ending = bench_mode.ENDED_SIGNAL
+            if self.bench is not None:
+                # First ending wins, so a bench that finished its own deadline and then
+                # unwound through here keeps "timer" rather than being relabelled.
+                self.bench.end(bench_mode.ENDED_SIGNAL, "the walk process was stopped")
+        except Exception as exc:
+            # NOT handling the exception — it is re-raised below, so the exit code and the
+            # traceback stay exactly what they were. This exists so an unhandled failure is
+            # one of the five endings the bench report can name, instead of the one that
+            # looks like a power cut. Torque is cut by the finally either way.
+            ending = bench_mode.ENDED_ERROR
+            if self.bench is not None:
+                self.bench.end(
+                    bench_mode.ENDED_ERROR, f"{exc.__class__.__name__}: {exc}"
+                )
+            raise
         finally:
             # a leftover snapshot from a dead walk must never read as a live pose
             local_telemetry.clear()
@@ -612,9 +687,30 @@ class RLWalk:
             except Exception:
                 pass
 
+            # AFTER the torque is off, deliberately. The report is the only record the
+            # server will ever see of this run, and writing it is still not worth one
+            # extra millisecond of a duck being driven by a policy that just failed.
+            # Wrapped, because a full /dev/shm must not turn a clean shutdown into a
+            # traceback.
+            if self.bench is not None:
+                report = self.bench.report()
+                try:
+                    bench_mode.write_report(report)
+                except OSError as exc:
+                    print(f"[bench] could not write the report: {exc}")
+                print(f"[bench] {report.summary()}")
+                print("[bench] torque off")
+
             if self.save_obs:
                 pickle.dump(self.saved_obs, open("robot_saved_obs.pkl", "wb"))
             print("TURNING OFF")
+
+        # Reached after every ending that this method handles — the bench deadline, an
+        # operator stop, an abort, a signal. Only an unhandled exception skips it, and that
+        # one is still propagating, with the report already written by the finally above.
+        if self.bench is not None:
+            return self.bench.report()
+        return bench_mode.BenchReport(mode=bench_mode.MODE_FREE, ended=ending, ticks=0)
 
 
 if __name__ == "__main__":
@@ -668,6 +764,33 @@ if __name__ == "__main__":
         help="the policy is user-supplied rather than the one this robot shipped with: "
         "arm the safety envelope (joint-limit and velocity clamps, tilt and control-"
         "budget aborts). TNKR_FORCE_ENVELOPE=1 arms it regardless.",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=bench_mode.MODE_FREE,
+        choices=list(bench_mode.MODES),
+        help="'free' walks until stopped (the default, and what every duck does today). "
+        "'bench' is the supervised first run of an unproven policy: the same loop and the "
+        "same safety envelope, bounded to --bench_seconds, endable at any moment through "
+        "POST /api/bench/stop, and reported at the end. It does not decide whether the "
+        "gait was any good -- a person watching the duck does.",
+    )
+    parser.add_argument(
+        "--bench_seconds",
+        type=float,
+        default=bench_mode.DEFAULT_BENCH_SECONDS,
+        help=f"how long a bench run lasts, clamped to "
+        f"[{bench_mode.MIN_BENCH_SECONDS:g}, {bench_mode.MAX_BENCH_SECONDS:g}] seconds. "
+        f"Ignored in free mode.",
+    )
+    parser.add_argument(
+        "--policy_id",
+        type=str,
+        default=None,
+        help="the store id of the policy being run, recorded in the bench report so the "
+        "operator's verdict can be filed against the right policy. Report-only: it never "
+        "chooses what is loaded, which is --onnx_model_path's job.",
     )
     parser.add_argument(
         "--urdf_path",
@@ -725,4 +848,8 @@ if __name__ == "__main__":
         supabase_key=args.supabase_key,
     )
     print("Done instantiating RLWalk")
-    rl_walk.run()
+    rl_walk.run(
+        mode=args.mode,
+        bench_seconds=args.bench_seconds,
+        policy_id=args.policy_id,
+    )

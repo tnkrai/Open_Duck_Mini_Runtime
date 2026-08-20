@@ -48,6 +48,7 @@ from mini_bdx_runtime import walk_offsets
 from mini_bdx_runtime import preflight
 from mini_bdx_runtime import policy_contract
 from mini_bdx_runtime import policy_store
+from mini_bdx_runtime import bench
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,9 @@ class WalkSession:
     # Which policy this launch loaded. Recorded so eviction can refuse to delete the
     # model a running walk has open, which the store cannot know by itself.
     policy_id: str | None = None
+    # "free" or "bench" (story 4.3). The monitor thread reads it to decide whether this
+    # launch's exit needs a bench report filed against the policy it ran.
+    mode: str = bench.MODE_FREE
 
 
 walk_session: WalkSession | None = None
@@ -370,6 +374,9 @@ TELEMETRY_FAILURES_ONLY_PATHS = {
     # way /api/state did. A 200 says "the policy UI is open", which nothing reads; a 500
     # says the robot stopped answering, which somebody should.
     "/api/policy",
+    # Polled for the ten seconds a bench run lasts, then again while the operator is
+    # looking at the verdict prompt. Same reasoning as /api/policy.
+    "/api/bench",
 }
 
 
@@ -569,6 +576,15 @@ CAPABILITY_ROUTES: dict[str, tuple[tuple[str, str], ...]] = {
     "policy.list": (("GET", "/api/policy"),),
     "policy.install": (("POST", "/api/policy/install"),),
     "policy.select": (("POST", "/api/policy/select"),),
+    # The supervised bench run (story 4.3). One name for the whole flow -- start it,
+    # stop it, read it, judge it -- because Studio has no use for half of it: without
+    # the verdict endpoint the gate can never be cleared, and without the gate there is
+    # nothing to clear.
+    "bench": (
+        ("GET", "/api/bench"),
+        ("POST", "/api/bench/stop"),
+        ("POST", "/api/bench/verdict"),
+    ),
 }
 
 _capabilities_cache: list[str] | None = None
@@ -1650,6 +1666,9 @@ POLICY_STATUS_CODES: dict[str, int] = {
     policy_contract.POLICY_CONTRACT_MISMATCH: 422,  # the file is not a duck policy
     policy_contract.POLICY_STORE_FULL: 507,         # Insufficient Storage, literally
     policy_contract.POLICY_INSTALL_FAILED: 502,     # could not obtain what was promised
+    # 409: the request is well-formed and the policy is fine -- the robot's state is what
+    # refuses it. This policy has never been watched moving a real duck (story 4.3).
+    bench.POLICY_BENCH_REQUIRED: 409,
 }
 
 
@@ -1772,6 +1791,165 @@ def select_policy(body: PolicySelectRequest):
     return {"ok": True, "active": active}
 
 
+# ── The supervised bench run (story 4.3, Decision 10) ─────────────────────────
+#
+# Decision 1 removed the simulation gate and recorded the consequence: nothing in this
+# design predicts whether a policy WALKS WELL. So the first hardware run of a policy this
+# robot has never run is ten bounded seconds with the operator holding the duck, and the
+# operator's answer is the only judge there is.
+#
+# These endpoints record a verdict. They never compute one. There is deliberately no
+# heuristic anywhere below that turns "did not abort" into a pass -- a policy can hold
+# every joint inside every limit, keep every deadline, and produce a gait that faceplants
+# the moment it bears weight, which is exactly the case a rubber stamp would wave through.
+#
+# The one exception runs the other way: an abort from the safety envelope FAILS the bench
+# without asking, because the envelope has already answered the question.
+
+
+class BenchVerdictRequest(BaseModel):
+    policyId: str
+    passed: bool
+    reason: str | None = None
+
+
+def _bench_running() -> bool:
+    session = walk_session
+    return (
+        session is not None
+        and session.mode == bench.MODE_BENCH
+        and session.proc.poll() is None
+    )
+
+
+def _bench_payload() -> dict:
+    """What /api/bench answers, and what /api/bench/stop echoes back.
+
+    ``policyId`` is the policy of the bench in progress, or of the last one that reported
+    -- never of the free walk that happens to be running, which is not a bench and whose
+    id would read as one on the screen the operator is watching.
+    """
+    report = bench.read_report()
+    running = _bench_running()
+    session = walk_session
+    return {
+        "running": running,
+        "policyId": (
+            session.policy_id
+            if running and session is not None
+            else (report.policy_id if report is not None else None)
+        ),
+        "stopRequested": bench.stop_requested(),
+        "defaultSeconds": bench.DEFAULT_BENCH_SECONDS,
+        "report": report.as_dict() if report is not None else None,
+    }
+
+
+def _finalize_bench(session: WalkSession) -> None:
+    """After a bench walk exits: fail it here if a guard tripped. Never pass it here.
+
+    Called from the monitor thread, so it must not raise -- and it is the only place a
+    verdict is written without a person, which is why it can only ever write a *failure*.
+
+    Everything else -- a clean ten seconds, an operator stop, a crash, a power cut --
+    leaves no record at all, and no record means still gated. That is the fail-closed
+    direction: the cost of forgetting a pass is another ten seconds, and the cost of
+    inventing one is an unwatched policy on a duck standing on its own feet.
+    """
+    if session.mode != bench.MODE_BENCH or not session.policy_id:
+        return
+    report = bench.read_report()
+    if report is None or not report.aborted:
+        return
+    reason = report.abort_reason or "the safety envelope stopped the run"
+    try:
+        get_policy_store().mark_bench(session.policy_id, False, reason)
+    except Exception as exc:  # a bookkeeping failure must not kill the monitor thread
+        print(f"[bench] could not record the failed bench run: {exc}")
+
+
+@app.get("/api/bench")
+def read_bench():
+    """Whether a bench run is in progress, and the last one's report.
+
+    Polled while the run is on screen, so it is on the failures-only telemetry list.
+    """
+    return _bench_payload()
+
+
+@app.post("/api/bench/stop")
+def stop_bench():
+    """End the bench run now.
+
+    A file the loop stats each tick, not a signal: the walk then ends its own bench, cuts
+    torque through the teardown it already has, and writes the report saying the operator
+    stopped it. Killing the process would cut torque just as fast and lose the report,
+    which is the difference between a run the operator can fail on purpose and a run that
+    merely vanished.
+
+    /api/walk/stop still works during a bench and still cuts torque immediately. This is
+    the gentler of the two, not a replacement for it.
+    """
+    if not _bench_running():
+        raise HTTPException(
+            status_code=409, detail="No bench run is in progress -- nothing to stop"
+        )
+    bench.request_stop()
+    return _bench_payload()
+
+
+@app.post("/api/bench/verdict")
+def bench_verdict(body: BenchVerdictRequest):
+    """Record the operator's answer to "did that look like walking?".
+
+    Refusals, and why each one is a refusal rather than a shrug:
+
+    * no report -- nothing ran, or the run died before it could say what it did. Accepting
+      a pass here would let the gate be cleared without a duck ever moving.
+    * a report for a different policy -- the verdict would be filed against weights nobody
+      watched.
+    * a pass on a run that aborted, crashed or was signalled away -- the envelope already
+      failed it, or nobody saw it finish. A *fail* on any of those is always accepted.
+    """
+    store = get_policy_store()
+    report = bench.read_report()
+    if report is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No bench run to judge -- run one before recording a verdict",
+        )
+    if (report.policy_id or policy_store.BUILTIN_ID) != body.policyId:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"the last bench run was of {report.policy_id!r}, "
+                f"not {body.policyId!r}"
+            ),
+        )
+    if body.passed and report.ended not in bench.PASSABLE_ENDINGS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"that bench run ended as {report.ended!r}, which cannot be passed. "
+                "Run the bench again."
+            ),
+        )
+    try:
+        status = store.mark_bench(body.policyId, body.passed, body.reason or "")
+    except policy_store.StoreError as exc:
+        return _policy_failure(exc.code, exc.detail)
+    add_telemetry_props(
+        passed=body.passed,
+        ended=report.ended,
+        # A boolean, never the id: which community policy an owner is trying is not this
+        # event's business (same rule as the install event).
+        builtin=body.policyId == policy_store.BUILTIN_ID,
+        ticks=report.ticks,
+        clamp_events=report.clamp_events,
+    )
+    return {"ok": True, "bench": status}
+
+
 # ── Walk Control ──────────────────────────────────────────────────────────────
 
 def stop_walk_process():
@@ -1810,6 +1988,13 @@ def stop_walk_process():
 def _monitor_walk(session: WalkSession):
     """Wait for one walk launch to exit and report how it ended."""
     rc = session.proc.wait()
+    # Before the telemetry, because this is the only chance to see the report the walk
+    # just wrote: a bench that aborted is a bench that failed, and story 1.3's guards are
+    # the one judge that does not need a person (story 4.3).
+    try:
+        _finalize_bench(session)
+    except Exception as exc:
+        print(f"[bench] finalize failed: {exc}")
     # Any nonzero exit we didn't ask for is a crash — including -SIGKILL,
     # which is how the kernel OOM killer ends walks on a 512MB Pi. Exempting
     # signals wholesale would blind the crash-rate dashboard to OOM.
@@ -1822,6 +2007,7 @@ def _monitor_walk(session: WalkSession):
             "crashed": crashed,
             "stop_requested": session.stop_requested,
             "cloud_streaming": session.cloud_streaming,
+            "mode": session.mode,
         },
     )
 
@@ -1833,6 +2019,11 @@ class WalkStartRequest(BaseModel):
     # Which policy to walk on. Omitted (the only thing Studio sends today) means the
     # active one, which on a duck that has never installed anything is the built-in.
     policyId: str | None = None
+    # "free" (the default, and everything before story 4.3) or "bench": a bounded
+    # supervised run of a policy this robot has never run. Omitted means free, so a Studio
+    # that predates the bench sends exactly what it sent before.
+    mode: str | None = None
+    benchSeconds: float | None = None
 
 
 @app.post("/api/walk/start")
@@ -1851,6 +2042,11 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
 
 def _walk_start_locked(body: WalkStartRequest):
     global walk_session
+
+    try:
+        mode = bench.parse_mode(body.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     if rehome_io is not None:
         raise HTTPException(
@@ -1892,6 +2088,30 @@ def _walk_start_locked(body: WalkStartRequest):
                 detail="No ONNX model found in scripts/ directory",
             )
 
+        # The gate (story 4.3). Checked here, in the same window as the 404 above and for
+        # the same reason: a refusal must cost nothing, and stopping the running walk
+        # first would cut torque on a duck mid-stride for a request that starts nothing.
+        #
+        # The built-in is exempt -- it is what every duck sold walks on. A bench run is
+        # never gated on itself, which is the whole point of it.
+        #
+        # DELIBERATE HOLE, worth stating: a file an owner copies straight into scripts/ is
+        # resolved by the built-in's glob, so it gets id "builtin" here and is NOT gated.
+        # Gating it would be unclearable -- a verdict is recorded against a store id, and
+        # that file has none -- so the gate would permanently break the workflow the
+        # envelope stories describe as how people run downloaded policies today. It is
+        # still guarded: envelope.is_armed goes by FILE NAME, not by this id, so anything
+        # that is not one of the two policies this repo ships runs with every clamp and
+        # abort armed. Fail-safe there, functional here.
+        if mode == bench.MODE_FREE:
+            status = store.bench_status(resolved.id)
+            if status["required"]:
+                return _policy_failure(
+                    bench.POLICY_BENCH_REQUIRED,
+                    f"{resolved.id} has not passed a supervised bench run on this robot"
+                    + (f": {status['reason']}" if status["reason"] else ""),
+                )
+
     if running:
         # A different session token: the old walk is bound to a channel nobody is
         # listening to any more. Only now, with a policy in hand and a walk certain to
@@ -1931,6 +2151,20 @@ def _walk_start_locked(body: WalkStartRequest):
             # was fail-open. If this line is ever deleted the envelope must still arm; if
             # it stops arming, the bug is in is_armed, not here.
             cmd.append("--custom_policy")
+        if mode == bench.MODE_BENCH:
+            # Bench mode adds three arguments and no second code path: --mode is read by
+            # the same loop, and --policy_id is carried only so the report the walk writes
+            # names the policy the operator's verdict will be filed against.
+            cmd.extend(
+                [
+                    "--mode",
+                    bench.MODE_BENCH,
+                    "--bench_seconds",
+                    f"{bench.clamp_seconds(body.benchSeconds):g}",
+                    "--policy_id",
+                    resolved.id,
+                ]
+            )
         if body.sessionToken:
             cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
             cmd.extend(["--cloud_commands_channel", f"robot-commands-{body.sessionToken}"])
@@ -1966,6 +2200,7 @@ def _walk_start_locked(body: WalkStartRequest):
         # Whether this walk is the policy the robot shipped with. A boolean, never the id:
         # which community policy an owner is trying is not this event's business.
         builtin_policy=bool(resolved.is_builtin) if resolved else None,
+        mode=mode,
     )
 
     # Start from a clean slate. stop_walk_process() clears these, but a walk
@@ -1975,6 +2210,13 @@ def _walk_start_locked(body: WalkStartRequest):
     # pause/trim for the whole boot window.
     walk_pause.clear()
     walk_offsets.clear()
+    # Same rule, for the same reason: a stop request belongs to the bench that was
+    # stopped, and a leftover one would end the next bench on its first tick. The report
+    # goes too, so /api/bench cannot serve a previous run's outcome as this one's while
+    # the walk is still booting. The walk clears both again itself, which is what keeps it
+    # correct when it is started from a terminal with no server involved.
+    bench.clear_stop()
+    bench.clear_report()
 
     proc = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
     walk_session = WalkSession(
@@ -1983,6 +2225,7 @@ def _walk_start_locked(body: WalkStartRequest):
         cloud_streaming=cloud_streaming,
         started_at=time.monotonic(),
         policy_id=resolved.id if resolved else None,
+        mode=mode,
     )
     Thread(target=_monitor_walk, args=(walk_session,), daemon=True).start()
     if resolved is not None:
@@ -1993,6 +2236,7 @@ def _walk_start_locked(body: WalkStartRequest):
         "success": True,
         "pid": proc.pid,
         "policyId": resolved.id if resolved else None,
+        "mode": mode,
     }
 
 

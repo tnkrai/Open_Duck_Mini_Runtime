@@ -89,7 +89,8 @@ OBS_VERSION: str = "duck-obs-v1"
 
 # The single ONNX input name the runtime feeds. OnnxInfer's input_name defaults to "obs"
 # (onnx_infer.py:5); its awd flag defaults to False and it is the WALK SCRIPT that passes
-# awd=True (v2_rl_walk_mujoco.py:67), which is what wraps the vector in a batch of one.
+# awd=True (v2_rl_walk_mujoco.py:78), which is what wraps the vector in a batch of one
+# and reads row zero of the result back out. See _batched_width: that rank is the contract.
 OBS_INPUT_NAME: str = "obs"
 
 # Reject before parsing rather than after. A hostile or corrupt multi-hundred-MB file
@@ -253,41 +254,81 @@ def infer_manifest(session: Any) -> dict:
     }
 
 
-def _static_width(shape: Sequence[Any]) -> int | None:
-    """The trailing width of a fully static ``[1, ..., N]`` shape, else ``None``.
+def _batched_width(shape: Sequence[Any]) -> int | None:
+    """The ``N`` of an exactly-``[1, N]`` shape, else ``None``.
 
-    ``None`` means "cannot assert", covering both a dynamic axis and a batch dimension
-    that is not one. Callers turn that into a refusal with a shape-specific reason, so
-    this function deliberately does not decide which.
+    Rank is part of the assertion, not incidental to it. The walk loop builds its
+    ``OnnxInfer`` with ``awd=True`` (``v2_rl_walk_mujoco.py:78``), which means it feeds
+    ``{"obs": [obs]}`` -- rank 2, batch of one -- and reads ``outputs[0][0]``, the first
+    *row* of a rank-2 result. Both halves of that are the contract.
+
+    An earlier version of this function only checked the trailing dimension, so a graph
+    exported without the batch axis (input ``[101]``, output ``[14]``) was accepted. That is
+    the worst thing this check can wave through, and it is worse than a crash: real
+    onnxruntime returns a ``(14,)`` array for that output, so ``outputs[0][0]`` is a numpy
+    *scalar*, and ``init_pos + scalar * action_scale`` at line 450 broadcasts it into 14
+    identical motor targets. Every joint gets the same offset from its init position, at
+    50 Hz, with torque on -- and nothing raises, nothing logs, and the envelope's clamps see
+    a perfectly plausible 14-vector. The operator has no signal at all that the policy's
+    output was discarded.
+
+    ``None`` means "cannot assert", and covers a dynamic axis, a rank that is not two, and a
+    batch that is not one. Callers turn it into a refusal that names which, so this function
+    deliberately does not decide.
     """
-    if not shape:
+    if len(shape) != 2:
         return None
     if any(not isinstance(dim, int) for dim in shape):
         return None
-    if any(dim != 1 for dim in shape[:-1]):
+    if shape[0] != 1:
         return None
-    return int(shape[-1])
+    return int(shape[1])
 
 
 def _describe_shape(shape: Sequence[Any]) -> str:
     return "[" + ", ".join("None" if d is None else repr(d) for d in shape) + "]"
 
 
-def _dynamic_refusal(role: str, arg: Any) -> str:
-    """The refusal text for a non-static shape.
+# Why the rank is refused rather than tolerated, in the words the reporter of a legitimate
+# case will need. Shared by the input and output branches because the reason is the same one.
+_SHAPE_RULE: str = (
+    f"{OBS_VERSION} requires exactly [1, N]: the walk loop constructs OnnxInfer with "
+    "awd=True, so it feeds one observation wrapped in a batch of one and reads row zero of "
+    "the result back. A shape that does not resolve to that cannot be verified before "
+    "torque is enabled, and 'cannot assert' on the hardware boundary means refuse."
+)
 
-    Says *why* it is refused, not just that it was. A dynamic-batch graph may well work --
-    the walk loop always calls with a batch of one (``awd=True`` wraps the observation in a
-    list) -- but "may well work" is not a claim this side of the servos gets to make. Naming
-    the reason is what lets a legitimate case be reported instead of mystifying its owner.
+
+def _shape_refusal(role: str, arg: Any) -> str:
+    """The refusal text for a shape that is not ``[1, N]``, naming which defect it has.
+
+    Says *why* it is refused, not just that it was. Each of the three defects is a case that
+    might be legitimate and reportable -- a dynamic-batch graph may well work, since the loop
+    always calls with a batch of one -- so the detail has to distinguish them. "Bad shape"
+    would leave the owner of a working policy guessing.
     """
+    shape = list(arg.shape)
+
+    if any(not isinstance(dim, int) for dim in shape):
+        defect = "is not static"
+        remedy = (
+            "This is a deliberate refusal, not a parse failure: report it if your policy "
+            "is genuinely dynamic-batch."
+        )
+    elif len(shape) != 2:
+        defect = f"is rank {len(shape)}, not rank 2"
+        remedy = (
+            "Re-export with the batch axis present. A missing batch axis is the dangerous "
+            "one: on the output side it makes the loop read a scalar and command every "
+            "joint the same offset, so it is refused rather than run."
+        )
+    else:
+        defect = f"is a batch of {shape[0]}, not a batch of one"
+        remedy = "Re-export with a fixed batch of one."
+
     return (
-        f"{role} {arg.name!r} has shape {_describe_shape(arg.shape)}, which is not static. "
-        f"{OBS_VERSION} requires a fixed shape resolving to a batch of one, because a "
-        "graph whose width is decided at run time cannot be verified before torque is "
-        "enabled. "
-        "This is a deliberate refusal, not a parse failure: report it if your policy is "
-        "genuinely dynamic-batch."
+        f"{role} {arg.name!r} has shape {_describe_shape(shape)}, which {defect}. "
+        f"{_SHAPE_RULE} {remedy}"
     )
 
 
@@ -315,9 +356,9 @@ def _signature_error(session: Any) -> str | None:
             f"{OBS_VERSION} is {OBS_DIM} floats"
         )
 
-    obs_width = _static_width(obs_in.shape)
+    obs_width = _batched_width(obs_in.shape)
     if obs_width is None:
-        return _dynamic_refusal("input", obs_in)
+        return _shape_refusal("input", obs_in)
     if obs_width != OBS_DIM:
         return f"input {obs_in.name!r} is {obs_width} wide, expected {OBS_DIM}"
 
@@ -332,9 +373,9 @@ def _signature_error(session: Any) -> str | None:
             f"the loop writes {ACT_DIM} float motor targets"
         )
 
-    act_width = _static_width(act_out.shape)
+    act_width = _batched_width(act_out.shape)
     if act_width is None:
-        return _dynamic_refusal("output", act_out)
+        return _shape_refusal("output", act_out)
     if act_width != ACT_DIM:
         return f"output {act_out.name!r} is {act_width} wide, expected {ACT_DIM}"
 

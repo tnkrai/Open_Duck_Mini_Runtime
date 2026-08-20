@@ -18,6 +18,12 @@ int64 output, a digest with the wrong case or stray whitespace, an unreadable fi
 missing onnxruntime) and two assertions about *order*, which is the part a reader would
 otherwise have to take on trust.
 
+Plus rank. "Static shape resolving to OBS_DIM floats" reads as a width assertion and is not
+one: a first pass compared only the trailing dimension, which accepted a batchless action
+head -- and that is the only refusal in this file whose absence is *silent* on the robot
+rather than loud. ``test_a_batchless_action_head_would_command_every_joint_alike`` drives the
+consequence rather than describing it.
+
 No onnxruntime here
 -------------------
 Every graph comes from the configurable double in ``tests/stubs/onnxruntime.py`` via the
@@ -38,6 +44,7 @@ import onnxruntime as onnx_double  # tests/stubs, not the wheel
 import pytest
 
 from mini_bdx_runtime import policy_contract
+from mini_bdx_runtime.onnx_infer import OnnxInfer
 from mini_bdx_runtime.policy_contract import (
     ACT_DIM,
     MAX_POLICY_BYTES,
@@ -86,21 +93,6 @@ def test_accepts_the_shape_the_duck_runs(onnx_specs, model):
     # Decision 5: a bare ONNX with no manifest is still installable, marked inferred.
     assert result.manifest["inferred"] is True
     assert result.manifest["size_bytes"] == model.stat().st_size
-
-
-def test_accepts_an_unbatched_input(onnx_specs, model):
-    """``[101]`` with no batch axis is still static and still 101 floats.
-
-    Both of the only two published Open Duck policies export ``[1, 101]``, but refusing a
-    batchless graph would be refusing a shape we can verify, which is not what the refusal
-    is for."""
-    onnx_specs.register(
-        model,
-        inputs=[(OBS_INPUT_NAME, [OBS_DIM], FLOAT)],
-        outputs=[("continuous_actions", [ACT_DIM], FLOAT)],
-    )
-
-    assert check_policy(model).ok
 
 
 def test_accepted_manifest_records_the_verified_digest(onnx_specs, model):
@@ -275,6 +267,98 @@ def test_refuses_a_batch_larger_than_one(onnx_specs, model):
 
     assert not result.ok
     assert result.code == POLICY_CONTRACT_MISMATCH
+    assert "a batch of 4, not a batch of one" in result.detail
+
+
+def test_refuses_an_input_with_no_batch_axis(onnx_specs, model):
+    """``[101]`` is static and 101 wide and still not what the loop feeds.
+
+    The loop runs ``OnnxInfer`` with ``awd=True`` (``v2_rl_walk_mujoco.py:78``), which hands
+    the session ``{"obs": [obs]}`` -- rank 2. A rank-1 graph raises inside the 50 Hz loop,
+    which is after torque is on, and story 2.2 requires the check to complete before that.
+    """
+    onnx_specs.register(
+        model,
+        inputs=[(OBS_INPUT_NAME, [OBS_DIM], FLOAT)],
+        outputs=[("continuous_actions", [1, ACT_DIM], FLOAT)],
+    )
+
+    result = check_policy(model)
+
+    assert not result.ok
+    assert result.code == POLICY_CONTRACT_MISMATCH
+    assert "rank 1, not rank 2" in result.detail
+    assert result.manifest is None
+
+
+def test_refuses_an_output_with_no_batch_axis(onnx_specs, model):
+    """The mixed-rank export: a conforming input and a batchless action head.
+
+    This is the one that has to be refused for a *silence* reason rather than a crash one --
+    see the next test, which shows what running it would do.
+    """
+    onnx_specs.register(
+        model,
+        inputs=[(OBS_INPUT_NAME, [1, OBS_DIM], FLOAT)],
+        outputs=[("continuous_actions", [ACT_DIM], FLOAT)],
+    )
+
+    result = check_policy(model)
+
+    assert not result.ok
+    assert result.code == POLICY_CONTRACT_MISMATCH
+    assert "'continuous_actions'" in result.detail
+    assert "rank 1, not rank 2" in result.detail
+
+
+def test_refuses_a_rank_three_input(onnx_specs, model):
+    """``[1, 1, 101]`` has a trailing 101 and leading dims that are all one, so a check
+    that only looked at the trailing width would take it. onnxruntime does not: it raises on
+    the rank mismatch, inside the loop, with torque enabled."""
+    onnx_specs.register(
+        model,
+        inputs=[(OBS_INPUT_NAME, [1, 1, OBS_DIM], FLOAT)],
+        outputs=[("continuous_actions", [1, ACT_DIM], FLOAT)],
+    )
+
+    result = check_policy(model)
+
+    assert not result.ok
+    assert result.code == POLICY_CONTRACT_MISMATCH
+    assert "rank 3, not rank 2" in result.detail
+
+
+def test_a_batchless_action_head_would_command_every_joint_alike(onnx_specs, model):
+    """Why the rank is refused instead of tolerated, demonstrated rather than asserted.
+
+    A first pass at this check only compared the trailing dimension, so ``[1, 101]`` in /
+    ``[14]`` out was accepted. This test drives the graph the way the walk loop does and
+    shows the consequence: ``outputs[0][0]`` over a ``(14,)`` result is a numpy *scalar*, and
+    ``init_pos + action * action_scale`` (``v2_rl_walk_mujoco.py:450``) broadcasts it into 14
+    identical motor targets -- every joint commanded the same offset, at 50 Hz, with torque
+    on, and nothing raising anywhere for the operator to see. The envelope's clamps cannot
+    help: what they receive is a plausible 14-vector.
+
+    So the assertion is in two halves: the harm is real, and the check refuses it.
+    """
+    onnx_specs.register(
+        model,
+        inputs=[(OBS_INPUT_NAME, [1, OBS_DIM], FLOAT)],
+        outputs=[("continuous_actions", [ACT_DIM], FLOAT)],
+    )
+
+    policy = OnnxInfer(str(model), awd=True)
+    action = policy.infer(np.zeros(OBS_DIM, dtype=np.float32))
+
+    # Half one: the loop's arithmetic silently fabricates a full command vector.
+    assert np.ndim(action) == 0, "the double no longer reproduces the scalar; fix the test"
+    init_pos = np.linspace(-1.0, 1.0, ACT_DIM)
+    motor_targets = init_pos + action * 0.25
+    assert motor_targets.shape == (ACT_DIM,)
+    assert np.allclose(motor_targets - init_pos, motor_targets[0] - init_pos[0])
+
+    # Half two: which is why the file never gets that far.
+    assert not check_policy(model).ok
 
 
 def test_refuses_non_float_input_dtype(onnx_specs, model):

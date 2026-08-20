@@ -424,6 +424,30 @@ def test_refuses_an_oversize_file_before_parsing_it(onnx_specs, model):
     assert onnx_specs.constructed == [], "an oversize file reached onnxruntime"
 
 
+def test_refuses_an_oversize_file_at_the_default_ceiling(onnx_specs, tmp_path):
+    """The test above passes ``max_bytes=4``, which proves the branch works and proves
+    nothing about the number every real caller uses -- and the number is the whole point,
+    because ``/api/policy/install`` has no auth (amendment A1) and nobody passes
+    ``max_bytes``. So this drives the same refusal through the default.
+
+    Sparse: ``truncate`` reserves the length without writing the bytes, so the test costs
+    no disk and no time. The file is never read past ``stat``, which is the property being
+    asserted."""
+    big = tmp_path / "big.onnx"
+    with big.open("wb") as fh:
+        fh.truncate(MAX_POLICY_BYTES + 1)
+    onnx_specs.valid(big, obs_dim=OBS_DIM, act_dim=ACT_DIM)
+
+    result = check_policy(big)
+
+    assert not result.ok
+    assert result.code == POLICY_CONTRACT_MISMATCH
+    assert onnx_specs.constructed == [], (
+        "a file over the default ceiling reached onnxruntime's parser, so the ceiling "
+        "does not bound peak memory for the callers that do not set one"
+    )
+
+
 def test_refuses_a_hash_mismatch_before_parsing_it(onnx_specs, model):
     """Integrity before RAM: a file that is not the file we were promised does not get
     parsed. Same reasoning as the ceiling, same assertion on ``constructed``."""

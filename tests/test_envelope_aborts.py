@@ -309,10 +309,13 @@ def test_the_driver_stamps_the_fused_read_and_only_the_fused_read() -> None:
     ``board`` import raises on any machine Blinka does not recognise), which is why the
     walk script is read with ast in this suite too.
 
-    Two things are asserted, and both are load-bearing. The published sample carries the
-    stamp -- without it every consumer is back to guessing -- and the stamp is written in
-    the same block as the quaternion it describes, so a read that failed cannot leave a
-    fresh timestamp on a stale value.
+    Three things are asserted, and all three are load-bearing. The published sample
+    carries the stamp -- without it every consumer is back to guessing. The published
+    stamp is *the recorded read time*, not a time taken as the sample is assembled --
+    stamping at publish time is the natural-looking edit that reintroduces F4 whole,
+    because every sample then looks fresh whether the fused read answered or not. And
+    the recorded time is written in the same block as the quaternion it describes, so a
+    read that failed cannot leave a fresh timestamp on a stale value.
     """
     source = (
         Path(__file__).parent.parent
@@ -333,11 +336,36 @@ def test_the_driver_stamps_the_fused_read_and_only_the_fused_read() -> None:
     ]
     assert published, "no IMU sample dict found in raw_imu.Imu"
     for sample in published:
-        keys = [ast.unparse(k).strip("'\"") for k in sample.keys if k]
-        assert "quaternion_t" in keys, (
+        paired = {
+            ast.unparse(k).strip("'\""): ast.unparse(v)
+            for k, v in zip(sample.keys, sample.values)
+            if k is not None
+        }
+        assert "quaternion_t" in paired, (
             "an IMU sample is published without the age of its fused read, so a "
             "consumer cannot tell a level duck from a sensor that stopped answering "
             "(failure mode F4)"
+        )
+        stamp = paired["quaternion_t"]
+        if stamp == "None":
+            # The seed sample built in __init__: no fused read has succeeded yet, so
+            # there is no time to carry and its identity quaternion is honestly undated.
+            continue
+        # The VALUE, not just the key. The stamp must be the one _read_quaternion recorded
+        # on success -- a whitelist of one, because "some expression that produces a
+        # float" is exactly what fails open here.
+        assert stamp == "self._last_quat_t", (
+            f"an IMU sample stamps quaternion_t with {stamp!r} instead of the time the "
+            "fused read succeeded. A time taken while the sample is assembled is fresh on "
+            "every sample, including the ones whose quaternion is the previous value "
+            "because self.imu.quaternion raised or returned None -- so imu_quaternion() "
+            "never reports unknown, check_tilt() sees a level duck forever, and a fallen "
+            "duck keeps being commanded into the floor with torque on (failure mode F4)"
+        )
+        assert "_last_quat" in paired.get("quaternion", ""), (
+            "the stamp describes self._last_quat, so the quaternion published beside it "
+            "must be that same value -- publishing a separately-sourced quaternion dates "
+            "one read with another read's timestamp"
         )
 
     blocks = [

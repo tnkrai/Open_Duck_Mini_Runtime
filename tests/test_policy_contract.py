@@ -401,8 +401,36 @@ def test_widths_are_positive() -> None:
     assert all(width > 0 for _, width in OBS_TERMS)
 
 
-def test_max_policy_bytes_is_sane() -> None:
-    assert 32 * 1024**2 <= MAX_POLICY_BYTES <= 512 * 1024**2
+# The board in the duck: Raspberry Pi Zero 2W, 512 MB total, already running the OS and
+# tnkr_server. Named here because the ceiling below is only meaningful relative to it.
+PI_RAM_BYTES = 512 * 1024**2
+# scripts/BEST_WALK_ONNX_2.onnx, the policy every duck ships with, to the byte.
+BUILTIN_POLICY_BYTES = 884177
+# onnxruntime holds the protobuf plus its initializers while parsing, so peak RSS during
+# inspection is a small multiple of the file. Three is the pessimistic end of that.
+PARSE_MEMORY_FACTOR = 3
+
+
+def test_the_size_ceiling_is_small_enough_to_be_a_ceiling() -> None:
+    """An earlier version of this test asserted only ``32 MB <= x <= 512 MB``, and 512 MB
+    is the whole board -- so a 256 MB ceiling passed it while letting a 200 MB file reach
+    onnxruntime's parser, which is the exact memory exhaustion the ceiling exists to stop
+    (story 2.2: "a large upload cannot exhaust a Pi's memory during inspection"). The
+    bound has to be stated against the Pi's RAM or it states nothing.
+    """
+    assert MAX_POLICY_BYTES * PARSE_MEMORY_FACTOR <= PI_RAM_BYTES // 4, (
+        f"a file at the {MAX_POLICY_BYTES / 1024**2:.0f} MB ceiling could cost "
+        f"{MAX_POLICY_BYTES * PARSE_MEMORY_FACTOR / 1024**2:.0f} MB to parse on a "
+        f"{PI_RAM_BYTES / 1024**2:.0f} MB board that is also running tnkr_server, so the "
+        "install would be refused by the OOM killer rather than by a typed refusal"
+    )
+
+
+def test_the_size_ceiling_accepts_every_policy_that_exists() -> None:
+    """The other half: a ceiling tight enough to refuse a real policy is a bug report, not
+    a safety feature. Ten times the built-in is the margin, and the built-in is the largest
+    Open Duck ONNX anyone has published."""
+    assert MAX_POLICY_BYTES >= 10 * BUILTIN_POLICY_BYTES
 
 
 def test_describe_is_one_line() -> None:

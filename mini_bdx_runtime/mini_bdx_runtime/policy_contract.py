@@ -95,7 +95,19 @@ OBS_INPUT_NAME: str = "obs"
 
 # Reject before parsing rather than after. A hostile or corrupt multi-hundred-MB file
 # should never reach onnxruntime's parser on a memory-constrained Pi.
-MAX_POLICY_BYTES: int = 256 * 1024 * 1024
+#
+# The number is derived from the machine, not from taste, because a ceiling above what the
+# robot can survive parsing is not a ceiling. The Pi Zero 2W in the duck has 512 MB total
+# (README.md) and is already running the OS plus tnkr_server; onnxruntime's parser holds the
+# protobuf and its initializers, so peak RSS during inspection is a small multiple of the
+# file. 16 MB keeps that multiple under a tenth of the board's RAM, which is what makes the
+# refusal cheaper than the OOM killer taking tnkr_server mid-walk.
+#
+# It is not tight: the policy every duck ships with is 884177 bytes, and a Playground-trained
+# policy is the same MLP at the same widths. 16 MB is ~19x the largest ONNX anyone in this
+# ecosystem has published. Raise it when a real policy is actually refused -- and re-derive
+# it from the board's RAM when you do, rather than adding a zero.
+MAX_POLICY_BYTES: int = 16 * 1024 * 1024
 
 # onnxruntime's dtype string for a float32 tensor, verbatim. Read off onnxruntime 1.24.4
 # loading scripts/BEST_WALK_ONNX_2.onnx: input 'obs' [1, 101] tensor(float), output

@@ -2211,12 +2211,29 @@ def _walk_start_locked(body: WalkStartRequest):
     walk_pause.clear()
     walk_offsets.clear()
     # Same rule, for the same reason: a stop request belongs to the bench that was
-    # stopped, and a leftover one would end the next bench on its first tick. The report
-    # goes too, so /api/bench cannot serve a previous run's outcome as this one's while
-    # the walk is still booting. The walk clears both again itself, which is what keeps it
-    # correct when it is started from a terminal with no server involved.
+    # stopped, and a leftover one would end the next bench on its first tick. Cleared on
+    # every start, because it is a REQUEST -- it expires with the run it was aimed at, and
+    # nothing is lost by dropping one nobody is waiting on.
     bench.clear_stop()
-    bench.clear_report()
+    # The report is the opposite: an ANSWER, and one the operator still owes a verdict on.
+    # POST /api/bench/verdict refuses with 409 when there is no report, so deleting it
+    # here costs somebody another ten seconds holding a duck. Clearing it on every start
+    # (which is what this did) threw that away whenever anyone pressed Walk in between --
+    # a bench finishes, the "did that look like walking?" prompt is on screen, the
+    # operator starts the built-in to compare the two, and the answer can no longer be
+    # recorded. Nothing unsafe: the policy stays gated, which is the fail-closed
+    # direction. It is ten seconds of the operator's time, lost for no reason.
+    #
+    # So only a bench start clears it, which is the case the clear exists for: /api/bench
+    # must not serve a previous run's outcome as THIS run's while the walk is still
+    # booting. A free walk cannot be mistaken for a bench -- `running` comes off the
+    # session's mode, never off the report lying beside it -- and the loop writes a report
+    # only when self.bench is not None (v2_rl_walk_mujoco.py, mode == bench).
+    #
+    # The walk clears both again itself when it starts a bench, which is what keeps this
+    # correct when a bench is started from a terminal with no server involved.
+    if mode == bench.MODE_BENCH:
+        bench.clear_report()
 
     proc = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
     walk_session = WalkSession(

@@ -1185,6 +1185,78 @@ def test_starting_a_bench_clears_a_previous_stop_request(api, onnx_specs, monkey
     assert bench.stop_requested() is False
 
 
+def test_starting_a_bench_clears_a_previous_report(api, onnx_specs, monkeypatch):
+    """A verdict must never be recordable against a run that did not just happen, so the
+    one start that DOES delete the report is the start of the next bench."""
+    api_install(api, onnx_specs, monkeypatch)
+    bench.write_report(
+        bench.BenchReport(policy_id="old", ended=bench.ENDED_TIMER, ticks=500)
+    )
+
+    api.post("/api/walk/start", json={"policyId": "9f2a", "mode": "bench"})
+    spawned_argv(tnkr_server.SCRIPTS_DIR)
+
+    assert bench.read_report() is None
+    assert api.get("/api/bench").json()["report"] is None
+
+
+def test_a_free_walk_keeps_a_finished_benchs_unanswered_report(
+    api, onnx_specs, monkeypatch
+):
+    """The operator's ten seconds are not something an unrelated walk may throw away.
+
+    The sequence, which is an ordinary afternoon: bench 9f2a, watch it finish, leave the
+    "did that look like walking?" prompt on screen, press Walk on the built-in to compare
+    the two -- then answer. Clearing the report on every start (which is what this did)
+    deleted the question, so the verdict came back 409 and the duck had to be held for
+    another ten seconds. Nothing unsafe: the policy stays gated either way, which is why
+    this is friction rather than a hazard.
+    """
+    api_install(api, onnx_specs, monkeypatch)
+    api.post("/api/walk/start", json={"policyId": "9f2a", "mode": "bench"})
+    spawned_argv(tnkr_server.SCRIPTS_DIR)
+    with tnkr_server._walk_lock:
+        tnkr_server.stop_walk_process()
+    bench.write_report(
+        bench.BenchReport(policy_id="9f2a", ended=bench.ENDED_TIMER, ticks=500)
+    )
+    (tnkr_server.SCRIPTS_DIR / "argv.json").unlink()
+
+    # the unrelated walk: the built-in, free mode, nothing to do with the bench
+    assert api.post("/api/walk/start", json={}).status_code == 200
+    spawned_argv(tnkr_server.SCRIPTS_DIR)
+
+    assert bench.read_report() is not None, "the free walk deleted the pending report"
+    assert api.get("/api/bench").json()["report"]["policyId"] == "9f2a"
+    # the stop REQUEST is the other way round -- it expires with the run it was aimed at,
+    # so every start still drops it and no bench inherits one
+    assert bench.stop_requested() is False
+    # and the answer is still recordable, which is the thing the operator loses
+    verdict = api.post(
+        "/api/bench/verdict",
+        json={"policyId": "9f2a", "passed": True, "reason": "looked like walking"},
+    )
+    assert verdict.status_code == 200, verdict.text
+    assert verdict.json()["bench"]["passed"] is True
+
+
+def test_a_free_walk_never_reads_as_the_bench_that_reported(api, onnx_specs, monkeypatch):
+    """Keeping the report costs nothing on the screen the operator is watching: what is
+    running comes off the session's mode, and the id off the bench, never off the free
+    walk happening beside it."""
+    bench.write_report(
+        bench.BenchReport(policy_id="9f2a", ended=bench.ENDED_TIMER, ticks=500)
+    )
+
+    assert api.post("/api/walk/start", json={}).status_code == 200  # the built-in, free
+    spawned_argv(tnkr_server.SCRIPTS_DIR)
+
+    body = api.get("/api/bench").json()
+    assert body["running"] is False
+    assert body["policyId"] == "9f2a", "the free walk's policy must not read as a bench"
+    assert api.post("/api/bench/stop").status_code == 409
+
+
 def test_a_verdict_with_no_bench_run_is_refused(api, onnx_specs, monkeypatch):
     """Otherwise the gate could be cleared without a duck ever having moved."""
     api_install(api, onnx_specs, monkeypatch)

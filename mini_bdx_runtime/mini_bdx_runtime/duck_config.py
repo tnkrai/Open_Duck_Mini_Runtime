@@ -1,6 +1,9 @@
 import json
+import math
 from typing import Optional
 import os
+
+from mini_bdx_runtime import envelope
 
 HOME_DIR = os.path.expanduser("~")
 
@@ -52,6 +55,34 @@ class DuckConfig:
             "phase_frequency_factor_offset", 0.0
         )
 
+        # ── Safety-envelope abort thresholds ──────────────────────────────────
+        # Only read when a CUSTOM policy is running (amendment A8); the built-in
+        # policy never arms the guards. Both aborts cut torque and exit with a
+        # named reason:
+        #
+        #   tilt_limit_deg        pitch or roll past this is a fall, not a gait.
+        #                         Sustained for tilt_abort_ticks ticks -> abort.
+        #                         An unreadable IMU counts as over the limit.
+        #   tilt_abort_ticks      consecutive bad ticks before the tilt abort
+        #                         fires. 8 at 50 Hz = 0.16 s, enough to ride out
+        #                         a stumble.
+        #   budget_overrun_ticks  consecutive ticks over 1/control_freq before
+        #                         the budget abort fires. 10 at 50 Hz = 0.2 s.
+        #
+        # A missing key uses the default. A key set to something nonsensical
+        # (zero ticks, a negative limit, a string) ALSO uses the default and says
+        # so: a config edit must never be able to leave a custom policy running
+        # with no guard at all.
+        self.tilt_limit_deg = self._number(
+            "tilt_limit_deg", envelope.DEFAULT_TILT_LIMIT_DEG, low=1.0, high=90.0
+        )
+        self.tilt_abort_ticks = self._positive_int(
+            "tilt_abort_ticks", envelope.DEFAULT_TILT_ABORT_TICKS
+        )
+        self.budget_overrun_ticks = self._positive_int(
+            "budget_overrun_ticks", envelope.DEFAULT_BUDGET_OVERRUN_TICKS
+        )
+
         expression_features = self.json_config.get("expression_features", {})
 
         self.eyes = expression_features.get("eyes", False)
@@ -81,3 +112,38 @@ class DuckConfig:
                 "right_ankle": 0.0,
             },
         )
+
+    # ── Typed reads ───────────────────────────────────────────────────────────
+    # Plain .get() is fine for a flag, but a threshold that arms a safety guard
+    # has to survive a hand-edited json file. A bad value falls back and says so
+    # on stdout rather than silently disarming the guard it configures.
+
+    def _number(self, key, default, low=None, high=None):
+        raw = self.json_config.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            print(f"Warning : {key}={raw!r} is not a number, using {default}")
+            return float(default)
+        if not math.isfinite(value):
+            print(f"Warning : {key}={raw!r} is not finite, using {default}")
+            return float(default)
+        if (low is not None and value < low) or (high is not None and value > high):
+            print(
+                f"Warning : {key}={value} is outside [{low}, {high}], "
+                f"using {default}"
+            )
+            return float(default)
+        return value
+
+    def _positive_int(self, key, default):
+        raw = self.json_config.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            print(f"Warning : {key}={raw!r} is not a whole number, using {default}")
+            return int(default)
+        if value < 1:
+            print(f"Warning : {key}={value} must be at least 1, using {default}")
+            return int(default)
+        return value

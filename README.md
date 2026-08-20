@@ -182,30 +182,68 @@ Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_M
 ```
 ## Telemetry
 
-The runtime sends **anonymous usage telemetry** to help us find and fix setup
-and robot failures across the fleet.
+The robot sends anonymous usage data so we can find and fix the setup steps and
+failures that affect everyone.
 
-**What we collect:** setup step outcomes (success/failure + error text from the
-setup log), API request outcomes from the robot server (endpoint, status,
-duration, failure cause), walk session outcomes (duration, exit code, whether
-joint data was being streamed — as a boolean), and hardware specs (Pi model,
-RAM, OS, Python version, servo USB adapter chip: CH343 vs FTDI).
+**What it sends:** which setup step ran and whether it worked (with the error
+text from the setup log when it did not), API request outcomes from the robot
+server (endpoint, status, duration, failure cause), how a walk session ended
+(duration, exit code, and whether joint data was streaming, as a true/false),
+IMU calibration failures, and hardware facts: Pi model, RAM, OS, Python version,
+and which servo USB adapter chip you have (CH343 or FTDI).
 
-**What we never collect:** joint/motion data, session tokens, Supabase
-credentials, hostnames, usernames, or location (GeoIP is disabled). The device
-is identified only by a random UUID generated on first install.
+**What it never sends:** joint or motion data, your recordings, your wifi
+password, session tokens, Supabase credentials, your Tnkr password, your name,
+your hostname or username, or your location. Location is off at the source:
+every event sets `$geoip_disable`, so PostHog never derives a place from the IP
+the request arrived on. The robot is identified only by a random UUID made on
+first install.
 
-**How to opt out** (any time):
+### If you sign in to Tnkr Studio and connect this robot
 
-- Edit `~/.tnkr-telemetry.json` and set `"enabled": false` — the durable
-  opt-out: it covers both the server and the setup script and survives
-  reinstalls (including `setup.sh --clean`).
-- Alternatively, set the environment variable `TNKR_TELEMETRY=0` (e.g.
-  uncomment the `Environment=` line in
-  `/etc/systemd/system/tnkr-robot.service`). Note: re-running `setup.sh`
-  regenerates that service file, so prefer the JSON file for a permanent
-  opt-out.
+We link this robot's anonymous id to your Tnkr account. Everything the robot did
+before you signed in, including the whole setup, then shows up as yours rather
+than as an anonymous robot.
 
-The setup script shows a notice (with an opt-out prompt when run
-interactively) before sending anything. `~/.tnkr-telemetry.json` survives
-`setup.sh --clean` so reinstalls keep the same anonymous id.
+That is a real change to what "anonymous" means here, so it is worth being exact
+about when it happens:
+
+- It happens only if you made a Tnkr account, signed in to Studio, and connected
+  this robot. Nothing on the robot initiates it, and it cannot happen otherwise.
+- It happens once. The first account to connect a robot is the one it stays
+  linked to.
+- Turning telemetry off on the robot prevents it completely.
+
+The robot cannot record an owner and does not know one. `GET
+/api/telemetry/identity` returns this robot's anonymous UUID and the on/off flag,
+and nothing else: no account, no owner, no name. It is read-only, because this
+server authenticates nobody and could only ever believe whoever asked first.
+Ownership is decided by Tnkr's backend, which does verify who is asking. With
+telemetry off, that endpoint reports `{"enabled": false}` and withholds the id,
+so opting out here also stops the robot from being linked to any account.
+
+### Turning it off
+
+Either of these works, any time:
+
+- Set `"enabled": false` in `~/.tnkr-telemetry.json`. This is the durable one: it
+  covers the robot server and the setup script, and it survives reinstalls,
+  including `setup.sh --clean`.
+- Set `TNKR_TELEMETRY=0` in the environment, for example by uncommenting the
+  `Environment=` line in `/etc/systemd/system/tnkr-robot.service`. Re-running
+  `setup.sh` rewrites that service file, so prefer the JSON file if you want it
+  to stick.
+
+The setup script shows a notice before it sends anything, and asks first when you
+run it interactively.
+
+### Selling or giving away your duck
+
+Reflash the SD card. That gives the robot a new anonymous id and unlinks it from
+your account, so its history stops being attached to you and the next owner
+starts clean. It also wipes your wifi password and your SSH keys, which you want
+to do anyway.
+
+Reflashing is the only way to do this. `setup.sh --clean` deliberately keeps
+`~/.tnkr-telemetry.json`, because that file is where your opt-out lives and a
+reinstall must not quietly turn telemetry back on.

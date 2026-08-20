@@ -127,6 +127,42 @@ def is_enabled() -> bool:
         return False
 
 
+def identity_snapshot() -> dict:
+    """Read-only view of this robot's telemetry identity. Reports; never provisions.
+
+    Deliberately NOT device_id(): that function lazily mints and writes an id when
+    one is missing, which is right for a robot about to send an event and wrong for
+    a question asked over the network. Reading must not be able to enrol a robot
+    that never ran setup.sh, so this only ever reports what is already on disk.
+
+    Returns {"enabled": False} with NO device id whenever telemetry is off — env
+    override, file opt-out, or a corrupt file (is_enabled treats unreadable as
+    opted out, and so does this). Withholding the id is what makes a robot-side
+    opt-out also block being claimed by a signed-in Studio user: no id, no claim.
+
+    The id is safe to hand out. It is 128 random bits from
+    /proc/sys/kernel/random/uuid with no user data in or near it, which matters
+    because this server has no auth on any endpoint and PrivateNetworkMiddleware
+    grants browser access, so anything returned here should be assumed public.
+    That is also why nothing about an owner is returned: ownership lives in
+    tnkr-core behind a verified token. See TODO.md and
+    tnkr-studio/docs/plans/telemetry/_architecture.md.
+    """
+    try:
+        if not is_enabled():
+            return {"enabled": False}
+        cfg = _read_file()
+        if isinstance(cfg, dict):
+            existing = cfg.get("device_id")
+            if isinstance(existing, str) and existing:
+                return {"enabled": True, "device_id": existing}
+        # Enabled, but no id on disk yet (fresh robot, or upgrade path that has
+        # not captured an event). Report enabled without minting one.
+        return {"enabled": True}
+    except Exception:
+        return {"enabled": False}
+
+
 def device_id() -> str:
     """Read (or lazily create) the anonymous device id in ~/.tnkr-telemetry.json."""
     global _device_id

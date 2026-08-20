@@ -114,6 +114,63 @@ def test_excluded_and_non_api_paths_produce_no_events(client, captured):
     assert captured == []
 
 
+def test_polled_reads_capture_failures_but_not_successes(client, captured):
+    """/api/state is the viewer's live-joints poll and was 96% of all telemetry
+    on the real fleet -- 68,179 of 70,730 api_request_completed in month one.
+
+    Because capture() is rate-capped at 60/min and the cap is indiscriminate,
+    that polling was DISCARDING real events: 6 of 11 devices hit the cap,
+    dropping 710 on average and 1,870 at worst. So a successful poll must emit
+    nothing.
+
+    A FAILED poll still must, which is why this is a separate tier rather than
+    another entry in TELEMETRY_EXCLUDED_PATHS. A 200 here says "the viewer
+    polled", which nothing reads. A 500 says "the robot stopped answering the
+    viewer", which is a real product failure.
+    """
+    for _ in range(20):
+        client.get("/api/state")
+    assert captured == [], "a successful polled read must emit nothing"
+
+
+def test_a_failing_polled_read_is_still_captured(client, captured, monkeypatch):
+    """The half that full exclusion would have thrown away.
+
+    Patches `is_walking`, which the handler calls, rather than the handler
+    itself: FastAPI captured a reference to `read_state` at registration, so
+    monkeypatching the module attribute would bind nothing and this test would
+    pass while asserting about a request that never failed.
+    """
+    import tnkr_server
+
+    def boom():
+        raise RuntimeError("servo bus gone")
+
+    monkeypatch.setattr(tnkr_server, "is_walking", boom)
+    r = client.get("/api/state")
+
+    assert r.status_code == 500, "the failure must actually happen"
+    assert [c["event"] for c in captured] == ["api_request_failed"]
+    assert captured[0]["properties"]["endpoint"] == "/api/state"
+
+
+def test_a_polled_read_that_RETURNS_an_error_is_captured(client, captured):
+    """The other failure shape, and the one a raising test cannot reach.
+
+    `/api/stance/positions` answers 503 when no stance session is open — it
+    returns the status rather than raising, so control passes through the
+    `status < 400` branch instead of the exception handler. Gating on the path
+    alone (dropping the `status < 400` half of the condition) would silently
+    discard every returned 4xx/5xx on these endpoints, and the raising test
+    would still pass.
+    """
+    r = client.get("/api/stance/positions")
+
+    assert r.status_code == 503, "expected a returned error, not a raise"
+    assert [c["event"] for c in captured] == ["api_request_failed"]
+    assert captured[0]["properties"]["status_code"] == 503
+
+
 def test_unmatched_api_404s_are_not_captured(client, captured):
     # LAN port-scanner noise: /api/* paths that match no route must not
     # generate events (quota protection).

@@ -180,6 +180,40 @@ Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_M
 - left and right triggers to control the left and right antennas
 - LB (new!) press and hold to increase the walking frequency, kind of a sprint mode 🙂
 ```
+
+## Installed policies (`~/.tnkr/policies`)
+
+The duck can hold a few policies besides the one this repo ships, and Tnkr Studio installs
+them over the robot's HTTP API (`POST /api/policy/install`). They live here:
+
+```
+~/.tnkr/policies/
+├── active                  # which policy the next walk starts on. Absent = the built-in
+└── <policy-id>/
+    ├── model.onnx
+    ├── manifest.json       # shapes read off the graph + measured inference latency
+    └── last_used           # empty; its mtime decides what gets evicted first
+```
+
+Facts worth knowing before you go looking:
+
+- **The built-in policy is not in there.** It is resolved through the same `scripts/*.onnx`
+  glob the walk has always used, so it tracks whatever the repo ships and cannot be
+  evicted. A duck that has never installed anything has an empty (or absent) store and
+  walks exactly as it always did.
+- **The store is bounded**: at most three installed policies plus the built-in, least
+  recently used evicted to make room, and an install is refused outright if it would leave
+  less than 200 MB free. A full SD card is a Pi that will not boot, which is a worse
+  problem than a policy that walks badly.
+- **Getting back is one call**: `curl -X POST http://<duck>:8000/api/policy/select -d
+  '{"id":"builtin"}'`. It works with an empty store, a corrupt `active` file, and while a
+  walk is running (it takes effect on the next start).
+- **Deleting the whole directory is safe.** The next walk resolves the built-in.
+
+Anything not resolved through that glob is treated as a custom policy and runs inside the
+safety envelope (velocity and joint-limit clamps, tilt and control-budget aborts) whether or
+not anyone asked for it.
+
 ## Telemetry
 
 The robot sends anonymous usage data so we can find and fix the setup steps and

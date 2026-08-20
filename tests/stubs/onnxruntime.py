@@ -110,6 +110,11 @@ class _Spec:
     invalid: bool = False
     error: type[BaseException] = InvalidProtobuf
     delay_s: float = 0.0
+    # A graph that parses and presents the right shape but refuses to run -- e.g. one
+    # asserting an input range that a zeros observation violates. Story 2.6 has to keep
+    # installing such a policy while recording that its latency is unknown, so the branch
+    # needs a way to exist in a test.
+    run_error: type[BaseException] | None = None
 
 
 # Registry and construction log. Module-level because the import system gives us exactly one
@@ -134,6 +139,7 @@ def _register(
     invalid: bool = False,
     error: type[BaseException] = InvalidProtobuf,
     delay_s: float = 0.0,
+    run_error: type[BaseException] | None = None,
 ) -> None:
     """Declare the graph a session over ``path`` presents.
 
@@ -145,6 +151,7 @@ def _register(
         invalid=invalid,
         error=error,
         delay_s=delay_s,
+        run_error=run_error,
     )
 
 
@@ -219,6 +226,11 @@ class InferenceSession:
         if missing:
             raise InvalidArgument(
                 f"[ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Missing Input: {missing[0]}"
+            )
+
+        if self._spec.run_error is not None:
+            raise self._spec.run_error(
+                "[ONNXRuntimeError] : 2 : INVALID_ARGUMENT : this graph refuses this input"
             )
 
         if self._spec.delay_s:

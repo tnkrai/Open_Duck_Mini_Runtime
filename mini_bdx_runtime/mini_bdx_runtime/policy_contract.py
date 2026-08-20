@@ -40,7 +40,10 @@ See ``tnkr-studio/docs/plans/custom-policy/_architecture.md``, Decision 3 and am
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import platform
+import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -186,6 +189,9 @@ def validate_obs(obs: Any) -> None:
 # Studio, where they must match the ErrorCode members added in story 2.5 exactly.
 POLICY_CONTRACT_MISMATCH: str = "POLICY_CONTRACT_MISMATCH"
 POLICY_INSTALL_FAILED: str = "POLICY_INSTALL_FAILED"
+POLICY_STORE_FULL: str = "POLICY_STORE_FULL"
+# A warning, not a refusal: it rides an ``ok: true`` install response. See measure_latency.
+POLICY_SLOW: str = "POLICY_SLOW"
 
 # How much of the file to hash at a time. The point of streaming is that a 200 MB model
 # never becomes a 200 MB bytes object on a Pi Zero 2W.
@@ -517,3 +523,250 @@ def check_policy(
         manifest["sha256"] = normalise_digest(expect_sha256)
 
     return CheckResult(ok=True, code=None, detail=describe(), manifest=manifest)
+
+
+# ── how long the policy takes to think (story 2.6, amendment A7) ────────────────
+#
+# THIS IS THINKING TIME, NOT TICK TIME. Read that again before putting the number on a
+# screen. Inference is one part of a tick: the same 20 ms also has to cover reading 14
+# servo positions over serial, reading the IMU over I2C, building the observation,
+# clamping, and writing 14 targets back. A policy measuring 18 ms against a 20 ms budget
+# does not "fit with 2 ms spare" -- it overruns, and the abort in story 1.3 is what will
+# find out. So the number is a FLOOR on the tick cost and must never be presented as
+# headroom.
+#
+# It is measured and reported, never enforced. That is amendment A7, and it comes from
+# prior art rather than nerve: kinfer's own examples/timing.py runs this exact dt=20ms /
+# 50 Hz loop and reports deviation from the expected tick with no pass/fail threshold
+# anywhere. Nobody has published what a community-trained Open Duck policy costs per step,
+# so a threshold invented today would reject working policies. Measure now, threshold when
+# there is data.
+
+# The tick the walk loop has to fit inside, in milliseconds. Derived from CONTROL_HZ so
+# lowering the control rate cannot leave a stale budget behind.
+BUDGET_MS: float = 1000.0 / CONTROL_HZ
+
+# Enough samples for a tail to mean anything, few enough to keep install responsive.
+DEFAULT_ITERATIONS: int = 50
+
+# The first calls pay one-time costs -- arena allocation, thread pool spin-up, first-touch
+# page faults -- that no steady-state tick pays. Including them would make every policy
+# look slower than it runs.
+DEFAULT_WARMUP: int = 5
+
+# Hard wall-clock cap. 50 iterations of a 30 ms policy is 1.5 s, which is the budget the
+# story sets for install responsiveness; a 200 ms policy would otherwise spend 11 s here.
+# Stopping early costs precision on exactly the policies whose slowness is already obvious.
+MAX_MEASURE_SECONDS: float = 2.0
+
+
+def percentile(samples: Sequence[float], q: float) -> float:
+    """Nearest-rank percentile of ``samples`` (``q`` in 0..1). ``samples`` need not be sorted.
+
+    Nearest-rank rather than interpolated on purpose: with 45 samples an interpolated p99
+    invents a value between the two slowest observations, and the thing being reported is
+    "how slow did this actually get", not a model of it. Nearest-rank always returns a
+    measurement that happened.
+    """
+    if not samples:
+        raise ValueError("percentile of no samples")
+    ordered = sorted(samples)
+    rank = max(1, math.ceil(q * len(ordered)))
+    return float(ordered[min(rank, len(ordered)) - 1])
+
+
+@dataclass
+class LatencyReport:
+    """What one policy costs per inference on THIS robot, at one point in time.
+
+    ``p50_ms``/``p99_ms`` are ``None`` when measurement could not run at all -- a graph
+    that rejects a zeros observation, say. That is a reportable unknown, never a refusal:
+    the shape check is what gates the install, and failing an install because a stopwatch
+    failed would refuse a policy for a reason that has nothing to do with the policy.
+
+    ``machine`` is ``platform.machine()`` because the number is worthless without it. An
+    SD card moved from a Pi Zero 2W into a Pi 5 carries its old measurements along, and the
+    recorded machine string is what makes that visible instead of misleading.
+
+    ``samples`` is how many timed inferences the numbers came from, after warm-up and after
+    any early stop -- a p99 from 6 samples deserves less weight than one from 45.
+    """
+
+    p50_ms: float | None
+    p99_ms: float | None
+    budget_ms: float
+    machine: str
+    over_budget: bool
+    measured: bool
+    samples: int
+    detail: str
+    warning_code: str = POLICY_SLOW
+
+    def as_manifest_fields(self) -> dict:
+        """The subset written into a policy's ``manifest.json``.
+
+        **``latency_p50_ms`` and ``latency_p99_ms`` are inference time, NOT tick time, and
+        must never be presented as headroom.** The 20 ms tick also has to cover reading 14
+        servo positions over serial, reading the IMU over I2C, building the observation,
+        clamping and writing the targets back. A policy at 18 ms of a 20 ms budget will
+        overrun; these numbers are a floor on the tick cost, not a measure of what is left.
+
+        A point-in-time observation, too: a Pi busy with something else measures slower, and
+        the number is recorded anyway rather than retried, with ``machine`` alongside so a
+        measurement taken on different hardware is detectable.
+
+        Snake_case, unlike the HTTP layer's camelCase: this is a file on the robot read by
+        this repo's own code, and it sits beside ``obs_dim``/``act_dim`` from the graph.
+        """
+        return {
+            "latency_p50_ms": self.p50_ms,
+            "latency_p99_ms": self.p99_ms,
+            "latency_budget_ms": self.budget_ms,
+            "latency_samples": self.samples,
+            "latency_measured": self.measured,
+            "latency_over_budget": self.over_budget,
+            "machine": self.machine,
+        }
+
+
+def _zeros_observation(obs_dim: int) -> Any:
+    """A batch-of-one zeros observation, the shape the walk loop feeds (``awd=True``)."""
+    import numpy as np
+
+    return np.zeros((1, obs_dim), dtype=np.float32)
+
+
+def measure_latency(
+    session: Any,
+    obs_dim: int = OBS_DIM,
+    *,
+    iterations: int = DEFAULT_ITERATIONS,
+    warmup: int = DEFAULT_WARMUP,
+    control_hz: int = CONTROL_HZ,
+    max_seconds: float = MAX_MEASURE_SECONDS,
+) -> LatencyReport:
+    """Time ``iterations`` inferences on a zeros observation. Never raises.
+
+    Pure compute: it holds no serial bus, no I2C and no GPIO, which is why it is safe to
+    run during an install even while a walk is running.
+
+    Zeros rather than a recorded observation because there is no recorded observation to
+    hand at install time, and the cost of a matmul does not depend on the values in it. A
+    graph that *rejects* zeros (a hard input-range assertion) is the one case this cannot
+    time, and it degrades to ``measured=False`` rather than to a failed install.
+    """
+    budget_ms = 1000.0 / control_hz
+    machine = platform.machine()
+
+    def unknown(detail: str) -> LatencyReport:
+        return LatencyReport(
+            p50_ms=None,
+            p99_ms=None,
+            budget_ms=budget_ms,
+            machine=machine,
+            over_budget=False,  # unknown is not over; the abort in 1.3 is the backstop
+            measured=False,
+            samples=0,
+            detail=detail,
+        )
+
+    try:
+        inputs = list(session.get_inputs())
+        if not inputs:
+            return unknown("graph declares no input, so there is nothing to time")
+        feed = {inputs[0].name: _zeros_observation(obs_dim)}
+        output_names = [a.name for a in session.get_outputs()] or None
+    except Exception as exc:  # a session we cannot even read the specs off
+        return unknown(f"could not prepare an observation: {exc.__class__.__name__}: {exc}")
+
+    samples: list[float] = []
+    deadline = time.perf_counter() + max_seconds
+    try:
+        for i in range(warmup + max(1, iterations)):
+            start = time.perf_counter()
+            session.run(output_names, feed)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if i >= warmup:
+                samples.append(elapsed_ms)
+            # Checked after recording, so the cap can never produce zero samples.
+            if time.perf_counter() > deadline and samples:
+                break
+    except Exception as exc:
+        # The graph refused a zeros input, or the runtime failed mid-measurement. Story
+        # 2.6: record that latency is unknown and let the install proceed.
+        return unknown(
+            f"inference on a zeros observation raised {exc.__class__.__name__}: {exc}; "
+            "latency is unknown for this policy"
+        )
+
+    if not samples:
+        return unknown("no inference completed, so latency is unknown")
+
+    p50 = round(percentile(samples, 0.50), 3)
+    p99 = round(percentile(samples, 0.99), 3)
+    over = p99 > budget_ms
+    detail = (
+        f"p99 {p99}ms exceeds the {budget_ms}ms budget"
+        if over
+        else f"p50 {p50}ms, p99 {p99}ms against a {budget_ms}ms budget"
+    )
+    return LatencyReport(
+        p50_ms=p50,
+        p99_ms=p99,
+        budget_ms=budget_ms,
+        machine=machine,
+        over_budget=over,
+        measured=True,
+        samples=len(samples),
+        detail=(
+            f"{detail} on {machine}, from {len(samples)} timed inferences. "
+            "This is inference time only, not the whole tick."
+        ),
+    )
+
+
+def measure_latency_at(
+    path: "os.PathLike[str] | str",
+    obs_dim: int = OBS_DIM,
+    **kwargs: Any,
+) -> LatencyReport:
+    """``measure_latency`` for a file, opening its own session. Never raises.
+
+    A second graph parse, seconds after ``check_policy``'s. That is deliberate: keeping
+    ``check_policy`` a pure predicate that owns nothing is worth one extra parse off the
+    hot path, and the alternative -- returning a live session from the security boundary --
+    hands every caller a thing it must remember to drop.
+    """
+    try:
+        import onnxruntime
+    except ImportError as exc:
+        return measure_latency(
+            _UnusableSession(f"onnxruntime is not installed: {exc}"), obs_dim, **kwargs
+        )
+    try:
+        session = onnxruntime.InferenceSession(
+            str(path), providers=["CPUExecutionProvider"]
+        )
+    except Exception as exc:
+        return measure_latency(
+            _UnusableSession(f"{exc.__class__.__name__}: {exc}"), obs_dim, **kwargs
+        )
+    return measure_latency(session, obs_dim, **kwargs)
+
+
+class _UnusableSession:
+    """A session stand-in that reports why there is no session, through one code path.
+
+    So "the file will not open" and "the graph rejects zeros" both arrive at the caller as
+    a ``LatencyReport`` with ``measured=False``, instead of one being a report and the other
+    an exception the caller has to remember to catch.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def get_inputs(self) -> list:
+        raise RuntimeError(self._reason)
+
+    def get_outputs(self) -> list:
+        raise RuntimeError(self._reason)

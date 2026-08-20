@@ -330,6 +330,29 @@ TELEMETRY_EXCLUDED_PATHS = {
     "/api/telemetry/identity",    # asking who we are is not an event about us
 }
 
+# Polled READ endpoints: capture failures, never successes.
+#
+# These were the hole in the list above. It excluded the 50 Hz *write* stream
+# (/api/commands) and missed the read side, so /api/state — the live joints and
+# IMU poll behind Studio's 3D viewer — became 96% of all telemetry: 68,179 of
+# 70,730 api_request_completed across the fleet's first month.
+#
+# That is not merely a volume bill. capture() is rate-capped at
+# RATE_LIMIT_PER_MIN=60 and the cap is indiscriminate, so viewer polling
+# crowded out the events the funnel is built from. Measured on the real fleet
+# before this change: 6 of 11 devices hitting the cap, discarding 710 events on
+# average and 1,870 at worst. Every setup_step_failed and walk_ended lost in
+# those windows is gone.
+#
+# Full exclusion would have been the wrong fix. A failing /api/state means the
+# viewer has no data — a real product failure worth knowing about — so only the
+# success case is dropped. A 200 here says "the viewer polled", which nothing
+# reads; a 500 says "the robot stopped answering", which somebody should.
+TELEMETRY_FAILURES_ONLY_PATHS = {
+    "/api/state",              # live joints + IMU, polled continuously by the viewer
+    "/api/stance/positions",   # polled while the stance editor is open
+}
+
 
 ERROR_MESSAGE_MAX_LEN = 500
 
@@ -375,6 +398,10 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
             # 404/405 on a path that matched no route = LAN noise (port
             # scanners, stray apps), not a robot failure. Don't burn events.
             if status in (404, 405) and "route" not in request.scope:
+                skip_capture = True
+            # A polled read that worked is not news. Checked on the way out
+            # rather than at the top of dispatch, because the failure still is.
+            elif status < 400 and request.url.path in TELEMETRY_FAILURES_ONLY_PATHS:
                 skip_capture = True
             return response
         except Exception as e:

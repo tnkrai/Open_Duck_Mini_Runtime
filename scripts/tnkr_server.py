@@ -46,6 +46,8 @@ from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
 from mini_bdx_runtime import walk_offsets
 from mini_bdx_runtime import preflight
+from mini_bdx_runtime import policy_contract
+from mini_bdx_runtime import policy_store
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -53,6 +55,14 @@ HOME_DIR = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME_DIR, "duck_config.json")
 SCRIPTS_DIR = Path(__file__).parent
 SERVER_PORT = 8000
+
+# Where installed policies live. A module global (not a constant baked into a store
+# instance) so a test -- or a future config option -- can move it without this file
+# needing to know.
+POLICY_ROOT = Path(HOME_DIR) / ".tnkr" / "policies"
+
+# How the robot fetches a policy. Swapped in tests; there is no network in the suite.
+POLICY_FETCH = policy_store.stream_to_file
 
 
 def _resolve_usb_port(default: str = "/dev/ttyACM0") -> str:
@@ -112,6 +122,9 @@ class WalkSession:
     cloud_streaming: bool
     started_at: float
     stop_requested: bool = False
+    # Which policy this launch loaded. Recorded so eviction can refuse to delete the
+    # model a running walk has open, which the store cannot know by itself.
+    policy_id: str | None = None
 
 
 walk_session: WalkSession | None = None
@@ -352,6 +365,11 @@ TELEMETRY_EXCLUDED_PATHS = {
 TELEMETRY_FAILURES_ONLY_PATHS = {
     "/api/state",              # live joints + IMU, polled continuously by the viewer
     "/api/stance/positions",   # polled while the stance editor is open
+    # The policy list is built to be polled (story 2.3), so it belongs here the day it
+    # ships rather than after it has crowded out a month of setup_step_failed events the
+    # way /api/state did. A 200 says "the policy UI is open", which nothing reads; a 500
+    # says the robot stopped answering, which somebody should.
+    "/api/policy",
 }
 
 
@@ -524,6 +542,72 @@ def telemetry_identity():
     return body
 
 
+# ── Capabilities ──────────────────────────────────────────────────────────────
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  CAPABILITY NAMES ARE A PERMANENT CONTRACT.                              │
+# │                                                                          │
+# │  A Pi updates only when its owner re-runs scripts/setup.sh, so the fleet  │
+# │  runs mixed versions forever and an OLD Studio will be matching on these │
+# │  exact strings for as long as any duck is switched on. Therefore:        │
+# │                                                                          │
+# │    * namespaced, dotted, lowercase   ("policy.install")                  │
+# │    * ADD names, never rename or remove one                               │
+# │    * a rename is a new name plus the old one kept forever                │
+# │                                                                          │
+# │  Tidying these up is not a refactor, it is a fleet-wide capability       │
+# │  regression that no test in Studio's repo can see.                       │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# DERIVED, NOT LISTED. Each name maps to the routes that implement it, and a name is
+# only claimed when every one of its routes is actually registered on this process's
+# app. A hardcoded list would let a half-applied `git pull` -- setup.sh's update path is
+# a git pull, and it can fail partway -- advertise a capability whose handler is missing,
+# which is worse than not advertising it: Studio would show the UI and then 404.
+CAPABILITY_ROUTES: dict[str, tuple[tuple[str, str], ...]] = {
+    "preflight": (("POST", "/api/preflight"),),
+    "policy.list": (("GET", "/api/policy"),),
+    "policy.install": (("POST", "/api/policy/install"),),
+    "policy.select": (("POST", "/api/policy/select"),),
+}
+
+_capabilities_cache: list[str] | None = None
+
+
+def capabilities_for(routes) -> list[str]:
+    """The capability names satisfied by ``routes``. Pure, so every case is testable.
+
+    Sorted for a stable payload — a set's iteration order would make /api/health's body
+    differ between boots for no reason.
+    """
+    registered = set()
+    for route in routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None) or ()
+        if path is None:
+            continue
+        for method in methods:
+            registered.add((method.upper(), path))
+    return sorted(
+        name
+        for name, needed in CAPABILITY_ROUTES.items()
+        if all(pair in registered for pair in needed)
+    )
+
+
+def capabilities() -> list[str]:
+    """This robot's capability list, computed once.
+
+    /api/health is polled by Studio, so this walks the route table on the first call and
+    then never again. The route table cannot change after startup — FastAPI registers at
+    import — so a cache is not a staleness risk.
+    """
+    global _capabilities_cache
+    if _capabilities_cache is None:
+        _capabilities_cache = capabilities_for(app.routes)
+    return list(_capabilities_cache)
+
+
 @app.get("/api/health")
 def health():
     machine = platform.machine()  # 'aarch64' / 'armv7l' on Pi, 'x86_64' / 'arm64' on Mac
@@ -535,6 +619,9 @@ def health():
         "walking": is_walking(),
         "paused": is_paused(),
         "walkExitCode": walk_exit_code(),
+        # Absent on an older robot, which deserialises to [] in Studio — the correct
+        # fallback for free, and the reason this is a list and not a version string.
+        "capabilities": capabilities(),
     }
 
 
@@ -1537,6 +1624,154 @@ def update_config(config: DuckConfigModel):
     return {"success": True}
 
 
+# ── Policies ──────────────────────────────────────────────────────────────────
+#
+# The store is the file half of this (mini_bdx_runtime/policy_store.py); these three
+# endpoints are the HTTP half and hold no state of their own.
+#
+# NONE of them refuse while a walk is running, and that is deliberate rather than an
+# oversight. They touch no servo bus, no I2C and no GPIO — install is a download plus a
+# graph parse, select writes one pointer file — and amendment A4 requires reverting to the
+# built-in to work exactly when a bad policy is running, because that is the moment the
+# operator needs it. A selection takes effect on the next walk start.
+#
+# A NOTE ON WHAT MAY BE LOGGED HERE: the install URL is presigned, so its query string IS
+# a credential. The telemetry middleware ships an endpoint's error detail to PostHog as
+# `error_message`, so no failure text on this path may contain the URL. policy_store
+# redacts it down to scheme/host/path; do not undo that, and do not add the URL to a
+# telemetry prop.
+
+_policy_lock = Lock()
+
+# Which HTTP status a refusal gets. Studio renders the operator sentence off `code`, so
+# these exist for HTTP's sake — but a failure must not be a 200 with ok:false, or a
+# caller that only checks the status would treat a refused install as a success.
+POLICY_STATUS_CODES: dict[str, int] = {
+    policy_contract.POLICY_CONTRACT_MISMATCH: 422,  # the file is not a duck policy
+    policy_contract.POLICY_STORE_FULL: 507,         # Insufficient Storage, literally
+    policy_contract.POLICY_INSTALL_FAILED: 502,     # could not obtain what was promised
+}
+
+
+def get_policy_store() -> policy_store.PolicyStore:
+    """A store bound to the CURRENT module globals.
+
+    Rebuilt per request on purpose: construction reads no files and creates no
+    directories, and capturing SCRIPTS_DIR/POLICY_ROOT once at import would make the
+    built-in's glob resolve against a path a test (or a future config reload) has since
+    moved.
+    """
+    return policy_store.PolicyStore(
+        root=POLICY_ROOT,
+        scripts_dir=SCRIPTS_DIR,
+        fetch=POLICY_FETCH,
+    )
+
+
+def _policy_failure(code: str, detail: str) -> JSONResponse:
+    add_telemetry_props(policy_code=code)
+    return JSONResponse(
+        status_code=POLICY_STATUS_CODES.get(code, 400),
+        content={"ok": False, "code": code, "detail": detail},
+    )
+
+
+def _running_policy_ids() -> set[str]:
+    """The policy a live walk has open, so eviction leaves it alone."""
+    session = walk_session
+    if session is None or session.proc.poll() is not None:
+        return set()
+    return {session.policy_id} if session.policy_id else set()
+
+
+class PolicyInstallRequest(BaseModel):
+    id: str
+    url: str
+    sha256: str
+    manifest: dict | None = None
+
+
+class PolicySelectRequest(BaseModel):
+    id: str
+
+
+@app.get("/api/policy")
+def list_policies():
+    """Installed policies, which is active, and the built-in that always exists.
+
+    Cheap enough to poll: one stat per policy and one small JSON read. It never hashes a
+    file — that is install and select's job, and hashing a 16 MB model on every poll would
+    be a self-inflicted load problem on a Pi Zero 2W.
+    """
+    return get_policy_store().list()
+
+
+@app.post("/api/policy/install")
+def install_policy(body: PolicyInstallRequest):
+    """Fetch, verify and store one policy. Transactional: on any failure, nothing changes.
+
+    The verification is `policy_contract.check_policy`, which is the security boundary
+    (amendment A1) — this API authenticates nobody and its CORS reflects any origin, so
+    the check lives here rather than in Studio, and there is no way for a caller to skip it.
+    """
+    store = get_policy_store()
+    with _policy_lock:
+        try:
+            result = store.install(
+                body.id,
+                body.url,
+                body.sha256,
+                body.manifest,
+                protect=_running_policy_ids(),
+            )
+        except policy_store.StoreError as exc:
+            return _policy_failure(exc.code, exc.detail)
+
+    stored = result.manifest or {}
+    add_telemetry_props(
+        ok=result.ok,
+        already_installed=result.already_installed,
+        evicted=result.evicted is not None,
+        # Read off the manifest, not off `warning`: a warning also rides an install whose
+        # latency could not be measured at all, and counting those as slow policies would
+        # make the one number this feature exists to gather wrong.
+        over_budget=bool(stored.get("latency_over_budget")),
+        latency_measured=bool(stored.get("latency_measured")),
+        latency_p99_ms=stored.get("latency_p99_ms"),
+    )
+    if not result.ok:
+        return _policy_failure(result.code or policy_contract.POLICY_INSTALL_FAILED,
+                               result.detail)
+    return result.as_dict()
+
+
+@app.post("/api/policy/select")
+def select_policy(body: PolicySelectRequest):
+    """Record which policy the next walk starts on.
+
+    `id="builtin"` is the one-action revert (amendment A4) and always succeeds: it removes
+    the pointer file rather than writing one, so it works with an empty store, a corrupt
+    active pointer, and a walk in progress.
+    """
+    store = get_policy_store()
+    # DELIBERATELY OUTSIDE _policy_lock. An install holds that lock for as long as the
+    # download takes -- up to a minute on household wifi -- and amendment A4 says the way
+    # back to the built-in must work at the moment a bad policy is running, which is
+    # exactly when someone might also be installing the next one. Selecting is one atomic
+    # pointer write (or one unlink), so it needs no mutual exclusion of its own.
+    #
+    # The race it admits: an install's eviction reads the active id, then a select lands
+    # on a policy that eviction is about to delete. The result is an active pointer naming
+    # a directory that no longer exists, which resolves to the built-in and logs -- the
+    # same fallback a reflashed card produces, and tested as such.
+    try:
+        active = store.select(body.id)
+    except policy_store.StoreError as exc:
+        return _policy_failure(exc.code, exc.detail)
+    add_telemetry_props(builtin=active == policy_store.BUILTIN_ID)
+    return {"ok": True, "active": active}
+
+
 # ── Walk Control ──────────────────────────────────────────────────────────────
 
 def stop_walk_process():
@@ -1595,6 +1830,9 @@ class WalkStartRequest(BaseModel):
     sessionToken: str | None = None
     supabaseUrl: str | None = None
     supabaseKey: str | None = None
+    # Which policy to walk on. Omitted (the only thing Studio sends today) means the
+    # active one, which on a duck that has never installed anything is the built-in.
+    policyId: str | None = None
 
 
 @app.post("/api/walk/start")
@@ -1620,10 +1858,44 @@ def _walk_start_locked(body: WalkStartRequest):
             detail="Servo rehoming session in progress — finish it before walking",
         )
 
-    if walk_session is not None and walk_session.proc.poll() is None:
-        if body.sessionToken and body.sessionToken == walk_session.session_token:
-            add_telemetry_props(already_running=True)
-            return {"success": True, "message": "Walk is already running"}
+    running = walk_session is not None and walk_session.proc.poll() is None
+    if running and body.sessionToken and body.sessionToken == walk_session.session_token:
+        # An idempotent retry of the walk that is already running. It starts nothing, so
+        # it resolves nothing: a stale policyId must not turn a no-op into a 404.
+        add_telemetry_props(already_running=True)
+        return {"success": True, "message": "Walk is already running"}
+
+    venv_python = sys.executable
+    is_pi = platform.machine() in ("aarch64", "armv7l")
+
+    # Resolve the policy BEFORE stopping the running walk and before releasing the buses.
+    # A request naming a policy this robot does not have is a 404 that should cost
+    # nothing, and both of those cost torque: stopping first cuts it on a duck mid-stride
+    # for a request that never starts a walk, and Studio sending an id this robot no
+    # longer has is routine, because a bounded store evicts policies its cached list
+    # still shows.
+    resolved = None
+    if is_pi:
+        store = get_policy_store()
+        try:
+            resolved = (
+                store.resolve(body.policyId)
+                if body.policyId
+                else store.resolve_active()
+            )
+        except policy_store.StoreError as exc:
+            raise HTTPException(status_code=404, detail=exc.detail)
+        if resolved is None:
+            # Same message this endpoint has always given when scripts/ holds no .onnx.
+            raise HTTPException(
+                status_code=404,
+                detail="No ONNX model found in scripts/ directory",
+            )
+
+    if running:
+        # A different session token: the old walk is bound to a channel nobody is
+        # listening to any more. Only now, with a policy in hand and a walk certain to
+        # start, is it worth stopping.
         stop_walk_process()
 
     # Release HWI + BNO055 so the walk script owns both buses (serial + I2C);
@@ -1640,27 +1912,25 @@ def _walk_start_locked(body: WalkStartRequest):
     imu_calib_status["running"] = False
     release_state_imu()
 
-    venv_python = sys.executable
-    is_pi = platform.machine() in ("aarch64", "armv7l")
-
     if is_pi:
-        # Find the ONNX model — look for any .onnx file in scripts/
-        onnx_files = list(SCRIPTS_DIR.glob("*.onnx"))
-        if not onnx_files:
-            raise HTTPException(
-                status_code=404,
-                detail="No ONNX model found in scripts/ directory",
-            )
-        onnx_path = str(onnx_files[0])
+        assert resolved is not None  # resolved above, before the buses were released
         walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
 
         cmd = [
             venv_python,
             walk_script,
-            "--onnx_model_path", onnx_path,
+            "--onnx_model_path", str(resolved.path),
             "--remote",
             "--commands",
         ]
+        if not resolved.is_builtin:
+            # Explicitness, NOT the arming mechanism. envelope.is_armed() decides from the
+            # ARTIFACT — `not is_builtin_policy(onnx_model_path)` — precisely because
+            # nothing used to pass this flag, so a downloaded policy dropped in scripts/
+            # and started from here ran with every guard disarmed and nothing logged. That
+            # was fail-open. If this line is ever deleted the envelope must still arm; if
+            # it stops arming, the bug is in is_armed, not here.
+            cmd.append("--custom_policy")
         if body.sessionToken:
             cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
             cmd.extend(["--cloud_commands_channel", f"robot-commands-{body.sessionToken}"])
@@ -1693,6 +1963,9 @@ def _walk_start_locked(body: WalkStartRequest):
         cloud_streaming=cloud_streaming,
         has_session=bool(body.sessionToken),
         already_running=False,
+        # Whether this walk is the policy the robot shipped with. A boolean, never the id:
+        # which community policy an owner is trying is not this event's business.
+        builtin_policy=bool(resolved.is_builtin) if resolved else None,
     )
 
     # Start from a clean slate. stop_walk_process() clears these, but a walk
@@ -1709,10 +1982,18 @@ def _walk_start_locked(body: WalkStartRequest):
         session_token=body.sessionToken,
         cloud_streaming=cloud_streaming,
         started_at=time.monotonic(),
+        policy_id=resolved.id if resolved else None,
     )
     Thread(target=_monitor_walk, args=(walk_session,), daemon=True).start()
+    if resolved is not None:
+        # LRU stamp: the policy you are walking on is the last one you would want evicted.
+        get_policy_store().mark_used(resolved.id)
 
-    return {"success": True, "pid": proc.pid}
+    return {
+        "success": True,
+        "pid": proc.pid,
+        "policyId": resolved.id if resolved else None,
+    }
 
 
 @app.post("/api/walk/stop")

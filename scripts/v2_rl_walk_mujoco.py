@@ -16,6 +16,15 @@ from mini_bdx_runtime.antennas import Antennas
 from mini_bdx_runtime.projector import Projector
 from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
 from mini_bdx_runtime.duck_config import DuckConfig
+from mini_bdx_runtime.envelope import (
+    AbortMonitor,
+    ActionEnvelope,
+    PolicyAbort,
+    format_counts,
+    imu_quaternion,
+    is_armed,
+    joint_limits_from_urdf,
+)
 # StateServer removed — cloud telemetry via CloudPublisher; local telemetry is a
 # one-slot /dev/shm snapshot the server's /api/state reads while we own the bus
 from mini_bdx_runtime import walk_telemetry as local_telemetry
@@ -40,6 +49,8 @@ class RLWalk:
         save_obs=False,
         replay_obs=None,
         cutoff_frequency=None,
+        custom_policy=False,
+        urdf_path=None,
         cloud_channel=None,
         cloud_commands_channel=None,
         supabase_url=None,
@@ -120,6 +131,55 @@ class RLWalk:
         self.prev_motor_targets = np.array(self.init_pos.copy())
 
         self.last_commands = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        # ── Safety envelope, armed only for a custom policy (amendment A8) ────
+        # The built-in walk is trusted by construction: it is the one policy that has
+        # run on every duck sold. Subjecting it to new clamps and aborts would change
+        # a working system for no benefit, so with no custom policy every attribute
+        # below stays None and the loop runs the code it ran before this existed.
+        # TNKR_FORCE_ENVELOPE=1 arms it anyway, to exercise the guards against a
+        # policy already known to be good.
+        self.envelope = None
+        self.abort_monitor = None
+        self.envelope_prev_targets = None
+        self.envelope_telemetry = None
+        self._envelope_flushed_at = 0.0
+        if is_armed(custom_policy, onnx_model_path):
+            joint_names = list(self.hwi.joints.keys())
+            lower, upper = joint_limits_from_urdf(urdf_path, joint_names)
+            self.envelope = ActionEnvelope(
+                joint_names,
+                lower,
+                upper,
+                self.max_motor_velocity,
+                self.control_freq,
+            )
+            self.abort_monitor = AbortMonitor(
+                self.duck_config.tilt_limit_deg,
+                self.duck_config.tilt_abort_ticks,
+                1 / self.control_freq,
+                self.duck_config.budget_overrun_ticks,
+            )
+            # The velocity clamp's baseline is the last value we COMMANDED. It starts at
+            # the rest pose, not at zeros: a zero baseline would pin the first step to
+            # no motion at all.
+            self.envelope_prev_targets = np.array(self.init_pos, dtype=float)
+            # One dict, mutated in place and re-published each tick, so the per-tick
+            # telemetry write allocates nothing new.
+            self.envelope_telemetry = {"window_s": 1.0, "clamped": {}}
+            print(
+                f"[envelope] armed for a custom policy: "
+                f"{self.max_motor_velocity} rad/s, "
+                f"tilt limit {self.duck_config.tilt_limit_deg:.0f} deg, "
+                f"abort after {self.duck_config.budget_overrun_ticks} slow ticks"
+            )
+        else:
+            # Say it out loud. "Ran with the guards off" must never be something a
+            # log has to be read backwards to work out.
+            print(
+                f"[envelope] not armed: {os.path.basename(onnx_model_path)} is a "
+                f"policy this robot shipped with"
+            )
 
         self.paused = self.duck_config.start_paused
 
@@ -225,6 +285,30 @@ class RLWalk:
 
         return obs
 
+    def _envelope_snapshot(self, now):
+        """The envelope's clamp counts for the telemetry drop, one window per second.
+
+        A saturating policy trips a clamp on every tick of every joint, so the count is
+        the signal and a per-tick log line would cost more than the clamp it reports.
+        Between flushes this returns the last completed window, so a poller always has a
+        full second of counts rather than a partial one.
+        """
+        if now - self._envelope_flushed_at >= self.envelope_telemetry["window_s"]:
+            self._envelope_flushed_at = now
+            counts = self.envelope.clamp_counts()
+            self.envelope_telemetry["clamped"] = counts
+            if counts:
+                limits = self.envelope.clamp_counts("limit")
+                velocity = self.envelope.clamp_counts("velocity")
+                if limits:
+                    print(f"[envelope] clamped to joint limits: {format_counts(limits)}")
+                if velocity:
+                    print(
+                        f"[envelope] clamped to velocity limit: {format_counts(velocity)}"
+                    )
+            self.envelope.reset_counts()
+        return self.envelope_telemetry
+
     def start(self):
         kps = [self.pid[0]] * 14
         kds = [self.pid[2]] * 14
@@ -258,6 +342,9 @@ class RLWalk:
 
         i = 0
         try:
+            # A previous walk's abort must never be read as this walk's outcome —
+            # including when this walk is a built-in one that cannot abort at all.
+            local_telemetry.clear_abort()
             print("Starting")
             start_t = time.time()
             while True:
@@ -313,6 +400,20 @@ class RLWalk:
                 if obs is None:
                     continue
 
+                if self.abort_monitor is not None:
+                    # get_obs already read the IMU. Freshness, not presence: raw_imu
+                    # never drops the quaternion key — a failed fused read repeats the
+                    # previous value, and the first of those is identity — so asking
+                    # only whether it is there would accept a dead sensor as a level
+                    # duck (failure mode F4). imu_quaternion answers None when the
+                    # reading is too old to mean anything, which is what counts toward
+                    # the abort.
+                    tilt = self.abort_monitor.check_tilt(
+                        imu_quaternion(self.last_imu_data, time.monotonic())
+                    )
+                    if tilt is not None:
+                        raise self.abort_monitor.abort("tilt", tilt)
+
                 self.imitation_i += 1 * (
                     self.phase_frequency_factor + self.phase_frequency_factor_offset
                 )
@@ -348,13 +449,11 @@ class RLWalk:
 
                 self.motor_targets = self.init_pos + action * self.action_scale
 
-                # self.motor_targets = np.clip(
-                #     self.motor_targets,
-                #     self.prev_motor_targets
-                #     - self.max_motor_velocity * (1 / self.control_freq),  # control dt
-                #     self.prev_motor_targets
-                #     + self.max_motor_velocity * (1 / self.control_freq),  # control dt
-                # )
+                # The velocity clamp that used to sit here, commented out, now lives in
+                # ActionEnvelope.clamp with the same formula
+                # (max_motor_velocity * (1 / control_freq) per tick). It moved because it
+                # has to run AFTER the head override below, and only for a custom policy
+                # — see the clamp-order comment at the call site.
 
                 if self.action_filter is not None:
                     self.action_filter.push(self.motor_targets)
@@ -368,6 +467,34 @@ class RLWalk:
 
                 head_motor_targets = self.last_commands[3:] + self.motor_targets[5:9]
                 self.motor_targets[5:9] = head_motor_targets
+
+                # ── Clamp order (story 1.2). Load-bearing; do not reorder. ─────────
+                #
+                #   policy action
+                #     -> motor_targets = init_pos + action * action_scale     (unchanged)
+                #     -> action filter (if --cutoff_frequency)                (unchanged)
+                #     -> head override  motor_targets[5:9] = operator command (unchanged)
+                #     -> if custom policy active (or TNKR_FORCE_ENVELOPE):    (NEW, A8)
+                #          JOINT LIMIT clamp
+                #          VELOCITY clamp vs the last commanded targets
+                #     -> hwi.set_position_all
+                #
+                # Velocity clamping last is deliberate: it is the guard that must see the
+                # final commanded value, including whatever the operator's head command
+                # contributed. Clamping before the head override would let an operator
+                # command out through a joint stop — and the head is the joint the rest of
+                # this file already special-cases twice (kps 8 vs 30, and the override
+                # above), because it is heavy enough to damage itself.
+                #
+                # The baseline is envelope_prev_targets, not prev_motor_targets: the
+                # latter is re-assigned above, BEFORE the head override, so by this point
+                # it holds this tick's value rather than last tick's. Clamping velocity
+                # against it would cap a held head command at one tick of travel forever.
+                if self.envelope is not None:
+                    self.motor_targets = self.envelope.clamp(
+                        self.motor_targets, self.envelope_prev_targets
+                    )
+                    np.copyto(self.envelope_prev_targets, self.motor_targets)
 
                 action_dict = make_action_dict(
                     self.motor_targets, list(self.hwi.joints.keys())
@@ -393,6 +520,11 @@ class RLWalk:
                             "gyro": [float(g) for g in self.last_imu_data["gyro"]],
                             "accelero": [float(a) for a in self.last_imu_data["accelero"]],
                         },
+                        envelope=(
+                            self._envelope_snapshot(t)
+                            if self.envelope is not None
+                            else None
+                        ),
                     )
 
                 if self.cloud_publisher is not None:
@@ -436,8 +568,26 @@ class RLWalk:
                         "Policy control budget exceeded by",
                         np.around(took - 1 / self.control_freq, 3),
                     )
+                if self.abort_monitor is not None:
+                    # Called every tick, not only on an overrun: a good tick is what
+                    # resets the streak, which is what makes this a sustained-condition
+                    # guard rather than a hair trigger.
+                    overrun = self.abort_monitor.check_budget(took)
+                    if overrun is not None:
+                        raise self.abort_monitor.abort("budget", overrun)
                 time.sleep(max(0, 1 / self.control_freq - took))
 
+        except PolicyAbort as abort:
+            # Must be listed before SystemExit, which it subclasses on purpose: the
+            # finally block below is the only teardown, and it already runs for
+            # SystemExit because that is how SIGTERM ends a walk. Record the reason
+            # HERE, before that teardown, because the server only asks why after the
+            # process is gone.
+            print(f"[abort] {abort.code} {abort.reason}: {abort.detail}")
+            local_telemetry.write_abort(
+                abort.code, abort.reason, abort.detail, abort.operator
+            )
+            print("[abort] torque off")
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
@@ -512,6 +662,21 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
     parser.add_argument(
+        "--custom_policy",
+        action="store_true",
+        default=False,
+        help="the policy is user-supplied rather than the one this robot shipped with: "
+        "arm the safety envelope (joint-limit and velocity clamps, tilt and control-"
+        "budget aborts). TNKR_FORCE_ENVELOPE=1 arms it regardless.",
+    )
+    parser.add_argument(
+        "--urdf_path",
+        type=str,
+        default=None,
+        help="URDF to read per-joint travel limits from for the joint-limit clamp. "
+        "Without it every joint clamps to +/-2 rad.",
+    )
+    parser.add_argument(
         "--cloud_channel",
         type=str,
         default=None,
@@ -552,6 +717,8 @@ if __name__ == "__main__":
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
+        custom_policy=args.custom_policy,
+        urdf_path=args.urdf_path,
         cloud_channel=args.cloud_channel,
         cloud_commands_channel=args.cloud_commands_channel,
         supabase_url=args.supabase_url,

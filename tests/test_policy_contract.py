@@ -36,7 +36,9 @@ See ``tnkr-studio/docs/plans/custom-policy/_architecture.md``, Decision 3 and am
 from __future__ import annotations
 
 import ast
+import importlib.util
 import inspect
+import sys
 from pathlib import Path
 
 import pytest
@@ -399,8 +401,36 @@ def test_widths_are_positive() -> None:
     assert all(width > 0 for _, width in OBS_TERMS)
 
 
-def test_max_policy_bytes_is_sane() -> None:
-    assert 32 * 1024**2 <= MAX_POLICY_BYTES <= 512 * 1024**2
+# The board in the duck: Raspberry Pi Zero 2W, 512 MB total, already running the OS and
+# tnkr_server. Named here because the ceiling below is only meaningful relative to it.
+PI_RAM_BYTES = 512 * 1024**2
+# scripts/BEST_WALK_ONNX_2.onnx, the policy every duck ships with, to the byte.
+BUILTIN_POLICY_BYTES = 884177
+# onnxruntime holds the protobuf plus its initializers while parsing, so peak RSS during
+# inspection is a small multiple of the file. Three is the pessimistic end of that.
+PARSE_MEMORY_FACTOR = 3
+
+
+def test_the_size_ceiling_is_small_enough_to_be_a_ceiling() -> None:
+    """An earlier version of this test asserted only ``32 MB <= x <= 512 MB``, and 512 MB
+    is the whole board -- so a 256 MB ceiling passed it while letting a 200 MB file reach
+    onnxruntime's parser, which is the exact memory exhaustion the ceiling exists to stop
+    (story 2.2: "a large upload cannot exhaust a Pi's memory during inspection"). The
+    bound has to be stated against the Pi's RAM or it states nothing.
+    """
+    assert MAX_POLICY_BYTES * PARSE_MEMORY_FACTOR <= PI_RAM_BYTES // 4, (
+        f"a file at the {MAX_POLICY_BYTES / 1024**2:.0f} MB ceiling could cost "
+        f"{MAX_POLICY_BYTES * PARSE_MEMORY_FACTOR / 1024**2:.0f} MB to parse on a "
+        f"{PI_RAM_BYTES / 1024**2:.0f} MB board that is also running tnkr_server, so the "
+        "install would be refused by the OOM killer rather than by a typed refusal"
+    )
+
+
+def test_the_size_ceiling_accepts_every_policy_that_exists() -> None:
+    """The other half: a ceiling tight enough to refuse a real policy is a bug report, not
+    a safety feature. Ten times the built-in is the margin, and the built-in is the largest
+    Open Duck ONNX anyone has published."""
+    assert MAX_POLICY_BYTES >= 10 * BUILTIN_POLICY_BYTES
 
 
 def test_describe_is_one_line() -> None:
@@ -435,31 +465,93 @@ def test_validate_obs_rejects_none() -> None:
 # ── dependency boundary ─────────────────────────────────────────────────────────
 
 
-def test_module_pulls_in_no_hardware_or_runtime_deps() -> None:
-    """policy_contract must be readable by tooling on a workstation.
-
-    Studio-side tooling and CI need the constants with no robot attached, so this module
-    must not reach the rest of mini_bdx_runtime or any third-party package. A denylist,
-    not an allowlist: adding a stdlib ``typing`` import is fine and should not turn this
-    red with a message that reads like a hardware violation.
-    """
+def _module_level_imports() -> list[str]:
+    """Names imported at module scope (including inside a top-level ``if``)."""
     source_path = inspect.getsourcefile(policy_contract)
     assert source_path, "could not locate policy_contract's source"
     tree = ast.parse(Path(source_path).read_text())
 
     imported: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported += [a.name for a in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.append(node.module)
+    for node in tree.body:
+        nodes = [node]
+        if isinstance(node, (ast.If, ast.Try)):
+            nodes = list(ast.walk(node))
+        for sub in nodes:
+            if isinstance(sub, ast.Import):
+                imported += [a.name for a in sub.names]
+            elif isinstance(sub, ast.ImportFrom) and sub.module:
+                imported.append(sub.module)
+    return imported
 
-    forbidden_prefixes = ("mini_bdx_runtime", "numpy", "onnxruntime", "rustypot",
-                          "adafruit", "board", "busio", "digitalio", "serial")
+
+FORBIDDEN_AT_MODULE_SCOPE = (
+    "mini_bdx_runtime",
+    "numpy",
+    "onnxruntime",
+    "rustypot",
+    "adafruit",
+    "board",
+    "busio",
+    "digitalio",
+    "serial",
+)
+
+
+def test_module_pulls_in_no_hardware_or_runtime_deps() -> None:
+    """policy_contract must be IMPORTABLE by tooling on a workstation.
+
+    Studio-side tooling and CI need the constants with no robot attached, so nothing here
+    may be needed *to import the module*. A denylist, not an allowlist: adding a stdlib
+    ``hashlib`` import is fine and should not turn this red with a message that reads like
+    a hardware violation.
+
+    Narrowed in story 2.2 from "no import of these anywhere in the file" to "no import of
+    these at module scope". ``check_policy`` has to construct an onnxruntime session -- it
+    is the boundary that reads a candidate graph's shape -- and it imports the wheel inside
+    the function, which is what keeps the import-time guarantee above intact. The next test
+    proves that rather than trusting it.
+    """
     offenders = [
-        m for m in imported if any(m == p or m.startswith(p + ".") for p in forbidden_prefixes)
+        m
+        for m in _module_level_imports()
+        if any(m == p or m.startswith(p + ".") for p in FORBIDDEN_AT_MODULE_SCOPE)
     ]
     assert not offenders, (
-        f"policy_contract imports {offenders}. It declares constants; it must stay "
-        "importable on a machine with no robot and no native wheels."
+        f"policy_contract imports {offenders} at module scope. It declares constants and "
+        "one file check; it must stay importable on a machine with no robot and no native "
+        "wheels. If a function needs onnxruntime, import it inside that function."
     )
+
+
+def test_importable_with_onnxruntime_absent(monkeypatch) -> None:
+    """Load the module from source with the native wheels unimportable.
+
+    The AST test above can only see import *statements*; this executes the module for real
+    with ``onnxruntime`` and ``numpy`` made to fail, which is the situation on a
+    workstation or in a CI job that only wants the constants.
+    """
+    blocked = ("onnxruntime", "numpy")
+
+    class Blocker:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname.split(".")[0] in blocked:
+                raise ImportError(f"blocked for test: {fullname}")
+            return None
+
+    for name in list(sys.modules):
+        if name.split(".")[0] in blocked:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Blocker(), *sys.meta_path])
+
+    source_path = inspect.getsourcefile(policy_contract)
+    assert source_path
+    spec = importlib.util.spec_from_file_location("policy_contract_isolated", source_path)
+    assert spec and spec.loader
+    isolated = importlib.util.module_from_spec(spec)
+    # dataclasses resolves a string annotation through sys.modules[cls.__module__], so the
+    # module has to be registered before it executes. monkeypatch removes it after.
+    monkeypatch.setitem(sys.modules, spec.name, isolated)
+    spec.loader.exec_module(isolated)  # raises ImportError if a wheel is needed to import
+
+    assert isolated.OBS_DIM == OBS_DIM
+    assert isolated.MAX_POLICY_BYTES == MAX_POLICY_BYTES

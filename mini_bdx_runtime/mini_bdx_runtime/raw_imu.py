@@ -144,9 +144,12 @@ class Imu:
             "gyro": [0, 0, 0],
             "accelero": [0, 0, 0],
             "quaternion": [1.0, 0.0, 0.0, 0.0],  # w, x, y, z (identity)
+            # None until a fused read has actually succeeded — see _read_quaternion
+            "quaternion_t": None,
         }
         # fused orientation for viewers/telemetry; the policy only uses gyro+accel
         self._last_quat = [1.0, 0.0, 0.0, 0.0]
+        self._last_quat_t = None
         self._stop = False
         self.imu_queue = Queue(maxsize=1)
         Thread(target=self.imu_worker, daemon=True).start()
@@ -216,25 +219,42 @@ class Imu:
 
             accelero[0] -= self.x_offset
 
-            # Fused quaternion (w, x, y, z) rides along for viewers/telemetry.
-            # A failed read keeps the previous value — never skip the whole
-            # sample over it, the policy's gyro/accel must keep flowing.
-            try:
-                raw_quat = self.imu.quaternion
-                if raw_quat is not None and None not in raw_quat:
-                    self._last_quat = [float(q) for q in raw_quat]
-            except Exception:
-                pass
+            self._read_quaternion()
 
             data = {
                 "gyro": gyro,
                 "accelero": accelero,
                 "quaternion": list(self._last_quat),
+                # When that quaternion was last actually read from the chip. A
+                # consumer that only checks for None cannot tell a level duck from
+                # a fused read that stopped answering: the quaternion above is the
+                # previous value either way (see _read_quaternion).
+                "quaternion_t": self._last_quat_t,
             }
 
             self.imu_queue.put(data)
             took = time.time() - s
             time.sleep(max(0, 1 / self.sampling_freq - took))
+
+    def _read_quaternion(self):
+        """Refresh the fused orientation, and record WHEN it was refreshed.
+
+        A failed read keeps the previous value — never skip the whole sample over
+        it, the policy's gyro/accel must keep flowing.  But the previous value
+        must not pass for a fresh one: the walk's tilt guard treats an unknown
+        orientation as unsafe, and without the timestamp there is no unknown to
+        report.  The BNO055 can lose its fused output (a mode or fusion fault)
+        while gyro and accel keep streaming, and _last_quat starts at identity —
+        so a duck that has fallen would keep reporting itself perfectly level.
+        """
+        try:
+            raw_quat = self.imu.quaternion
+        except Exception:
+            return
+        if raw_quat is None or None in raw_quat:
+            return
+        self._last_quat = [float(q) for q in raw_quat]
+        self._last_quat_t = time.monotonic()
 
     def get_data(self):
         """Return the most recent IMU reading (non-blocking).

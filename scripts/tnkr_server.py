@@ -45,6 +45,7 @@ from mini_bdx_runtime import telemetry
 from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
 from mini_bdx_runtime import walk_offsets
+from mini_bdx_runtime import preflight
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -2006,6 +2007,83 @@ def send_commands(req: CommandRequest):
             json.dump(data, f)
         os.replace(tmp_path, COMMAND_FILE)
     return {"success": True}
+
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+#
+# Implements the open TODO at the bottom of checklist.md ("Make a script that goes
+# through all this automatically"). It reports; it never decides whether a walk may
+# start. That call belongs to whoever is starting the walk.
+
+last_preflight: dict | None = None  # last result, so a client can re-read without re-running
+
+
+def get_feet_contacts():
+    """Lazy foot-switch reader, or None when this machine has no GPIO.
+
+    Not a singleton: FeetContacts holds two DigitalInOut pins and the walk subprocess
+    constructs its own, so preflight opens and closes its own short-lived reader rather
+    than holding pins a walk will want.
+    """
+    try:
+        from mini_bdx_runtime.feet_contacts import FeetContacts
+
+        return FeetContacts()
+    except Exception as e:
+        print(f"[preflight] foot switches unavailable: {e}")
+        return None
+
+
+@app.post("/api/preflight")
+def run_preflight_endpoint():
+    """Check joints, calibration offsets, IMU orientation and foot switches."""
+    global last_preflight
+
+    # The walk subprocess owns both the serial bus and the I2C while it runs.
+    refuse_while_walking()
+
+    try:
+        hwi = get_hwi()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Cannot connect to motor controller: {e}"
+        )
+
+    try:
+        imu = get_state_imu()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Cannot open the IMU: {e}")
+
+    feet = get_feet_contacts()
+    try:
+        report = preflight.run_preflight(hwi, imu, feet, hwi.duck_config)
+    finally:
+        # Release the pins immediately — a walk started right after preflight needs them.
+        if feet is not None:
+            try:
+                feet.stop()
+            except Exception:
+                pass
+
+    last_preflight = report.as_dict()
+    telemetry.capture(
+        "preflight_run",
+        {
+            "ok": report.ok,
+            # Which checks failed, never the values they read.
+            "failed": [c.name for c in report.checks if not c.ok],
+            "duration_ms": report.duration_ms,
+        },
+    )
+    return last_preflight
+
+
+@app.get("/api/preflight")
+def read_preflight():
+    """The last preflight result, or nulls if none has run this boot."""
+    if last_preflight is None:
+        return {"ok": None, "checks": [], "duration_ms": 0}
+    return last_preflight
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

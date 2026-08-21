@@ -180,6 +180,79 @@ Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_M
 - left and right triggers to control the left and right antennas
 - LB (new!) press and hold to increase the walking frequency, kind of a sprint mode 🙂
 ```
+
+## Installed policies (`~/.tnkr/policies`)
+
+The duck can hold a few policies besides the one this repo ships, and Tnkr Studio installs
+them over the robot's HTTP API (`POST /api/policy/install`). They live here:
+
+```
+~/.tnkr/policies/
+├── active                  # which policy the next walk starts on. Absent = the built-in
+└── <policy-id>/
+    ├── model.onnx
+    ├── manifest.json       # shapes read off the graph + measured inference latency
+    └── last_used           # empty; its mtime decides what gets evicted first
+```
+
+Facts worth knowing before you go looking:
+
+- **The built-in policy is not in there.** It is resolved through the same `scripts/*.onnx`
+  glob the walk has always used, so it tracks whatever the repo ships and cannot be
+  evicted. A duck that has never installed anything has an empty (or absent) store and
+  walks exactly as it always did.
+- **The store is bounded**: at most three installed policies plus the built-in, least
+  recently used evicted to make room, and an install is refused outright if it would leave
+  less than 200 MB free. A full SD card is a Pi that will not boot, which is a worse
+  problem than a policy that walks badly.
+- **Getting back is one call**: `curl -X POST http://<duck>:8000/api/policy/select -d
+  '{"id":"builtin"}'`. It works with an empty store, a corrupt `active` file, and while a
+  walk is running (it takes effect on the next start).
+- **Deleting the whole directory is safe.** The next walk resolves the built-in.
+
+Anything not resolved through that glob is treated as a custom policy and runs inside the
+safety envelope (velocity and joint-limit clamps, tilt and control-budget aborts) whether or
+not anyone asked for it.
+
+### The first run of a new policy is a bench run
+
+Nothing on this robot can tell you whether a policy *walks well*. It can tell you the policy
+is shaped right, bounded, and fast enough — a gait that would faceplant the moment it bore
+weight passes all of that. So the first hardware run of a policy this duck has never run is
+ten seconds with you holding it off the ground, and **you** say whether that looked like
+walking:
+
+```bash
+cd scripts/
+python v2_rl_walk_mujoco.py --onnx_model_path ~/.tnkr/policies/9f2a/model.onnx \
+    --mode bench --bench_seconds 10
+Starting (bench, 10s)
+[bench] timer: the 10s bench completed
+[bench] timer: 498 ticks in 10.0s, mean 7.1ms/tick, 12 clamp events
+[bench] torque off
+```
+
+- **It is the same walk loop**, with a deadline. Not a second control loop — the clamps and
+  aborts that make a bench safe to watch are the ones the ordinary walk uses, and a second
+  loop would be a second, untested envelope.
+- **It always ends on its own**, and `POST /api/bench/stop` ends it on the next control tick
+  (~20 ms) if it looks wrong sooner than that. `POST /api/walk/stop` still cuts torque
+  immediately, bench or not.
+- **Torque comes off on every exit**: the deadline, your stop, a safety abort, `SIGTERM`, or a
+  crash. There is one teardown and all five go through it.
+- **An abort during a bench fails it**, with the guard's reason, without asking you.
+- **Free walking is refused until a policy has passed a bench run** — `POST /api/walk/start`
+  answers `409 POLICY_BENCH_REQUIRED`. The verdict is stored in `bench.json` beside the model,
+  so you are asked once per policy, not once per session. It is dropped if the model's bytes
+  change, and it goes with the policy when the policy is evicted.
+- **The built-in is exempt.** It is what every duck sold walks on. You can bench it; you are
+  never made to. So is a `.onnx` you copy straight into `scripts/` — it is resolved by the
+  built-in's glob and has no id for a verdict to be filed against. It still runs inside the
+  full safety envelope, because that is decided by the file's name, not by the gate.
+- **Nothing here guesses a verdict.** "Did not abort" is not "walked well", so
+  `POST /api/bench/verdict {"policyId": …, "passed": false, "reason": …}` is the only thing
+  that records one. If the walk dies before it reports, the policy stays gated — run it again.
+
 ## Telemetry
 
 The robot sends anonymous usage data so we can find and fix the setup steps and

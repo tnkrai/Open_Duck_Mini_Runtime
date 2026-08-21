@@ -2,6 +2,9 @@
     "start_paused": false,
     "imu_upside_down": false,
     "phase_frequency_factor_offset": 0.0,
+    "tilt_limit_deg": 60.0,
+    "tilt_abort_ticks": 8,
+    "budget_overrun_ticks": 10,
     "expression_features": {
         "eyes": false,
         "projector": false,

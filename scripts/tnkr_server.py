@@ -45,6 +45,10 @@ from mini_bdx_runtime import telemetry
 from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
 from mini_bdx_runtime import walk_offsets
+from mini_bdx_runtime import preflight
+from mini_bdx_runtime import policy_contract
+from mini_bdx_runtime import policy_store
+from mini_bdx_runtime import bench
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -52,6 +56,14 @@ HOME_DIR = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME_DIR, "duck_config.json")
 SCRIPTS_DIR = Path(__file__).parent
 SERVER_PORT = 8000
+
+# Where installed policies live. A module global (not a constant baked into a store
+# instance) so a test -- or a future config option -- can move it without this file
+# needing to know.
+POLICY_ROOT = Path(HOME_DIR) / ".tnkr" / "policies"
+
+# How the robot fetches a policy. Swapped in tests; there is no network in the suite.
+POLICY_FETCH = policy_store.stream_to_file
 
 
 def _resolve_usb_port(default: str = "/dev/ttyACM0") -> str:
@@ -111,6 +123,12 @@ class WalkSession:
     cloud_streaming: bool
     started_at: float
     stop_requested: bool = False
+    # Which policy this launch loaded. Recorded so eviction can refuse to delete the
+    # model a running walk has open, which the store cannot know by itself.
+    policy_id: str | None = None
+    # "free" or "bench" (story 4.3). The monitor thread reads it to decide whether this
+    # launch's exit needs a bench report filed against the policy it ran.
+    mode: str = bench.MODE_FREE
 
 
 walk_session: WalkSession | None = None
@@ -351,6 +369,14 @@ TELEMETRY_EXCLUDED_PATHS = {
 TELEMETRY_FAILURES_ONLY_PATHS = {
     "/api/state",              # live joints + IMU, polled continuously by the viewer
     "/api/stance/positions",   # polled while the stance editor is open
+    # The policy list is built to be polled (story 2.3), so it belongs here the day it
+    # ships rather than after it has crowded out a month of setup_step_failed events the
+    # way /api/state did. A 200 says "the policy UI is open", which nothing reads; a 500
+    # says the robot stopped answering, which somebody should.
+    "/api/policy",
+    # Polled for the ten seconds a bench run lasts, then again while the operator is
+    # looking at the verdict prompt. Same reasoning as /api/policy.
+    "/api/bench",
 }
 
 
@@ -523,6 +549,81 @@ def telemetry_identity():
     return body
 
 
+# ── Capabilities ──────────────────────────────────────────────────────────────
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  CAPABILITY NAMES ARE A PERMANENT CONTRACT.                              │
+# │                                                                          │
+# │  A Pi updates only when its owner re-runs scripts/setup.sh, so the fleet  │
+# │  runs mixed versions forever and an OLD Studio will be matching on these │
+# │  exact strings for as long as any duck is switched on. Therefore:        │
+# │                                                                          │
+# │    * namespaced, dotted, lowercase   ("policy.install")                  │
+# │    * ADD names, never rename or remove one                               │
+# │    * a rename is a new name plus the old one kept forever                │
+# │                                                                          │
+# │  Tidying these up is not a refactor, it is a fleet-wide capability       │
+# │  regression that no test in Studio's repo can see.                       │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# DERIVED, NOT LISTED. Each name maps to the routes that implement it, and a name is
+# only claimed when every one of its routes is actually registered on this process's
+# app. A hardcoded list would let a half-applied `git pull` -- setup.sh's update path is
+# a git pull, and it can fail partway -- advertise a capability whose handler is missing,
+# which is worse than not advertising it: Studio would show the UI and then 404.
+CAPABILITY_ROUTES: dict[str, tuple[tuple[str, str], ...]] = {
+    "preflight": (("POST", "/api/preflight"),),
+    "policy.list": (("GET", "/api/policy"),),
+    "policy.install": (("POST", "/api/policy/install"),),
+    "policy.select": (("POST", "/api/policy/select"),),
+    # The supervised bench run (story 4.3). One name for the whole flow -- start it,
+    # stop it, read it, judge it -- because Studio has no use for half of it: without
+    # the verdict endpoint the gate can never be cleared, and without the gate there is
+    # nothing to clear.
+    "bench": (
+        ("GET", "/api/bench"),
+        ("POST", "/api/bench/stop"),
+        ("POST", "/api/bench/verdict"),
+    ),
+}
+
+_capabilities_cache: list[str] | None = None
+
+
+def capabilities_for(routes) -> list[str]:
+    """The capability names satisfied by ``routes``. Pure, so every case is testable.
+
+    Sorted for a stable payload — a set's iteration order would make /api/health's body
+    differ between boots for no reason.
+    """
+    registered = set()
+    for route in routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None) or ()
+        if path is None:
+            continue
+        for method in methods:
+            registered.add((method.upper(), path))
+    return sorted(
+        name
+        for name, needed in CAPABILITY_ROUTES.items()
+        if all(pair in registered for pair in needed)
+    )
+
+
+def capabilities() -> list[str]:
+    """This robot's capability list, computed once.
+
+    /api/health is polled by Studio, so this walks the route table on the first call and
+    then never again. The route table cannot change after startup — FastAPI registers at
+    import — so a cache is not a staleness risk.
+    """
+    global _capabilities_cache
+    if _capabilities_cache is None:
+        _capabilities_cache = capabilities_for(app.routes)
+    return list(_capabilities_cache)
+
+
 @app.get("/api/health")
 def health():
     machine = platform.machine()  # 'aarch64' / 'armv7l' on Pi, 'x86_64' / 'arm64' on Mac
@@ -534,6 +635,9 @@ def health():
         "walking": is_walking(),
         "paused": is_paused(),
         "walkExitCode": walk_exit_code(),
+        # Absent on an older robot, which deserialises to [] in Studio — the correct
+        # fallback for free, and the reason this is a list and not a version string.
+        "capabilities": capabilities(),
     }
 
 
@@ -1536,6 +1640,316 @@ def update_config(config: DuckConfigModel):
     return {"success": True}
 
 
+# ── Policies ──────────────────────────────────────────────────────────────────
+#
+# The store is the file half of this (mini_bdx_runtime/policy_store.py); these three
+# endpoints are the HTTP half and hold no state of their own.
+#
+# NONE of them refuse while a walk is running, and that is deliberate rather than an
+# oversight. They touch no servo bus, no I2C and no GPIO — install is a download plus a
+# graph parse, select writes one pointer file — and amendment A4 requires reverting to the
+# built-in to work exactly when a bad policy is running, because that is the moment the
+# operator needs it. A selection takes effect on the next walk start.
+#
+# A NOTE ON WHAT MAY BE LOGGED HERE: the install URL is presigned, so its query string IS
+# a credential. The telemetry middleware ships an endpoint's error detail to PostHog as
+# `error_message`, so no failure text on this path may contain the URL. policy_store
+# redacts it down to scheme/host/path; do not undo that, and do not add the URL to a
+# telemetry prop.
+
+_policy_lock = Lock()
+
+# Which HTTP status a refusal gets. Studio renders the operator sentence off `code`, so
+# these exist for HTTP's sake — but a failure must not be a 200 with ok:false, or a
+# caller that only checks the status would treat a refused install as a success.
+POLICY_STATUS_CODES: dict[str, int] = {
+    policy_contract.POLICY_CONTRACT_MISMATCH: 422,  # the file is not a duck policy
+    policy_contract.POLICY_STORE_FULL: 507,         # Insufficient Storage, literally
+    policy_contract.POLICY_INSTALL_FAILED: 502,     # could not obtain what was promised
+    # 409: the request is well-formed and the policy is fine -- the robot's state is what
+    # refuses it. This policy has never been watched moving a real duck (story 4.3).
+    bench.POLICY_BENCH_REQUIRED: 409,
+}
+
+
+def get_policy_store() -> policy_store.PolicyStore:
+    """A store bound to the CURRENT module globals.
+
+    Rebuilt per request on purpose: construction reads no files and creates no
+    directories, and capturing SCRIPTS_DIR/POLICY_ROOT once at import would make the
+    built-in's glob resolve against a path a test (or a future config reload) has since
+    moved.
+    """
+    return policy_store.PolicyStore(
+        root=POLICY_ROOT,
+        scripts_dir=SCRIPTS_DIR,
+        fetch=POLICY_FETCH,
+    )
+
+
+def _policy_failure(code: str, detail: str) -> JSONResponse:
+    add_telemetry_props(policy_code=code)
+    return JSONResponse(
+        status_code=POLICY_STATUS_CODES.get(code, 400),
+        content={"ok": False, "code": code, "detail": detail},
+    )
+
+
+def _running_policy_ids() -> set[str]:
+    """The policy a live walk has open, so eviction leaves it alone."""
+    session = walk_session
+    if session is None or session.proc.poll() is not None:
+        return set()
+    return {session.policy_id} if session.policy_id else set()
+
+
+class PolicyInstallRequest(BaseModel):
+    id: str
+    url: str
+    sha256: str
+    manifest: dict | None = None
+
+
+class PolicySelectRequest(BaseModel):
+    id: str
+
+
+@app.get("/api/policy")
+def list_policies():
+    """Installed policies, which is active, and the built-in that always exists.
+
+    Cheap enough to poll: one stat per policy and one small JSON read. It never hashes a
+    file — that is install and select's job, and hashing a 16 MB model on every poll would
+    be a self-inflicted load problem on a Pi Zero 2W.
+    """
+    return get_policy_store().list()
+
+
+@app.post("/api/policy/install")
+def install_policy(body: PolicyInstallRequest):
+    """Fetch, verify and store one policy. Transactional: on any failure, nothing changes.
+
+    The verification is `policy_contract.check_policy`, which is the security boundary
+    (amendment A1) — this API authenticates nobody and its CORS reflects any origin, so
+    the check lives here rather than in Studio, and there is no way for a caller to skip it.
+    """
+    store = get_policy_store()
+    with _policy_lock:
+        try:
+            result = store.install(
+                body.id,
+                body.url,
+                body.sha256,
+                body.manifest,
+                protect=_running_policy_ids(),
+            )
+        except policy_store.StoreError as exc:
+            return _policy_failure(exc.code, exc.detail)
+
+    stored = result.manifest or {}
+    add_telemetry_props(
+        ok=result.ok,
+        already_installed=result.already_installed,
+        evicted=result.evicted is not None,
+        # Read off the manifest, not off `warning`: a warning also rides an install whose
+        # latency could not be measured at all, and counting those as slow policies would
+        # make the one number this feature exists to gather wrong.
+        over_budget=bool(stored.get("latency_over_budget")),
+        latency_measured=bool(stored.get("latency_measured")),
+        latency_p99_ms=stored.get("latency_p99_ms"),
+    )
+    if not result.ok:
+        return _policy_failure(result.code or policy_contract.POLICY_INSTALL_FAILED,
+                               result.detail)
+    return result.as_dict()
+
+
+@app.post("/api/policy/select")
+def select_policy(body: PolicySelectRequest):
+    """Record which policy the next walk starts on.
+
+    `id="builtin"` is the one-action revert (amendment A4) and always succeeds: it removes
+    the pointer file rather than writing one, so it works with an empty store, a corrupt
+    active pointer, and a walk in progress.
+    """
+    store = get_policy_store()
+    # DELIBERATELY OUTSIDE _policy_lock. An install holds that lock for as long as the
+    # download takes -- up to a minute on household wifi -- and amendment A4 says the way
+    # back to the built-in must work at the moment a bad policy is running, which is
+    # exactly when someone might also be installing the next one. Selecting is one atomic
+    # pointer write (or one unlink), so it needs no mutual exclusion of its own.
+    #
+    # The race it admits: an install's eviction reads the active id, then a select lands
+    # on a policy that eviction is about to delete. The result is an active pointer naming
+    # a directory that no longer exists, which resolves to the built-in and logs -- the
+    # same fallback a reflashed card produces, and tested as such.
+    try:
+        active = store.select(body.id)
+    except policy_store.StoreError as exc:
+        return _policy_failure(exc.code, exc.detail)
+    add_telemetry_props(builtin=active == policy_store.BUILTIN_ID)
+    return {"ok": True, "active": active}
+
+
+# ── The supervised bench run (story 4.3, Decision 10) ─────────────────────────
+#
+# Decision 1 removed the simulation gate and recorded the consequence: nothing in this
+# design predicts whether a policy WALKS WELL. So the first hardware run of a policy this
+# robot has never run is ten bounded seconds with the operator holding the duck, and the
+# operator's answer is the only judge there is.
+#
+# These endpoints record a verdict. They never compute one. There is deliberately no
+# heuristic anywhere below that turns "did not abort" into a pass -- a policy can hold
+# every joint inside every limit, keep every deadline, and produce a gait that faceplants
+# the moment it bears weight, which is exactly the case a rubber stamp would wave through.
+#
+# The one exception runs the other way: an abort from the safety envelope FAILS the bench
+# without asking, because the envelope has already answered the question.
+
+
+class BenchVerdictRequest(BaseModel):
+    policyId: str
+    passed: bool
+    reason: str | None = None
+
+
+def _bench_running() -> bool:
+    session = walk_session
+    return (
+        session is not None
+        and session.mode == bench.MODE_BENCH
+        and session.proc.poll() is None
+    )
+
+
+def _bench_payload() -> dict:
+    """What /api/bench answers, and what /api/bench/stop echoes back.
+
+    ``policyId`` is the policy of the bench in progress, or of the last one that reported
+    -- never of the free walk that happens to be running, which is not a bench and whose
+    id would read as one on the screen the operator is watching.
+    """
+    report = bench.read_report()
+    running = _bench_running()
+    session = walk_session
+    return {
+        "running": running,
+        "policyId": (
+            session.policy_id
+            if running and session is not None
+            else (report.policy_id if report is not None else None)
+        ),
+        "stopRequested": bench.stop_requested(),
+        "defaultSeconds": bench.DEFAULT_BENCH_SECONDS,
+        "report": report.as_dict() if report is not None else None,
+    }
+
+
+def _finalize_bench(session: WalkSession) -> None:
+    """After a bench walk exits: fail it here if a guard tripped. Never pass it here.
+
+    Called from the monitor thread, so it must not raise -- and it is the only place a
+    verdict is written without a person, which is why it can only ever write a *failure*.
+
+    Everything else -- a clean ten seconds, an operator stop, a crash, a power cut --
+    leaves no record at all, and no record means still gated. That is the fail-closed
+    direction: the cost of forgetting a pass is another ten seconds, and the cost of
+    inventing one is an unwatched policy on a duck standing on its own feet.
+    """
+    if session.mode != bench.MODE_BENCH or not session.policy_id:
+        return
+    report = bench.read_report()
+    if report is None or not report.aborted:
+        return
+    reason = report.abort_reason or "the safety envelope stopped the run"
+    try:
+        get_policy_store().mark_bench(session.policy_id, False, reason)
+    except Exception as exc:  # a bookkeeping failure must not kill the monitor thread
+        print(f"[bench] could not record the failed bench run: {exc}")
+
+
+@app.get("/api/bench")
+def read_bench():
+    """Whether a bench run is in progress, and the last one's report.
+
+    Polled while the run is on screen, so it is on the failures-only telemetry list.
+    """
+    return _bench_payload()
+
+
+@app.post("/api/bench/stop")
+def stop_bench():
+    """End the bench run now.
+
+    A file the loop stats each tick, not a signal: the walk then ends its own bench, cuts
+    torque through the teardown it already has, and writes the report saying the operator
+    stopped it. Killing the process would cut torque just as fast and lose the report,
+    which is the difference between a run the operator can fail on purpose and a run that
+    merely vanished.
+
+    /api/walk/stop still works during a bench and still cuts torque immediately. This is
+    the gentler of the two, not a replacement for it.
+    """
+    if not _bench_running():
+        raise HTTPException(
+            status_code=409, detail="No bench run is in progress -- nothing to stop"
+        )
+    bench.request_stop()
+    return _bench_payload()
+
+
+@app.post("/api/bench/verdict")
+def bench_verdict(body: BenchVerdictRequest):
+    """Record the operator's answer to "did that look like walking?".
+
+    Refusals, and why each one is a refusal rather than a shrug:
+
+    * no report -- nothing ran, or the run died before it could say what it did. Accepting
+      a pass here would let the gate be cleared without a duck ever moving.
+    * a report for a different policy -- the verdict would be filed against weights nobody
+      watched.
+    * a pass on a run that aborted, crashed or was signalled away -- the envelope already
+      failed it, or nobody saw it finish. A *fail* on any of those is always accepted.
+    """
+    store = get_policy_store()
+    report = bench.read_report()
+    if report is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No bench run to judge -- run one before recording a verdict",
+        )
+    if (report.policy_id or policy_store.BUILTIN_ID) != body.policyId:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"the last bench run was of {report.policy_id!r}, "
+                f"not {body.policyId!r}"
+            ),
+        )
+    if body.passed and report.ended not in bench.PASSABLE_ENDINGS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"that bench run ended as {report.ended!r}, which cannot be passed. "
+                "Run the bench again."
+            ),
+        )
+    try:
+        status = store.mark_bench(body.policyId, body.passed, body.reason or "")
+    except policy_store.StoreError as exc:
+        return _policy_failure(exc.code, exc.detail)
+    add_telemetry_props(
+        passed=body.passed,
+        ended=report.ended,
+        # A boolean, never the id: which community policy an owner is trying is not this
+        # event's business (same rule as the install event).
+        builtin=body.policyId == policy_store.BUILTIN_ID,
+        ticks=report.ticks,
+        clamp_events=report.clamp_events,
+    )
+    return {"ok": True, "bench": status}
+
+
 # ── Walk Control ──────────────────────────────────────────────────────────────
 
 def stop_walk_process():
@@ -1574,6 +1988,13 @@ def stop_walk_process():
 def _monitor_walk(session: WalkSession):
     """Wait for one walk launch to exit and report how it ended."""
     rc = session.proc.wait()
+    # Before the telemetry, because this is the only chance to see the report the walk
+    # just wrote: a bench that aborted is a bench that failed, and story 1.3's guards are
+    # the one judge that does not need a person (story 4.3).
+    try:
+        _finalize_bench(session)
+    except Exception as exc:
+        print(f"[bench] finalize failed: {exc}")
     # Any nonzero exit we didn't ask for is a crash — including -SIGKILL,
     # which is how the kernel OOM killer ends walks on a 512MB Pi. Exempting
     # signals wholesale would blind the crash-rate dashboard to OOM.
@@ -1586,6 +2007,7 @@ def _monitor_walk(session: WalkSession):
             "crashed": crashed,
             "stop_requested": session.stop_requested,
             "cloud_streaming": session.cloud_streaming,
+            "mode": session.mode,
         },
     )
 
@@ -1594,6 +2016,14 @@ class WalkStartRequest(BaseModel):
     sessionToken: str | None = None
     supabaseUrl: str | None = None
     supabaseKey: str | None = None
+    # Which policy to walk on. Omitted (the only thing Studio sends today) means the
+    # active one, which on a duck that has never installed anything is the built-in.
+    policyId: str | None = None
+    # "free" (the default, and everything before story 4.3) or "bench": a bounded
+    # supervised run of a policy this robot has never run. Omitted means free, so a Studio
+    # that predates the bench sends exactly what it sent before.
+    mode: str | None = None
+    benchSeconds: float | None = None
 
 
 @app.post("/api/walk/start")
@@ -1613,16 +2043,79 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
 def _walk_start_locked(body: WalkStartRequest):
     global walk_session
 
+    try:
+        mode = bench.parse_mode(body.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     if rehome_io is not None:
         raise HTTPException(
             status_code=409,
             detail="Servo rehoming session in progress — finish it before walking",
         )
 
-    if walk_session is not None and walk_session.proc.poll() is None:
-        if body.sessionToken and body.sessionToken == walk_session.session_token:
-            add_telemetry_props(already_running=True)
-            return {"success": True, "message": "Walk is already running"}
+    running = walk_session is not None and walk_session.proc.poll() is None
+    if running and body.sessionToken and body.sessionToken == walk_session.session_token:
+        # An idempotent retry of the walk that is already running. It starts nothing, so
+        # it resolves nothing: a stale policyId must not turn a no-op into a 404.
+        add_telemetry_props(already_running=True)
+        return {"success": True, "message": "Walk is already running"}
+
+    venv_python = sys.executable
+    is_pi = platform.machine() in ("aarch64", "armv7l")
+
+    # Resolve the policy BEFORE stopping the running walk and before releasing the buses.
+    # A request naming a policy this robot does not have is a 404 that should cost
+    # nothing, and both of those cost torque: stopping first cuts it on a duck mid-stride
+    # for a request that never starts a walk, and Studio sending an id this robot no
+    # longer has is routine, because a bounded store evicts policies its cached list
+    # still shows.
+    resolved = None
+    if is_pi:
+        store = get_policy_store()
+        try:
+            resolved = (
+                store.resolve(body.policyId)
+                if body.policyId
+                else store.resolve_active()
+            )
+        except policy_store.StoreError as exc:
+            raise HTTPException(status_code=404, detail=exc.detail)
+        if resolved is None:
+            # Same message this endpoint has always given when scripts/ holds no .onnx.
+            raise HTTPException(
+                status_code=404,
+                detail="No ONNX model found in scripts/ directory",
+            )
+
+        # The gate (story 4.3). Checked here, in the same window as the 404 above and for
+        # the same reason: a refusal must cost nothing, and stopping the running walk
+        # first would cut torque on a duck mid-stride for a request that starts nothing.
+        #
+        # The built-in is exempt -- it is what every duck sold walks on. A bench run is
+        # never gated on itself, which is the whole point of it.
+        #
+        # DELIBERATE HOLE, worth stating: a file an owner copies straight into scripts/ is
+        # resolved by the built-in's glob, so it gets id "builtin" here and is NOT gated.
+        # Gating it would be unclearable -- a verdict is recorded against a store id, and
+        # that file has none -- so the gate would permanently break the workflow the
+        # envelope stories describe as how people run downloaded policies today. It is
+        # still guarded: envelope.is_armed goes by FILE NAME, not by this id, so anything
+        # that is not one of the two policies this repo ships runs with every clamp and
+        # abort armed. Fail-safe there, functional here.
+        if mode == bench.MODE_FREE:
+            status = store.bench_status(resolved.id)
+            if status["required"]:
+                return _policy_failure(
+                    bench.POLICY_BENCH_REQUIRED,
+                    f"{resolved.id} has not passed a supervised bench run on this robot"
+                    + (f": {status['reason']}" if status["reason"] else ""),
+                )
+
+    if running:
+        # A different session token: the old walk is bound to a channel nobody is
+        # listening to any more. Only now, with a policy in hand and a walk certain to
+        # start, is it worth stopping.
         stop_walk_process()
 
     # Release HWI + BNO055 so the walk script owns both buses (serial + I2C);
@@ -1639,27 +2132,39 @@ def _walk_start_locked(body: WalkStartRequest):
     imu_calib_status["running"] = False
     release_state_imu()
 
-    venv_python = sys.executable
-    is_pi = platform.machine() in ("aarch64", "armv7l")
-
     if is_pi:
-        # Find the ONNX model — look for any .onnx file in scripts/
-        onnx_files = list(SCRIPTS_DIR.glob("*.onnx"))
-        if not onnx_files:
-            raise HTTPException(
-                status_code=404,
-                detail="No ONNX model found in scripts/ directory",
-            )
-        onnx_path = str(onnx_files[0])
+        assert resolved is not None  # resolved above, before the buses were released
         walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
 
         cmd = [
             venv_python,
             walk_script,
-            "--onnx_model_path", onnx_path,
+            "--onnx_model_path", str(resolved.path),
             "--remote",
             "--commands",
         ]
+        if not resolved.is_builtin:
+            # Explicitness, NOT the arming mechanism. envelope.is_armed() decides from the
+            # ARTIFACT — `not is_builtin_policy(onnx_model_path)` — precisely because
+            # nothing used to pass this flag, so a downloaded policy dropped in scripts/
+            # and started from here ran with every guard disarmed and nothing logged. That
+            # was fail-open. If this line is ever deleted the envelope must still arm; if
+            # it stops arming, the bug is in is_armed, not here.
+            cmd.append("--custom_policy")
+        if mode == bench.MODE_BENCH:
+            # Bench mode adds three arguments and no second code path: --mode is read by
+            # the same loop, and --policy_id is carried only so the report the walk writes
+            # names the policy the operator's verdict will be filed against.
+            cmd.extend(
+                [
+                    "--mode",
+                    bench.MODE_BENCH,
+                    "--bench_seconds",
+                    f"{bench.clamp_seconds(body.benchSeconds):g}",
+                    "--policy_id",
+                    resolved.id,
+                ]
+            )
         if body.sessionToken:
             cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
             cmd.extend(["--cloud_commands_channel", f"robot-commands-{body.sessionToken}"])
@@ -1692,6 +2197,10 @@ def _walk_start_locked(body: WalkStartRequest):
         cloud_streaming=cloud_streaming,
         has_session=bool(body.sessionToken),
         already_running=False,
+        # Whether this walk is the policy the robot shipped with. A boolean, never the id:
+        # which community policy an owner is trying is not this event's business.
+        builtin_policy=bool(resolved.is_builtin) if resolved else None,
+        mode=mode,
     )
 
     # Start from a clean slate. stop_walk_process() clears these, but a walk
@@ -1701,6 +2210,30 @@ def _walk_start_locked(body: WalkStartRequest):
     # pause/trim for the whole boot window.
     walk_pause.clear()
     walk_offsets.clear()
+    # Same rule, for the same reason: a stop request belongs to the bench that was
+    # stopped, and a leftover one would end the next bench on its first tick. Cleared on
+    # every start, because it is a REQUEST -- it expires with the run it was aimed at, and
+    # nothing is lost by dropping one nobody is waiting on.
+    bench.clear_stop()
+    # The report is the opposite: an ANSWER, and one the operator still owes a verdict on.
+    # POST /api/bench/verdict refuses with 409 when there is no report, so deleting it
+    # here costs somebody another ten seconds holding a duck. Clearing it on every start
+    # (which is what this did) threw that away whenever anyone pressed Walk in between --
+    # a bench finishes, the "did that look like walking?" prompt is on screen, the
+    # operator starts the built-in to compare the two, and the answer can no longer be
+    # recorded. Nothing unsafe: the policy stays gated, which is the fail-closed
+    # direction. It is ten seconds of the operator's time, lost for no reason.
+    #
+    # So only a bench start clears it, which is the case the clear exists for: /api/bench
+    # must not serve a previous run's outcome as THIS run's while the walk is still
+    # booting. A free walk cannot be mistaken for a bench -- `running` comes off the
+    # session's mode, never off the report lying beside it -- and the loop writes a report
+    # only when self.bench is not None (v2_rl_walk_mujoco.py, mode == bench).
+    #
+    # The walk clears both again itself when it starts a bench, which is what keeps this
+    # correct when a bench is started from a terminal with no server involved.
+    if mode == bench.MODE_BENCH:
+        bench.clear_report()
 
     proc = subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR))
     walk_session = WalkSession(
@@ -1708,10 +2241,20 @@ def _walk_start_locked(body: WalkStartRequest):
         session_token=body.sessionToken,
         cloud_streaming=cloud_streaming,
         started_at=time.monotonic(),
+        policy_id=resolved.id if resolved else None,
+        mode=mode,
     )
     Thread(target=_monitor_walk, args=(walk_session,), daemon=True).start()
+    if resolved is not None:
+        # LRU stamp: the policy you are walking on is the last one you would want evicted.
+        get_policy_store().mark_used(resolved.id)
 
-    return {"success": True, "pid": proc.pid}
+    return {
+        "success": True,
+        "pid": proc.pid,
+        "policyId": resolved.id if resolved else None,
+        "mode": mode,
+    }
 
 
 @app.post("/api/walk/stop")
@@ -2006,6 +2549,83 @@ def send_commands(req: CommandRequest):
             json.dump(data, f)
         os.replace(tmp_path, COMMAND_FILE)
     return {"success": True}
+
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+#
+# Implements the open TODO at the bottom of checklist.md ("Make a script that goes
+# through all this automatically"). It reports; it never decides whether a walk may
+# start. That call belongs to whoever is starting the walk.
+
+last_preflight: dict | None = None  # last result, so a client can re-read without re-running
+
+
+def get_feet_contacts():
+    """Lazy foot-switch reader, or None when this machine has no GPIO.
+
+    Not a singleton: FeetContacts holds two DigitalInOut pins and the walk subprocess
+    constructs its own, so preflight opens and closes its own short-lived reader rather
+    than holding pins a walk will want.
+    """
+    try:
+        from mini_bdx_runtime.feet_contacts import FeetContacts
+
+        return FeetContacts()
+    except Exception as e:
+        print(f"[preflight] foot switches unavailable: {e}")
+        return None
+
+
+@app.post("/api/preflight")
+def run_preflight_endpoint():
+    """Check joints, calibration offsets, IMU orientation and foot switches."""
+    global last_preflight
+
+    # The walk subprocess owns both the serial bus and the I2C while it runs.
+    refuse_while_walking()
+
+    try:
+        hwi = get_hwi()
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"Cannot connect to motor controller: {e}"
+        )
+
+    try:
+        imu = get_state_imu()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Cannot open the IMU: {e}")
+
+    feet = get_feet_contacts()
+    try:
+        report = preflight.run_preflight(hwi, imu, feet, hwi.duck_config)
+    finally:
+        # Release the pins immediately — a walk started right after preflight needs them.
+        if feet is not None:
+            try:
+                feet.stop()
+            except Exception:
+                pass
+
+    last_preflight = report.as_dict()
+    telemetry.capture(
+        "preflight_run",
+        {
+            "ok": report.ok,
+            # Which checks failed, never the values they read.
+            "failed": [c.name for c in report.checks if not c.ok],
+            "duration_ms": report.duration_ms,
+        },
+    )
+    return last_preflight
+
+
+@app.get("/api/preflight")
+def read_preflight():
+    """The last preflight result, or nulls if none has run this boot."""
+    if last_preflight is None:
+        return {"ok": None, "checks": [], "duration_ms": 0}
+    return last_preflight
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

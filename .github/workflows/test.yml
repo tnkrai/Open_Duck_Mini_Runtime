@@ -1,10 +1,15 @@
 name: Tests
 
+# v2 first, because v2 is the default branch and where everything actually
+# lands. This used to say `[v3]` alone, which meant the suite had never run on
+# a single v2 pull request -- v3 has been dormant since June and is 40 commits
+# behind. A green PR into v2 was green because nothing checked it.
+#
+# v3 stays listed rather than being removed: it still holds two commits that
+# are not in v2, so it is dormant, not provably dead, and listing it costs
+# nothing.
 on:
   push:
-    # v2 is origin/HEAD and the branch scripts/setup.sh git-pulls onto real ducks,
-    # so it is what the fleet actually runs -- but it was not tested. A PR into v2
-    # ran zero jobs. v3 kept for whatever is being developed there.
     branches: [v2, v3]
   pull_request:
     branches: [v2, v3]

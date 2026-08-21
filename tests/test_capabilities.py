@@ -32,7 +32,7 @@ class FakeRoute:
 # Every name this repo has ever shipped. ADD to this list; never edit or remove an entry.
 # A name that leaves this list has been broken for every Studio already installed.
 SHIPPED_CAPABILITIES = frozenset(
-    {"preflight", "policy.list", "policy.install", "policy.select"}
+    {"preflight", "policy.list", "policy.install", "policy.select", "bench"}
 )
 
 

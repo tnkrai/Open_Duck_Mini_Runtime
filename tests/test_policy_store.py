@@ -845,6 +845,17 @@ def api_install(api, onnx_specs, monkeypatch, policy_id="9f2a", **kwargs):
     )
 
 
+def bench_passed(policy_id="9f2a", reason="watched on the bench by this test"):
+    """Clear story 4.3's first-run gate for one policy.
+
+    Free walking a policy this robot has never watched is a refusal, so every test below
+    that starts a walk on a custom policy has to say that somebody watched it -- otherwise
+    it would be asserting the gate rather than what it means to assert. Called explicitly
+    rather than folded into ``api_install`` so it is visible which tests depend on it.
+    """
+    tnkr_server.get_policy_store().mark_bench(policy_id, True, reason)
+
+
 def test_get_policy_on_a_fresh_robot(api):
     body = api.get("/api/policy").json()
     assert body["active"] == BUILTIN_ID
@@ -906,6 +917,7 @@ def test_reverting_works_while_a_walk_is_running(api, onnx_specs, monkeypatch, c
         tnkr_server.POLICY_ROOT / "9f2a" / "model.onnx", obs_dim=OBS_DIM, act_dim=ACT_DIM
     )
     api.post("/api/policy/select", json={"id": "9f2a"})
+    bench_passed()
     monkeypatch.setattr(tnkr_server.platform, "machine", lambda: "aarch64")
     write_walk_script(tnkr_server.SCRIPTS_DIR, "import time; time.sleep(30)\n")
     assert api.post("/api/walk/start", json={}).status_code == 200
@@ -1003,6 +1015,7 @@ def test_a_policy_installed_from_the_store_comes_out_armed(
         tnkr_server.POLICY_ROOT / "9f2a" / "model.onnx", obs_dim=OBS_DIM, act_dim=ACT_DIM
     )
     spawning.post("/api/policy/select", json={"id": "9f2a"})
+    bench_passed()
 
     assert spawning.post("/api/walk/start", json={}).status_code == 200
     argv = spawned_argv(tnkr_server.SCRIPTS_DIR)
@@ -1032,6 +1045,7 @@ def test_the_builtin_still_comes_out_unarmed(spawning):
 
 def test_walk_start_can_be_told_which_policy(spawning, onnx_specs, monkeypatch):
     api_install(spawning, onnx_specs, monkeypatch, policy_id="1c04")
+    bench_passed("1c04")
 
     assert (
         spawning.post("/api/walk/start", json={"policyId": "1c04"}).status_code == 200
@@ -1091,6 +1105,7 @@ def test_a_stale_policy_id_does_not_break_an_idempotent_retry(spawning, onnx_spe
     not need, which is exactly what a Studio tab retrying with its own stale list sends.
     """
     api_install(spawning, onnx_specs, monkeypatch)
+    bench_passed()
     assert (
         spawning.post(
             "/api/walk/start", json={"sessionToken": "sess-1", "policyId": "9f2a"}
@@ -1151,6 +1166,7 @@ def test_walking_stamps_the_policy_as_used(spawning, onnx_specs, monkeypatch):
     """LRU is what decides eviction, and the policy you are walking on is the last one you
     would want deleted."""
     api_install(spawning, onnx_specs, monkeypatch)
+    bench_passed()
     marker = tnkr_server.POLICY_ROOT / "9f2a" / policy_store.USED_FILENAME
     stale = time.time() - 9999
     os.utime(marker, (stale, stale))
@@ -1168,6 +1184,7 @@ def test_the_running_policy_is_protected_from_eviction_through_the_api(
     knows which policy the walk process has open."""
     for policy_id in ("aaa", "bbb", "ccc"):
         api_install(spawning, onnx_specs, monkeypatch, policy_id=policy_id)
+    bench_passed("aaa")
     marker = tnkr_server.POLICY_ROOT / "aaa" / policy_store.USED_FILENAME
     stale = time.time() - 9999
 

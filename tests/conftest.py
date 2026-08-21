@@ -15,6 +15,7 @@ below declares what graph a given .onnx path presents, which is how the contract
 check that guards the servos gets tested without a 50 MB native wheel in CI.
 """
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ sys.path.insert(0, str(REPO_ROOT / "mini_bdx_runtime"))
 import onnxruntime as onnxruntime_double  # noqa: E402  (tests/stubs, not the wheel)
 import pytest  # noqa: E402
 
+from mini_bdx_runtime import bench  # noqa: E402
 from mini_bdx_runtime import policy_store  # noqa: E402
 from mini_bdx_runtime import telemetry  # noqa: E402
 from mini_bdx_runtime.policy_contract import ACT_DIM, OBS_DIM, OBS_INPUT_NAME  # noqa: E402
@@ -97,6 +99,20 @@ def _no_network_fetch(url, dest, **kwargs):
         f"tests never fetch over the network (asked for {policy_store.redact_url(url)}); "
         "install a fake via monkeypatch.setattr(tnkr_server, 'POLICY_FETCH', ...)"
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_bench_files(tmp_path, monkeypatch):
+    """Point the bench's stop flag and report at this test's directory, for every test.
+
+    Autouse because the defaults are ``/dev/shm`` (or the system temp dir) -- shared with
+    every other test in the session, with a developer's own duck server, and with a real
+    bench report if one happens to be sitting there. A report leaking between tests would
+    be read as "a bench run just finished" by whichever test looked next, and the verdict
+    endpoint would accept it.
+    """
+    monkeypatch.setattr(bench, "STOP_FILE", str(tmp_path / "bench_stop"))
+    monkeypatch.setattr(bench, "REPORT_FILE", str(tmp_path / "bench_report.json"))
 
 
 @pytest.fixture(autouse=True)
@@ -285,6 +301,23 @@ def write_walk_script(d, body):
             "monkeypatch tnkr_server.SCRIPTS_DIR onto a tmp_path first"
         )
     (d / "v2_rl_walk_mujoco.py").write_text(body)
+
+
+def spawned_argv_or_none(scripts_dir, settle_s=0.3):
+    """The argv a stand-in walk script recorded, or ``None`` if nothing ran.
+
+    The negative of ``spawned_argv``: proving a refusal started NO process needs a short
+    wait, because "the file is not there yet" and "no process was spawned" look identical
+    for the first few milliseconds.
+    """
+    time.sleep(settle_s)
+    path = Path(scripts_dir) / "argv.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except ValueError:
+        return None
 
 
 def wait_for_walk_ended(captured, count=1, timeout=10.0):

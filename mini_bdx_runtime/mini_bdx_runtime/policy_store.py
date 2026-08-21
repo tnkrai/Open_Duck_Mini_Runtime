@@ -11,6 +11,7 @@ Layout on disk
     `-- 9f2a.../
         |-- model.onnx             # the verified artifact
         |-- manifest.json          # what it claims + what we measured
+        |-- bench.json             # the operator's verdict on its supervised first run
         `-- last_used              # empty; its mtime is the LRU key
 
 Why the built-in is a resolution and not a copy
@@ -89,6 +90,7 @@ BUILTIN_ID: str = "builtin"
 
 MODEL_FILENAME: str = "model.onnx"
 MANIFEST_FILENAME: str = "manifest.json"
+BENCH_FILENAME: str = "bench.json"
 ACTIVE_FILENAME: str = "active"
 USED_FILENAME: str = "last_used"
 
@@ -452,6 +454,127 @@ class PolicyStore:
         except OSError as exc:
             print(f"[policy_store] could not stamp {policy_id} as used: {exc}")
 
+    # ── the supervised bench run (story 4.3, Decision 10) ───────────────────────
+
+    def _read_bench(self, policy_dir: Path) -> dict:
+        try:
+            loaded = json.loads((policy_dir / BENCH_FILENAME).read_text())
+        except (OSError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def bench_status(self, policy_id: str | None) -> dict:
+        """Whether this policy has passed a supervised bench run **on this robot**.
+
+        Every unreadable, truncated, malformed or absent state answers the same way:
+        ``required: True, passed: None`` -- not benched. That direction is the whole
+        design. A pass is a claim that a person watched this policy move a real duck, and
+        the cost of getting it wrong is asymmetric: wrongly requiring a bench costs ten
+        seconds, wrongly skipping one puts an unwatched policy on a robot standing on its
+        own feet.
+
+        The built-in is exempt (Decision 11): it is the policy every duck sold has been
+        walking on, so gating it would be gating the robot's own factory behaviour.
+
+        A verdict is tied to the bytes it was given for. If the model's digest has changed
+        since the verdict -- a re-install of the same id with different content, or a file
+        swapped on disk -- the pass no longer describes what is installed, and this reports
+        not-benched rather than carrying the old verdict onto new weights.
+        """
+        wanted = (policy_id or BUILTIN_ID).strip() or BUILTIN_ID
+        if wanted == BUILTIN_ID:
+            return {
+                "id": BUILTIN_ID,
+                "exempt": True,
+                "required": False,
+                "passed": None,
+                "at": None,
+                "reason": "",
+            }
+
+        status = {
+            "id": wanted,
+            "exempt": False,
+            "required": True,
+            "passed": None,
+            "at": None,
+            "reason": "",
+        }
+        try:
+            candidate = validate_id(wanted)
+        except StoreError:
+            return status
+
+        recorded = self._read_bench(self.root / candidate)
+        if not recorded:
+            return status
+
+        passed = recorded.get("passed")
+        status["reason"] = str(recorded.get("reason") or "")
+        try:
+            status["at"] = round(float(recorded.get("at") or 0.0), 3) or None
+        except (TypeError, ValueError):
+            status["at"] = None
+
+        stamped = recorded.get("sha256")
+        current = self._read_manifest(self.root / candidate).get("sha256")
+        if isinstance(stamped, str) and isinstance(current, str) and stamped != current:
+            status["reason"] = "the model changed since that bench run"
+            return status
+
+        # `is True` and `is False`, not truthiness: a JSON file hand-edited to
+        # `"passed": "yes"` is a file whose verdict nobody can read, and the fail-closed
+        # answer to that is "not benched", not "passed".
+        if passed is True:
+            status["passed"] = True
+            status["required"] = False
+        elif passed is False:
+            status["passed"] = False
+        return status
+
+    def mark_bench(self, policy_id: str, passed: bool, reason: str = "") -> dict:
+        """Record the operator's verdict on a bench run. Returns the new status.
+
+        Persisted per policy id, beside the model, so the gate is imposed once rather than
+        every session -- and so it disappears with the policy when the policy is evicted.
+        The digest is stamped alongside the verdict, which is what lets ``bench_status``
+        notice that the file the verdict was about is no longer the file installed.
+
+        A verdict on the built-in is accepted and stored nowhere: benching it is allowed
+        (Decision 10 makes it optional, not forbidden) but it is never gated, so there is
+        nothing for a verdict to unlock.
+        """
+        wanted = (policy_id or "").strip()
+        if wanted in ("", BUILTIN_ID):
+            return self.bench_status(BUILTIN_ID)
+
+        candidate = validate_id(wanted)
+        policy_dir = self.root / candidate
+        if not (policy_dir / MODEL_FILENAME).is_file():
+            raise StoreError(
+                POLICY_INSTALL_FAILED,
+                f"policy {candidate!r} is not installed on this robot",
+            )
+
+        record = {
+            "passed": bool(passed),
+            "reason": str(reason or ""),
+            "at": round(self._now(), 3),
+            "sha256": self._read_manifest(policy_dir).get("sha256"),
+        }
+        temp = policy_dir / f".{BENCH_FILENAME}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        try:
+            temp.write_text(json.dumps(record, indent=2))
+            os.replace(temp, policy_dir / BENCH_FILENAME)
+        except OSError as exc:
+            temp.unlink(missing_ok=True)
+            raise StoreError(
+                POLICY_INSTALL_FAILED,
+                f"could not record the bench result for {candidate}: "
+                f"{exc.__class__.__name__}: {exc}",
+            ) from exc
+        return self.bench_status(candidate)
+
     def list(self) -> dict:
         """``{"active": id, "policies": [...]}`` -- cheap enough to poll.
 
@@ -473,6 +596,9 @@ class PolicyStore:
                 "lastUsedAt": None,
                 "manifest": None,
                 "active": active == BUILTIN_ID,
+                # Always exempt. Studio reads this to decide whether Walk needs a bench
+                # run first, and the built-in never does (story 4.3).
+                "bench": self.bench_status(BUILTIN_ID),
             }
         ]
         for entry in reversed(self._entries()):  # most recently used first
@@ -488,6 +614,7 @@ class PolicyStore:
                     "lastUsedAt": round(entry.last_used_at, 3),
                     "manifest": entry.manifest or None,
                     "active": entry.id == active,
+                    "bench": self.bench_status(entry.id),
                 }
             )
         return {

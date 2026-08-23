@@ -45,6 +45,15 @@ from mini_bdx_runtime import telemetry
 from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
 from mini_bdx_runtime import walk_offsets
+from mini_bdx_runtime.pad import (
+    disconnect_pad,
+    forget_pad,
+    joystick_present,
+    pair_pad,
+    pad_status,
+    scan_pad,
+    walk_flags,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1594,6 +1603,8 @@ class WalkStartRequest(BaseModel):
     sessionToken: str | None = None
     supabaseUrl: str | None = None
     supabaseKey: str | None = None
+    # Who steers this walk. Omitted (old Studio / dashboard) means keyboard.
+    input: str | None = None
 
 
 @app.post("/api/walk/start")
@@ -1652,13 +1663,18 @@ def _walk_start_locked(body: WalkStartRequest):
             )
         onnx_path = str(onnx_files[0])
         walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
+        walk_input = body.input or "keyboard"
+        if walk_input == "pad" and not joystick_present():
+            raise HTTPException(
+                status_code=409,
+                detail="PAD_NOT_FOUND: no joystick",
+            )
 
         cmd = [
             venv_python,
             walk_script,
             "--onnx_model_path", onnx_path,
-            "--remote",
-            "--commands",
+            *walk_flags(walk_input),
         ]
         if body.sessionToken:
             cmd.extend(["--cloud_channel", f"robot-telemetry-{body.sessionToken}"])
@@ -1712,6 +1728,47 @@ def _walk_start_locked(body: WalkStartRequest):
     Thread(target=_monitor_walk, args=(walk_session,), daemon=True).start()
 
     return {"success": True, "pid": proc.pid}
+
+
+class PadPairRequest(BaseModel):
+    address: str | None = None
+
+
+@app.get("/api/pad")
+def get_pad():
+    return pad_status()
+
+
+@app.post("/api/pad/scan")
+def post_pad_scan():
+    return scan_pad()
+
+
+@app.post("/api/pad/pair")
+def post_pad_pair(body: PadPairRequest = PadPairRequest()):
+    try:
+        result = pair_pad(body.address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not result.get("connected"):
+        raise HTTPException(status_code=409, detail="PAD_PAIR_FAILED: did not bond")
+    return result
+
+
+@app.post("/api/pad/disconnect")
+def post_pad_disconnect(body: PadPairRequest = PadPairRequest()):
+    try:
+        return disconnect_pad(body.address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pad/forget")
+def post_pad_forget(body: PadPairRequest = PadPairRequest()):
+    try:
+        return forget_pad(body.address)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/walk/stop")

@@ -4,6 +4,7 @@ from queue import Queue
 import time
 import numpy as np
 from mini_bdx_runtime.buttons import Buttons
+from mini_bdx_runtime.pad import SILENCE_S, should_zero_commands
 
 
 X_RANGE = [-0.15, 0.15]
@@ -40,8 +41,20 @@ class XBoxController:
         self.RB_pressed = False
 
         self.buttons = Buttons()
+        self._last_ok = time.monotonic()
 
         Thread(target=self.commands_worker, daemon=True).start()
+
+    def _joystick_alive(self) -> bool:
+        try:
+            if pygame.joystick.get_count() < 1:
+                return False
+            if not self.p1.get_init():
+                return False
+            self.p1.get_axis(0)
+            return True
+        except Exception:
+            return False
 
     def commands_worker(self):
         while True:
@@ -52,6 +65,27 @@ class XBoxController:
         last_commands = self.last_commands
         left_trigger = self.last_left_trigger
         right_trigger = self.last_right_trigger
+
+        now = time.monotonic()
+        alive = self._joystick_alive()
+        if should_zero_commands(alive, self._last_ok, now, SILENCE_S):
+            self.last_commands = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            self.last_left_trigger = 0.0
+            self.last_right_trigger = 0.0
+            return (
+                np.around(self.last_commands, 3),
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                0.0,
+                0.0,
+                0,
+            )
+        if alive:
+            self._last_ok = now
 
         l_x = -1 * self.p1.get_axis(0)
         l_y = -1 * self.p1.get_axis(1)

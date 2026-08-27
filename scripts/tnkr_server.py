@@ -46,6 +46,7 @@ from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
 from mini_bdx_runtime import walk_offsets
 from mini_bdx_runtime.pad import (
+    adapter_state,
     disconnect_pad,
     forget_pad,
     joystick_present,
@@ -1664,7 +1665,17 @@ def _walk_start_locked(body: WalkStartRequest):
         onnx_path = str(onnx_files[0])
         walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
         walk_input = body.input or "keyboard"
+        # Which device is driving. Absent until now, which meant the one
+        # question worth asking about the controller -- did anyone ever manage
+        # to drive with it -- could not be answered from the data at all.
+        add_telemetry_props(walk_input=walk_input)
         if walk_input == "pad" and not joystick_present():
+            # The pad was chosen and the stick is not there. Say whether the
+            # radio is the reason, so this does not read as a flat battery.
+            # From the cache, not a fresh probe: Studio polls /api/pad the whole
+            # time its pair step is open, so this is current, and a walk start
+            # is the wrong place to spend two subprocess spawns.
+            add_telemetry_props(adapter_reason=_last_adapter_reason())
             raise HTTPException(
                 status_code=409,
                 detail="PAD_NOT_FOUND: no joystick",
@@ -1734,23 +1745,93 @@ class PadPairRequest(BaseModel):
     address: str | None = None
 
 
+#: "we have not looked yet". A distinct sentinel because None is a real reason
+#: value here -- it means the adapter is fine -- and the first observation of a
+#: healthy radio is not a change worth an event.
+_PAD_ADAPTER_UNSEEN = object()
+_pad_adapter_reason = _PAD_ADAPTER_UNSEEN
+
+
+def _last_adapter_reason() -> str:
+    """The radio's state as of the last pad call, without touching the radio."""
+    if _pad_adapter_reason is _PAD_ADAPTER_UNSEEN:
+        return "unknown"
+    return _pad_adapter_reason or "ok"
+
+
+def _note_pad(status: dict) -> dict:
+    """Attach the radio's state to this request, and announce a change once.
+
+    Every pad route returns through here, so `api_request_completed` carries
+    `adapter_reason` for the whole pad surface. That property is the one that
+    was missing: an empty `Nearby` list is ordinary, an empty list on a blocked
+    radio is a bug report, and until now both arrived as the same silence.
+
+    The dedicated event is transition-gated on purpose. Studio re-scans every
+    couple of seconds while its pair step is open, and a per-poll event would
+    turn one stuck operator into thousands of rows saying the same thing.
+    """
+    global _pad_adapter_reason
+    adapter = status.get("adapter") or {}
+    reason = adapter.get("reason")
+    add_telemetry_props(
+        adapter_present=bool(adapter.get("present")),
+        adapter_powered=bool(adapter.get("powered")),
+        adapter_blocked=bool(adapter.get("blocked")),
+        adapter_hard_blocked=bool(adapter.get("hardBlocked")),
+        adapter_reason=reason or "ok",
+        # Which escalation step woke the radio, and BlueZ's own sentence when
+        # none of them did. `woke_via` is the property that answers "why did the
+        # shipped power-on not work" without anyone having to reproduce it.
+        adapter_woke_via=adapter.get("wokeVia") or "none",
+        adapter_wake_error=adapter.get("wakeError"),
+        pad_devices=len(status.get("devices") or []),
+        pad_connected=bool(status.get("connected")),
+    )
+    if reason != _pad_adapter_reason:
+        previous = _pad_adapter_reason
+        _pad_adapter_reason = reason
+        first_look = previous is _PAD_ADAPTER_UNSEEN
+        if not (first_look and reason is None):
+            telemetry.capture(
+                "pad_adapter_changed",
+                {
+                    "reason": reason or "ok",
+                    "previous": None if first_look else (previous or "ok"),
+                    "woke_via": adapter.get("wokeVia") or "none",
+                    "wake_error": adapter.get("wakeError"),
+                },
+            )
+    return status
+
+
 @app.get("/api/pad")
 def get_pad():
-    return pad_status()
+    return _note_pad(pad_status())
 
 
 @app.post("/api/pad/scan")
 def post_pad_scan():
-    return scan_pad()
+    return _note_pad(scan_pad())
 
 
 @app.post("/api/pad/pair")
 def post_pad_pair(body: PadPairRequest = PadPairRequest()):
     try:
-        result = pair_pad(body.address)
+        result = _note_pad(pair_pad(body.address))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not result.get("connected"):
+        # Name the radio when the radio is why. PAD_PAIR_FAILED sends the
+        # operator back to the sync button, which is the wrong button when the
+        # adapter is blocked -- that was the whole of the 30 minutes this
+        # endpoint used to cost.
+        adapter = result.get("adapter") or {}
+        if adapter.get("reason"):
+            raise HTTPException(
+                status_code=409,
+                detail="PAD_RADIO_OFF: bluetooth adapter %s" % adapter["reason"],
+            )
         raise HTTPException(status_code=409, detail="PAD_PAIR_FAILED: did not bond")
     return result
 
@@ -1758,7 +1839,7 @@ def post_pad_pair(body: PadPairRequest = PadPairRequest()):
 @app.post("/api/pad/disconnect")
 def post_pad_disconnect(body: PadPairRequest = PadPairRequest()):
     try:
-        return disconnect_pad(body.address)
+        return _note_pad(disconnect_pad(body.address))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1766,9 +1847,15 @@ def post_pad_disconnect(body: PadPairRequest = PadPairRequest()):
 @app.post("/api/pad/forget")
 def post_pad_forget(body: PadPairRequest = PadPairRequest()):
     try:
-        return forget_pad(body.address)
+        return _note_pad(forget_pad(body.address))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/pad/adapter")
+def get_pad_adapter():
+    """The radio alone, with no device scan. Cheap enough for a health check."""
+    return _note_pad({"adapter": adapter_state(), "devices": [], "connected": False})
 
 
 @app.post("/api/walk/stop")

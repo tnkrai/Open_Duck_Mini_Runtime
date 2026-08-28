@@ -222,6 +222,15 @@ Ownership is decided by Tnkr's backend, which does verify who is asking. With
 telemetry off, that endpoint reports `{"enabled": false}` and withholds the id,
 so opting out here also stops the robot from being linked to any account.
 
+**This robot's id is not the only one.** `tnkr`, the command-line tool that put
+this software on the robot, keeps its own anonymous id on the computer you ran
+it from, and Studio links that one to your account at sign-in too. It is a
+separate id with a separate switch, and turning telemetry off here does not
+affect it — it lives in `~/.tnkr/telemetry.json` on your computer, and what it
+sends is listed in
+[the CLI's telemetry page](https://github.com/tnkrai/tnkr-cli/blob/main/docs/telemetry.md).
+Three anonymous ids in a kit: this robot's, Studio's, and the installer's.
+
 ### Turning it off
 
 Either of these works, any time:

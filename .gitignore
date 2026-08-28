@@ -6,3 +6,5 @@ mini_bdx_runtime.egg-info/
 build
 dist
 .venv/
+# macOS Finder metadata
+.DS_Store

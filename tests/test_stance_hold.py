@@ -17,6 +17,9 @@ class FakeHWI:
         self.init_pos = {"left_hip_pitch": -0.63, "right_knee": 1.379}
         self.turned_off = False
 
+    def close(self):
+        pass
+
     def turn_off(self):
         self.turned_off = True
 

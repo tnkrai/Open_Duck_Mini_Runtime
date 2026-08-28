@@ -1,9 +1,20 @@
 import time
+from functools import wraps
+from threading import RLock
 
 import numpy as np
 import rustypot
 import serial.tools.list_ports
 from mini_bdx_runtime.duck_config import DuckConfig
+
+# Exclusive owner of the servo USB adapter. rustypot wraps the serial port in
+# a Rust Mutex and `unwrap()`s it; a panic while holding that mutex poisons
+# every later call (PyO3 PanicException / PoisonError). The same adapter is
+# also opened by pypot (voltage, rehome). One lock, one owner, or the bus
+# double-opens and the rustypot object is dead until process restart.
+BUS_LOCK = RLock()
+_SERVO_BAUD = 1_000_000
+_INTERRUPT = (KeyboardInterrupt, SystemExit, GeneratorExit)
 
 # USB vendor IDs for the servo-bus adapters we ship. The bus adapter is the
 # only USB-serial device on the robot, so matching the chip vendor uniquely
@@ -43,6 +54,28 @@ def find_servo_adapter() -> tuple[str, str]:
 def find_servo_port() -> str:
     """Back-compat wrapper around find_servo_adapter()."""
     return find_servo_adapter()[0]
+
+
+def is_rust_panic(exc: BaseException) -> bool:
+    """True for a PyO3 PanicException (subclass of BaseException, not Exception).
+
+    rustypot `lock().unwrap()` after a poisoned mutex surfaces as this, so
+    `except Exception` in callers never sees it — FastAPI then 500s with
+    Starlette's 'No response returned'.
+    """
+    if isinstance(exc, _INTERRUPT):
+        return False
+    name = type(exc).__name__
+    return name == "PanicException" or "PoisonError" in str(exc)
+
+
+def _with_bus_lock(fn):
+    @wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        with BUS_LOCK:
+            return fn(self, *args, **kwargs)
+
+    return wrapped
 
 
 class HWI:
@@ -117,7 +150,8 @@ class HWI:
         self.servo_adapter_chip: str | None = None
         if usb_port is None:
             usb_port, self.servo_adapter_chip = find_servo_adapter()
-        self.io = rustypot.feetech(usb_port, 1000000)
+        self._usb_port = usb_port
+        self.io = rustypot.feetech(usb_port, _SERVO_BAUD)
 
     # CH343/cdc_acm has no latency-timer knob, so single-servo transactions
     # occasionally time out, and a brief bus voltage sag (e.g. on high-KP
@@ -126,24 +160,70 @@ class HWI:
     _IO_ATTEMPTS = 3
     _IO_RETRY_DELAY = 0.02
 
+    def close(self):
+        """Drop the rustypot handle so the serial port is actually freed.
+
+        Setting the server's HWI singleton to None is not enough: another
+        thread can still hold a reference, and rustypot's background controller
+        keeps the fd open until the pyclass is dropped. Voltage/rehome open
+        pypot on the same adapter; overlapping handles garbles the bus and
+        panics rustypot's mutex.
+        """
+        old = getattr(self, "io", None)
+        self.io = None
+        try:
+            del old
+        except BaseException:
+            pass
+
+    def _reopen_io(self):
+        """Replace a poisoned rustypot controller with a fresh serial handle."""
+        self.close()
+        self.io = rustypot.feetech(self._usb_port, _SERVO_BAUD)
+
     def _io_retry(self, fn, joint_name, op):
         """Run a single-servo io op, retrying transient OSErrors and naming
-        the joint (and id) if it ultimately fails."""
+        the joint (and id) if it ultimately fails.
+
+        A rustypot PanicException (poisoned mutex) is not an OSError and is
+        not a subclass of Exception. Treat it as a dead controller: drop it,
+        reopen the port, retry. Remaining panics become OSError so callers'
+        `except Exception` actually runs.
+        """
         last_exc = None
         for attempt in range(self._IO_ATTEMPTS):
             try:
+                if self.io is None:
+                    self._reopen_io()
                 return fn()
             except OSError as e:
                 last_exc = e
-                if attempt + 1 < self._IO_ATTEMPTS:
+            except BaseException as e:
+                if not is_rust_panic(e):
+                    raise
+                last_exc = OSError(f"{op} rust panic: {e}")
+                print(
+                    f"[HWI] {op} rustypot panic for '{joint_name}' "
+                    f"(id {self.joints.get(joint_name, '?')}), reopening serial: {e}"
+                )
+                try:
+                    self._reopen_io()
+                except BaseException as reopen_err:
+                    raise OSError(
+                        f"{op} failed for '{joint_name}' "
+                        f"(id {self.joints.get(joint_name, '?')}): rustypot panicked "
+                        f"and reopen failed: {reopen_err}"
+                    ) from reopen_err
+            if attempt + 1 < self._IO_ATTEMPTS:
+                if isinstance(last_exc, OSError) and "rust panic" not in str(last_exc):
                     print(
                         f"[HWI] {op} timed out for '{joint_name}' "
-                        f"(id {self.joints[joint_name]}), "
-                        f"retry {attempt + 1}/{self._IO_ATTEMPTS - 1}: {e}"
+                        f"(id {self.joints.get(joint_name, '?')}), "
+                        f"retry {attempt + 1}/{self._IO_ATTEMPTS - 1}: {last_exc}"
                     )
-                    time.sleep(self._IO_RETRY_DELAY)
+                time.sleep(self._IO_RETRY_DELAY)
         raise OSError(
-            f"{op} failed for '{joint_name}' (id {self.joints[joint_name]}) "
+            f"{op} failed for '{joint_name}' (id {self.joints.get(joint_name, '?')}) "
             f"after {self._IO_ATTEMPTS} attempts: {last_exc}"
         )
 
@@ -154,19 +234,23 @@ class HWI:
         for name, id, kp in zip(self.joints.keys(), self.joints.values(), kps):
             self._io_retry(lambda i=id, k=kp: self.io.set_kps([i], [k]), name, "set_kps")
 
+    @_with_bus_lock
     def set_kps(self, kps):
         self.kps = kps
         self._write_kps(self.kps)
 
+    @_with_bus_lock
     def set_kds(self, kds):
         self.kds = kds
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
         for name, id, kd in zip(self.joints.keys(), self.joints.values(), self.kds):
             self._io_retry(lambda i=id, k=kd: self.io.set_kds([i], [k]), name, "set_kds")
 
+    @_with_bus_lock
     def set_kp(self, id, kp):
-        self.io.set_kps([id], [kp])
+        self._io_retry(lambda: self.io.set_kps([id], [kp]), f"id:{id}", "set_kps")
 
+    @_with_bus_lock
     def turn_on(self):
         self._write_kps(self.low_torque_kps)
         print("turn on : low KPS set")
@@ -180,11 +264,13 @@ class HWI:
         self._write_kps(self.kps)
         print("turn on : high kps")
 
+    @_with_bus_lock
     def turn_off(self):
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
         for name, id in self.joints.items():
             self._io_retry(lambda i=id: self.io.disable_torque([i]), name, "disable_torque")
 
+    @_with_bus_lock
     def set_position(self, joint_name, pos):
         """
         pos is in radians
@@ -197,6 +283,7 @@ class HWI:
             "write_goal_position",
         )
 
+    @_with_bus_lock
     def set_position_all(self, joints_positions):
         """
         joints_positions is a dictionary with joint names as keys and joint positions as values
@@ -212,6 +299,7 @@ class HWI:
                 "write_goal_position",
             )
 
+    @_with_bus_lock
     def get_present_positions(self, ignore=[]):
         """
         Returns the present positions in radians
@@ -238,6 +326,51 @@ class HWI:
         ]
         return np.array(np.around(present_positions, 3))
 
+    @_with_bus_lock
+    def get_present_position(self, joint_name):
+        """Present position of ONE joint, in radians, offset-corrected.
+
+        `get_present_positions()` reads all fourteen and returns None if ANY of them
+        fails, which is right for the walk loop (it needs the whole vector or nothing)
+        and wrong for anything working on a single joint: a silent joint 3 makes a read
+        for joint 7 fail, with no way left to say which joint was actually quiet.
+        Per-joint calibration needs the failure attributable, so this reads one servo
+        and lets `_io_retry`'s OSError through — that message names the joint and its
+        id. Callers turn it into a message about that joint.
+
+        Offset-corrected like the plural version, so the two cannot disagree about what
+        "position" means. `.get(..., 0.0)` rather than `[...]` because a hand-edited
+        duck_config.json can carry a partial joints_offsets dict, and a KeyError here
+        would read as a dead servo.
+        """
+        joint_id = self.joints[joint_name]
+        raw = self._io_retry(
+            lambda: self.io.read_present_position([joint_id])[0],
+            joint_name,
+            "read_present_position",
+        )
+        return round(float(raw) - self.joints_offsets.get(joint_name, 0.0), 3)
+
+    @_with_bus_lock
+    def set_joint_torque(self, joint_name, enabled):
+        """Torque on or off for ONE joint, retried, locked, and attributable.
+
+        The HWI had no single-joint torque call, so callers reached through to
+        `hwi.io.disable_torque([id])` directly. That bypasses three things at once: the
+        bus lock (so a concurrent /api/state read can garble the write), `_io_retry`
+        (so a transient timeout is a hard failure instead of one of three attempts),
+        and the panic normalisation inside it (so a rustypot PanicException — a
+        BaseException — escapes past every `except Exception` and kills the ASGI task).
+        """
+        joint_id = self.joints[joint_name]
+        op = "enable_torque" if enabled else "disable_torque"
+        self._io_retry(
+            lambda: (self.io.enable_torque if enabled else self.io.disable_torque)([joint_id]),
+            joint_name,
+            op,
+        )
+
+    @_with_bus_lock
     def get_present_velocities(self, rad_s=True, ignore=[]):
         """
         Returns the present velocities in rad/s (default) or rev/min

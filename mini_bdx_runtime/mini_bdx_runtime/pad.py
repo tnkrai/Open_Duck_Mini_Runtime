@@ -12,14 +12,12 @@ for request type 2". We drive an interactive `bluetoothctl` over a PTY with
 
 from __future__ import annotations
 
-import glob
 import os
 import pty
 import re
 import select
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 _MAC = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
@@ -68,17 +66,6 @@ def should_zero_commands(alive: bool, last_ok: float, now: float, silence_s: flo
 
 
 def joystick_present() -> bool:
-    """Is a joystick attached right now?
-
-    Checks the device nodes first. `import pygame; pygame.init()` costs about two
-    seconds on a Pi Zero 2W -- measured, it is the whole of the unaccounted time
-    in a connect -- and a bonded pad always shows up as /dev/input/js0. pygame
-    stays as the fallback so a controller that somehow has no js node still
-    answers the way it always did; that path is the one where the pad is missing,
-    and two seconds spent proving a negative costs nobody anything.
-    """
-    if glob.glob("/dev/input/js*"):
-        return True
     try:
         import pygame
 
@@ -434,32 +421,6 @@ def _device_dict(addr: str, listed_name: str, info: dict) -> dict:
     }
 
 
-#: How many `bluetoothctl info` calls to have in flight at once. Each is a
-#: process spawn and a D-Bus read, ~0.17s on a Pi Zero 2W, and they do not
-#: contend: the cost of an enumeration is then one round trip rather than one
-#: per device. Capped so a radio with a hundred cached devices does not fork a
-#: hundred processes on a 512MB board.
-_INFO_WORKERS = 8
-
-
-def _info_many(addresses: list[str]) -> dict[str, dict]:
-    """`_info_fields` for several devices at once, keyed by address.
-
-    Serial, this was the single biggest cost in the whole pad surface. A duck
-    that has ever seen nine devices paid nine spawns per enumeration and ran two
-    enumerations per operation, so two thirds of a disconnect was spent reading
-    devices that were then filtered out for not being controllers. That cost grew
-    with every phone and laptop the radio had ever noticed, which is not
-    something an operator should have to know about, let alone prune.
-    """
-    if not addresses:
-        return {}
-    if len(addresses) == 1:
-        return {addresses[0]: _info_fields(addresses[0])}
-    with ThreadPoolExecutor(max_workers=min(_INFO_WORKERS, len(addresses))) as pool:
-        return dict(zip(addresses, pool.map(_info_fields, addresses)))
-
-
 def list_xbox_devices() -> list[dict]:
     """Every Xbox-like device bluetoothctl currently knows about."""
     try:
@@ -469,13 +430,10 @@ def list_xbox_devices() -> list[dict]:
     except subprocess.TimeoutExpired:
         return []
 
-    parsed = _parse_devices(listed.stdout)
-    infos = _info_many([addr for addr, _ in parsed])
-
     devices: list[dict] = []
     seen: set[str] = set()
-    for addr, listed_name in parsed:
-        info = infos[addr]
+    for addr, listed_name in _parse_devices(listed.stdout):
+        info = _info_fields(addr)
         name = str(info["name"] or listed_name or addr)
         icon = str(info["icon"] or "")
         if not is_controller_device(name=name, icon=icon):
@@ -488,10 +446,10 @@ def list_xbox_devices() -> list[dict]:
         paired_listed = _bt("devices", "Paired")
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return devices
-    unseen = [(a, n) for a, n in _parse_devices(paired_listed.stdout) if a.upper() not in seen]
-    paired_infos = _info_many([addr for addr, _ in unseen])
-    for addr, listed_name in unseen:
-        info = paired_infos[addr]
+    for addr, listed_name in _parse_devices(paired_listed.stdout):
+        if addr.upper() in seen:
+            continue
+        info = _info_fields(addr)
         name = str(info["name"] or listed_name or addr)
         icon = str(info["icon"] or "")
         if not is_controller_device(name=name, icon=icon):
@@ -638,13 +596,9 @@ def _resolve_address(
 ) -> tuple[Optional[str], dict]:
     if address and not valid_address(address):
         raise ValueError(f"invalid pad address: {address}")
-    if address:
-        # The caller already knows which controller it means -- every press in
-        # Studio comes off a device row. Enumerating the whole radio here only to
-        # return a status that every caller then re-reads at the end was a full
-        # extra pass, and on a Pi it was the second-largest cost of a disconnect.
-        return address, _status_from_devices([], adapter)
     status = pad_status(adapter)
+    if address:
+        return address, status
     if not status["present"]:
         scanned = scan_pad()
         if not scanned["present"]:

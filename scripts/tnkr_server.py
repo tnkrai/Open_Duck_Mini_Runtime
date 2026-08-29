@@ -46,13 +46,13 @@ from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
 from mini_bdx_runtime import walk_offsets
 from mini_bdx_runtime.pad import (
-    adapter_state,
     disconnect_pad,
     forget_pad,
     joystick_present,
     pair_pad,
     pad_status,
     scan_pad,
+    wake_adapter,
     walk_flags,
 )
 
@@ -1852,10 +1852,21 @@ def post_pad_forget(body: PadPairRequest = PadPairRequest()):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/pad/adapter")
-def get_pad_adapter():
-    """The radio alone, with no device scan. Cheap enough for a health check."""
-    return _note_pad({"adapter": adapter_state(), "devices": [], "connected": False})
+@app.post("/api/pad/adapter/on")
+def post_pad_adapter_on():
+    """Turn the radio on, because someone asked for it.
+
+    The only caller of `wake_adapter` in this process. Every other pad route
+    reads the radio and refuses when it is down, so this endpoint is the whole
+    of the escalation ladder\'s reach: an operator pressing Turn on.
+
+    It returns a full pad status rather than the adapter alone, so the caller
+    that just powered the radio up gets the device list of the room it can now
+    see, in the same round trip. The previous radio-only route returned a body
+    with no `present` key, which is not a PadStatus and which nothing ever
+    called; `GET /api/pad` already carries the adapter for anyone who wants it.
+    """
+    return _note_pad(pad_status(wake_adapter()))
 
 
 @app.post("/api/walk/stop")

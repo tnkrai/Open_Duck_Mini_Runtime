@@ -98,6 +98,12 @@ def _bt(*args: str, timeout: float = 12.0) -> subprocess.CompletedProcess[str]:
 # Pi OS image most often boots into. So the wake attempt has to unblock first,
 # and then it has to CHECK, because the useful output of this function is not
 # the side effect but the answer.
+#
+# The wake is `wake_adapter()` and NOTHING here calls it. Scanning, pairing,
+# disconnecting and forgetting all read the radio with `adapter_state()` and
+# refuse early when it is down. Powering a radio on is a thing the operator
+# asks for, on the one route that does it, so the screen can say the radio was
+# off before it changes it and can report what happened when it will not.
 
 #: `reason` on the adapter dict. Closed, and ordered by what the operator has to
 #: do about it: a hard block is a physical switch, a soft block is one command,
@@ -126,7 +132,7 @@ def _adapter_dict(*, present: bool, powered: bool, soft: bool, hard: bool) -> di
         "blocked": bool(soft or hard),
         "hardBlocked": bool(hard),
         "reason": reason,
-        # Filled in by _ensure_adapter_on. `wokeVia` is which escalation step
+        # Filled in by wake_adapter. `wokeVia` is which escalation step
         # actually worked, and `wakeError` is the sentence BlueZ printed when
         # none did -- the one string that turns "the pad never appeared" into a
         # diagnosis. A plain read leaves both unset.
@@ -284,8 +290,14 @@ def _power_on_via_pty() -> tuple[bool, str]:
     return worked, _first_failure(text)
 
 
-def _ensure_adapter_on() -> dict:
+def wake_adapter() -> dict:
     """Wake the radio, verify it, and say which step worked.
+
+    Called from exactly one place: `POST /api/pad/adapter/on`, which is the
+    operator pressing Turn on. It is deliberately not wired into scan or pair.
+    A radio that powers itself up behind the operator cannot be reported to
+    them, and the half hour that produced this file was spent on a screen that
+    was quietly retrying something it never mentioned.
 
     Three things can hold the adapter down and the old code could not tell them
     apart, because it ran one command, discarded the result and returned None:
@@ -477,15 +489,15 @@ def _status_from_devices(devices: list[dict], adapter: Optional[dict] = None) ->
 def pad_status(adapter: Optional[dict] = None) -> dict:
     """`{present, connected, name, address, devices, adapter}` as the Pi sees it.
 
-    Pass `adapter` when the caller has just run `_ensure_adapter_on`, so a poll
-    costs one `bluetoothctl show` rather than two.
+    Pass `adapter` when the caller has already read the radio this request, so
+    one call costs one `bluetoothctl show` rather than two.
     """
     return _status_from_devices(list_xbox_devices(), adapter)
 
 
 def scan_pad(timeout: float = _DEFAULT_SCAN_S) -> dict:
     """Look for controllers (README: bluetoothctl scan on), then return the list."""
-    adapter = _ensure_adapter_on()
+    adapter = adapter_state()
     if adapter["reason"] is not ADAPTER_OK:
         # Eighteen seconds spent scanning a radio that is off finds exactly
         # nothing, and to the operator that is indistinguishable from a
@@ -610,7 +622,7 @@ def _connect_bonded(address: str) -> None:
 
 def pair_pad(address: Optional[str] = None) -> dict:
     """pair → trust → connect for one controller (README steps), with a BlueZ agent."""
-    adapter = _ensure_adapter_on()
+    adapter = adapter_state()
     if adapter["reason"] is not ADAPTER_OK:
         return _status_from_devices([], adapter)
     # Studio's Nearby poll leaves the adapter discovering; BlueZ then rejects connect.
@@ -640,7 +652,7 @@ def pair_pad(address: Optional[str] = None) -> dict:
 
 def disconnect_pad(address: Optional[str] = None) -> dict:
     """Drop the HID link; keep the bond so it stays under My devices."""
-    adapter = _ensure_adapter_on()
+    adapter = adapter_state()
     if adapter["reason"] is not ADAPTER_OK:
         return _status_from_devices([], adapter)
     _stop_discovery()
@@ -658,7 +670,7 @@ def disconnect_pad(address: Optional[str] = None) -> dict:
 
 def forget_pad(address: Optional[str] = None) -> dict:
     """Remove the bond (bluetoothctl remove). Device leaves My devices."""
-    adapter = _ensure_adapter_on()
+    adapter = adapter_state()
     if adapter["reason"] is not ADAPTER_OK:
         return _status_from_devices([], adapter)
     _stop_discovery()

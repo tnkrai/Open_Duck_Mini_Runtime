@@ -7,11 +7,15 @@ on, then hold sync", and nothing anywhere -- agent, API, analytics -- recorded
 that the radio was down.
 
 The agent telemetry later showed `POST /api/pad/scan` returning 200 forty-seven
-times, so `_ensure_adapter_on()` DID run and the adapter stayed off anyway. It
-ran `bluetoothctl power on`, discarded the result and returned None, so which of
-the three possible causes it hit is unknowable after the fact. Every test below
-pins one link in that chain, and the escalation tests pin the specific thing the
-old code could not do: notice that the wake did not take.
+times, so the wake DID run and the adapter stayed off anyway. It ran
+`bluetoothctl power on`, discarded the result and returned None, so which of the
+three possible causes it hit is unknowable after the fact. Every test below pins
+one link in that chain, and the escalation tests pin the specific thing the old
+code could not do: notice that the wake did not take.
+
+The ladder now runs only from `wake_adapter()`, which only the Turn on route
+calls. The last group of tests pins that: a scan, a pair, a disconnect and a
+forget all read the radio and refuse, and none of them powers anything on.
 """
 
 import pytest
@@ -147,7 +151,7 @@ def test_missing_rfkill_binary_is_not_a_block(monkeypatch, radio):
 
 
 def test_healthy_radio_is_left_alone(radio):
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert state["wokeVia"] == "already_on"
     assert not used(radio, "bluetoothctl", "power", "on")
     assert not used(radio, "pty", "power on")
@@ -156,7 +160,7 @@ def test_healthy_radio_is_left_alone(radio):
 def test_soft_block_is_cleared_by_rfkill_and_named(radio):
     radio["rfkill"] = RFKILL_SOFT
     radio["show"] = SHOW_NONE
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert used(radio, "rfkill", "unblock", "bluetooth")
     # the fake leaves it merely off, so the piped call is what finishes
     assert state["wokeVia"] == "bluetoothctl"
@@ -165,7 +169,7 @@ def test_soft_block_is_cleared_by_rfkill_and_named(radio):
 
 def test_piped_call_alone_is_enough_when_it_works(radio):
     radio["show"] = SHOW_OFF
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert state["wokeVia"] == "bluetoothctl"
     assert not used(radio, "pty", "power on"), "no need to escalate past a working call"
 
@@ -176,7 +180,7 @@ def test_pty_rescues_a_piped_call_that_does_nothing(radio):
     # piped call had already failed dozens of times.
     radio["show"] = SHOW_OFF
     radio["piped_works"] = False
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert used(radio, "bluetoothctl", "power", "on")
     assert used(radio, "pty", "power on")
     assert state["wokeVia"] == "pty"
@@ -188,7 +192,7 @@ def test_total_failure_keeps_bluez_own_sentence(radio):
     radio["show"] = SHOW_OFF
     radio["piped_works"] = False
     radio["pty_works"] = False
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert state["wokeVia"] is None
     assert state["reason"] == pad.ADAPTER_OFF
     assert BLUEZ_REFUSAL in state["wakeError"], "the one string that explains the failure"
@@ -200,13 +204,13 @@ def test_refused_unblock_is_reported_not_swallowed(radio):
     radio["unblock_works"] = False
     radio["piped_works"] = False
     radio["pty_works"] = False
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert "rfkill" in state["wakeError"]
 
 
 def test_hard_block_does_not_pretend_to_fix_itself(radio):
     radio["rfkill"] = RFKILL_HARD
-    state = pad._ensure_adapter_on()
+    state = pad.wake_adapter()
     assert state["reason"] == pad.ADAPTER_HARD_BLOCKED
     assert not used(radio, "rfkill", "unblock", "bluetooth")
     assert not used(radio, "bluetoothctl", "power", "on")
@@ -236,9 +240,45 @@ def test_scan_skips_the_18_second_scan_when_the_radio_is_down(radio):
 
 
 def test_scan_runs_normally_once_the_radio_is_up(radio):
+    # Was: set the adapter OFF and assert the scan ran anyway, which asserted
+    # that scanning powers the radio on. It does not any more, so the operator's
+    # press has to happen first -- and then the scan behaves exactly as before.
     radio["show"] = SHOW_OFF
+    assert pad.wake_adapter()["reason"] is pad.ADAPTER_OK
     pad.scan_pad(timeout=1.0)
     assert any(c[:2] == ("bluetoothctl", "--timeout") for c in radio["calls"])
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: pad.scan_pad(timeout=1.0),
+        lambda: pad.pair_pad("AA:BB:CC:DD:EE:FF"),
+        lambda: pad.disconnect_pad("AA:BB:CC:DD:EE:FF"),
+        lambda: pad.forget_pad("AA:BB:CC:DD:EE:FF"),
+    ],
+    ids=["scan", "pair", "disconnect", "forget"],
+)
+def test_no_pad_call_powers_the_radio_on_by_itself(radio, call):
+    """The whole point of the change: nothing wakes the radio behind the operator.
+
+    A radio that powers itself up cannot be reported. The screen said "hold
+    sync" for half an hour precisely because the wake was a side effect nobody
+    could see, so every one of these has to read the state and stop.
+    """
+    radio["show"] = SHOW_OFF
+    status = call()
+    assert status["adapter"]["reason"] == pad.ADAPTER_OFF
+    assert not any(c[:2] == ("bluetoothctl", "power") for c in radio["calls"])
+    assert not any(c[0] == "rfkill" and c[1] == "unblock" for c in radio["calls"])
+    assert ("pty", "power on") not in radio["calls"]
+
+
+def test_the_wake_is_the_one_thing_that_powers_the_radio_on(radio):
+    radio["show"] = SHOW_OFF
+    state = pad.wake_adapter()
+    assert state["reason"] is pad.ADAPTER_OK
+    assert state["wokeVia"] == "bluetoothctl"
 
 
 def test_pair_refuses_early_when_the_radio_is_down(radio):

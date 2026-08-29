@@ -30,6 +30,11 @@ LOG_FILE="$STATE_DIR/setup.log"
 TOTAL_STEPS=12
 MIN_DISK_MB=2048
 SWAP_SIZE_MB=2048
+# Disk to keep clear for the install when sizing a fallback swapfile, and the
+# smallest swapfile worth making. Below the floor the file costs card space
+# without changing whether the build fits.
+SWAP_INSTALL_HEADROOM_MB=1024
+SWAP_MIN_USEFUL_MB=256
 
 # Anonymous usage telemetry (see telemetry_init below for the user notice).
 # Key is write-only (can send events, cannot read data). Key/host and the
@@ -287,39 +292,193 @@ run_step() {
 }
 
 # ── Swap management ──────────────────────────────────────────────────────────
+#
+# The Zero 2W has 512 MB of RAM and this script compiles a Rust extension on it,
+# so swap is not an optimisation here, it is the difference between an install
+# that finishes and one that thrashes for an hour.
+#
+# There are three generations of Pi OS to satisfy and only one of them has
+# dphys-swapfile:
+#
+#   Bullseye / Bookworm : dphys-swapfile, a file under /var
+#   Trixie              : rpi-swap, which is ZRAM — compressed RAM, no disk
+#   anything else       : nothing
+#
+# ZRAM is the trap. `free` on a Trixie Pi reports swap, so a naive "is there
+# swap?" check passes, but zram is backed by the same 512 MB we are trying not
+# to exhaust; it cannot hold a cargo build's working set. Disk-backed swap is
+# the only kind that helps, so ONLY disk-backed swap is counted below and
+# /dev/zram* is excluded by name.
+#
+# The fallback is a plain swapfile, which needs no package and works on every
+# Debian. It is temporary on purpose: restore_swap swapoffs and deletes it, and
+# it is never written to /etc/fstab. Leaving a 2 GB file on someone's SD card
+# forever is a real cost, and nothing here needs swap after the build.
+
+SWAP_FILE="/var/swap.tnkr-setup"
+SWAP_FILE_CREATED=false
+
+#: Disk-backed swap currently active, in MB. /proc/swaps rather than `free`
+#: because free's total silently includes zram, which is the thing that made
+#: this check wrong in the first place.
+active_disk_swap_mb() {
+    # Overridable so the test suite can feed a fixture; always /proc/swaps in use.
+    local src="${SWAP_PROC:-/proc/swaps}"
+    if [ ! -r "$src" ]; then
+        echo 0
+        return 0
+    fi
+    awk 'NR>1 && $1 !~ /^\/dev\/zram/ { total += $3 } END { printf "%d", total/1024 }' \
+        "$src" 2>/dev/null || echo 0
+}
+
+#: Free space in MB on the filesystem holding the swapfile.
+swap_fs_free_mb() {
+    local kb
+    kb=$(df --output=avail "$(dirname "$SWAP_FILE")" 2>/dev/null | tail -1 | tr -d ' ')
+    echo $(( ${kb:-0} / 1024 ))
+}
+
+# Create, format and enable SWAP_FILE at $1 MB. Returns non-zero if any step
+# fails so the caller can warn and carry on rather than abort the install.
+create_swapfile() {
+    local size_mb="$1"
+
+    # A leftover from a run that was killed hard enough to skip the trap. Its
+    # size is unknown, so replace rather than reuse: mkswap on a file that is
+    # already swapped on corrupts it, and swapoff of a file we did not enable
+    # is not ours to do.
+    # Field comparison rather than a grep pattern. `grep "^$SWAP_FILE "` also
+    # works — the kernel pads the filename to column 40, or emits one space if
+    # the path is longer, so a space always follows it (verified with cat -A on
+    # a Trixie Zero 2W). This matches how active_disk_swap_mb reads the same
+    # file, and it does not depend on that padding rule staying true.
+    if awk -v f="$SWAP_FILE" 'NR>1 && $1 == f { found=1 } END { exit !found }' \
+        "${SWAP_PROC:-/proc/swaps}" 2>/dev/null; then
+        sudo swapoff "$SWAP_FILE" 2>/dev/null || true
+    fi
+    sudo rm -f "$SWAP_FILE"
+
+    # fallocate is instant but can leave holes on some filesystems, and mkswap
+    # refuses a file with holes. dd is slow and always correct, so it is the
+    # fallback rather than the default.
+    if ! sudo fallocate -l "${size_mb}M" "$SWAP_FILE" 2>/dev/null; then
+        sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=none 2>/dev/null || return 1
+    fi
+
+    # swapon refuses anything group- or world-readable.
+    sudo chmod 600 "$SWAP_FILE" || return 1
+    sudo mkswap "$SWAP_FILE" >/dev/null 2>&1 || return 1
+    sudo swapon "$SWAP_FILE" 2>/dev/null || return 1
+
+    SWAP_FILE_CREATED=true
+    return 0
+}
 
 expand_swap() {
-    if ! command -v dphys-swapfile > /dev/null 2>&1; then
-        warn "dphys-swapfile not found — skipping swap expansion"
+    local have deficit
+
+    # Adopt a leftover of ours from a run that was killed before the EXIT trap
+    # could fire. It counts toward `have` below, which is right — the swap is
+    # real — but without claiming it restore_swap would walk past and the file
+    # would sit on the card until the next reboot deactivated it. The run that
+    # benefits from the swap is the run that should clean it up.
+    #
+    # Safe to do before the dphys branch: nothing on a dphys machine ever writes
+    # SWAP_FILE, so the two paths cannot both be live.
+    if awk -v f="$SWAP_FILE" 'NR>1 && $1 == f { found=1 } END { exit !found }' \
+        "${SWAP_PROC:-/proc/swaps}" 2>/dev/null; then
+        SWAP_FILE_CREATED=true
+        SWAP_EXPANDED=true
+    fi
+
+    have=$(active_disk_swap_mb)
+
+    if [ "$have" -ge "$SWAP_SIZE_MB" ]; then
+        info "Disk swap already ${have}MB (>= ${SWAP_SIZE_MB}MB)"
         return 0
     fi
 
-    ORIGINAL_SWAP_SIZE=$(grep -E '^CONF_SWAPSIZE=' /etc/dphys-swapfile 2>/dev/null | cut -d= -f2 || echo "100")
-    ORIGINAL_SWAP_SIZE="${ORIGINAL_SWAP_SIZE:-100}"
+    # Path 1: dphys-swapfile. Kept first because it is what the Pis in the
+    # field are already running and it has been exercised there.
+    if command -v dphys-swapfile > /dev/null 2>&1; then
+        ORIGINAL_SWAP_SIZE=$(grep -E '^CONF_SWAPSIZE=' /etc/dphys-swapfile 2>/dev/null | cut -d= -f2 || echo "100")
+        ORIGINAL_SWAP_SIZE="${ORIGINAL_SWAP_SIZE:-100}"
 
-    if [ "$ORIGINAL_SWAP_SIZE" -ge "$SWAP_SIZE_MB" ] 2>/dev/null; then
-        info "Swap already ${ORIGINAL_SWAP_SIZE}MB (>= ${SWAP_SIZE_MB}MB)"
-        ORIGINAL_SWAP_SIZE=""
+        start_spinner "Expanding swap to ${SWAP_SIZE_MB}MB for compilation..."
+        sudo dphys-swapfile swapoff 2>/dev/null || true
+        sudo sed -i "s/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=${SWAP_SIZE_MB}/" /etc/dphys-swapfile
+        sudo dphys-swapfile setup > /dev/null 2>&1
+        sudo dphys-swapfile swapon
+        SWAP_EXPANDED=true
+        stop_spinner true "Swap expanded to ${SWAP_SIZE_MB}MB (was ${ORIGINAL_SWAP_SIZE}MB)"
         return 0
     fi
 
-    start_spinner "Expanding swap to ${SWAP_SIZE_MB}MB for compilation..."
-    sudo dphys-swapfile swapoff 2>/dev/null || true
-    sudo sed -i "s/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=${SWAP_SIZE_MB}/" /etc/dphys-swapfile
-    sudo dphys-swapfile setup > /dev/null 2>&1
-    sudo dphys-swapfile swapon
-    SWAP_EXPANDED=true
-    stop_spinner true "Swap expanded to ${SWAP_SIZE_MB}MB (was ${ORIGINAL_SWAP_SIZE}MB)"
+    # Path 2: a plain swapfile. Trixie dropped dphys-swapfile for rpi-swap
+    # (zram), so this is now the path a current Pi OS image actually takes.
+    deficit=$(( SWAP_SIZE_MB - have ))
+
+    # Leave room for the install itself. Preflight only guarantees MIN_DISK_MB
+    # free and SWAP_SIZE_MB is the same number, so a Pi that just scraped past
+    # preflight has nothing spare — take what fits instead of filling the card
+    # and failing pip later with a confusing ENOSPC.
+    # Already close enough, which is a success and not the out-of-disk case
+    # below. A 512MB file measures 511MB (524284 KB), so an exact-size swap is
+    # always a megabyte short of its own target; warning about memory here told
+    # an operator with 22GB free and a working swapfile that their build might
+    # OOM.
+    if [ "$deficit" -lt "$SWAP_MIN_USEFUL_MB" ]; then
+        info "Disk swap already ${have}MB, within ${SWAP_MIN_USEFUL_MB}MB of the ${SWAP_SIZE_MB}MB target"
+        return 0
+    fi
+
+    local free_mb room
+    free_mb=$(swap_fs_free_mb)
+    room=$(( free_mb - SWAP_INSTALL_HEADROOM_MB ))
+
+    # Genuinely out of disk. This is the one that deserves the memory warning.
+    if [ "$room" -lt "$SWAP_MIN_USEFUL_MB" ]; then
+        warn "Only ${free_mb}MB free on $(dirname "$SWAP_FILE") — skipping swap expansion"
+        warn "The rustypot compile may be slow or run out of memory on a 512MB Pi"
+        return 0
+    fi
+
+    if [ "$room" -lt "$deficit" ]; then
+        deficit="$room"
+    fi
+
+    start_spinner "Adding ${deficit}MB swap file for compilation..."
+    if create_swapfile "$deficit"; then
+        SWAP_EXPANDED=true
+        stop_spinner true "Swap file added (${deficit}MB, total $(active_disk_swap_mb)MB)"
+    else
+        sudo rm -f "$SWAP_FILE"
+        stop_spinner false "Could not create a swap file"
+        warn "The rustypot compile may be slow or run out of memory on a 512MB Pi"
+    fi
+    return 0
 }
 
 restore_swap() {
-    if [ "$SWAP_EXPANDED" != "true" ] || [ -z "$ORIGINAL_SWAP_SIZE" ]; then
-        return 0
-    fi
-    if ! command -v dphys-swapfile > /dev/null 2>&1; then
+    if [ "$SWAP_EXPANDED" != "true" ]; then
         return 0
     fi
 
+    # The swapfile path. Delete it: it was only ever for the build.
+    if [ "$SWAP_FILE_CREATED" = "true" ]; then
+        sudo swapoff "$SWAP_FILE" 2>/dev/null || true
+        sudo rm -f "$SWAP_FILE"
+        SWAP_FILE_CREATED=false
+        SWAP_EXPANDED=false
+        printf "  ${CHECK} Swap file removed\n"
+        return 0
+    fi
+
+    # The dphys path.
+    if [ -z "$ORIGINAL_SWAP_SIZE" ] || ! command -v dphys-swapfile > /dev/null 2>&1; then
+        return 0
+    fi
     sudo dphys-swapfile swapoff 2>/dev/null || true
     sudo sed -i "s/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=${ORIGINAL_SWAP_SIZE}/" /etc/dphys-swapfile
     sudo dphys-swapfile setup > /dev/null 2>&1
@@ -922,7 +1081,11 @@ LOGO
     run_step  2 "02_system_deps"  "System dependencies"                    do_system_deps  true
     run_step  3 "03_i2c"          "Hardware interfaces (I2C)"              do_i2c
     run_step  4 "04_usb_latency"  "Motor communication (USB latency)"      do_usb_latency
-    run_step  5 "05_swap"         "Expand swap for compilation"            do_swap
+    # always=true: restore_swap runs in the EXIT trap, so an interrupted run
+    # tears the swap back down. Without this the resumed run — the one after
+    # an OOM, on the machine that just proved it needs swap — skips step 5 as
+    # "done" and compiles with none.
+    run_step  5 "05_swap"         "Expand swap for compilation"            do_swap         true
     run_step  6 "06_clone"        "Clone / update runtime"                 do_clone        true
     run_step  7 "07_venv"         "Python virtual environment"             do_venv
 

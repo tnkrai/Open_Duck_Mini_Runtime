@@ -3,9 +3,18 @@ Anonymous usage telemetry for the Open Duck Mini runtime.
 
 Privacy contract (also documented in the README "Telemetry" section):
   - distinct_id is a random UUID generated on this device. No hostnames,
-    usernames, IPs (GeoIP disabled), session tokens, or joint/motion data
-    are ever sent. String properties are scrubbed of home-directory paths
-    and the local username before sending.
+    usernames, IPs (GeoIP disabled), session tokens, or live joint/motion
+    data are ever sent. String properties are scrubbed of home-directory
+    paths and the local username before sending.
+  - One deliberate exception, added with the joint-calibration flow:
+    CALIBRATION offsets are sent (see joint_calibration_saved in
+    tnkr_server.py). They are hardware assembly measurements - how far each
+    servo horn is seated from straight - not a record of anything the robot
+    did or the operator asked for, and they are what tells us whether the
+    assembly instructions work and whether an offset sits close enough to
+    the servo's command seam to be unsafe. Live joint positions and motion
+    traces are still never sent; the walk still reports only a boolean for
+    whether joint data was streaming.
   - Disable any time with TNKR_TELEMETRY=0 (env var) or by setting
     "enabled": false in ~/.tnkr-telemetry.json.
   - A consent file that exists but cannot be parsed counts as OPTED OUT:

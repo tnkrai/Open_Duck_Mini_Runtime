@@ -7,6 +7,7 @@ and walk control endpoints.
 Telemetry is streamed via Supabase Realtime broadcast channels.
 """
 
+import errno
 import json
 import math
 import os
@@ -39,7 +40,12 @@ import uvicorn
 
 # ── Runtime imports (available after pip install -e .) ────────────────────────
 
-from mini_bdx_runtime.rustypot_position_hwi import HWI, find_servo_adapter
+from mini_bdx_runtime.rustypot_position_hwi import (
+    BUS_LOCK,
+    HWI,
+    find_servo_adapter,
+    is_rust_panic,
+)
 from mini_bdx_runtime.duck_config import DuckConfig
 from mini_bdx_runtime import telemetry
 from mini_bdx_runtime import walk_telemetry
@@ -55,7 +61,6 @@ from mini_bdx_runtime.pad import (
     wake_adapter,
     walk_flags,
 )
-
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 HOME_DIR = os.path.expanduser("~")
@@ -141,17 +146,18 @@ def get_hwi() -> HWI:
         raise RuntimeError(
             "Servo rehoming session in progress — finish it before other motor operations"
         )
-    if hwi_instance is None:
-        config = DuckConfig(config_json_path=CONFIG_PATH, ignore_default=True)
-        # None unless TNKR_USB_PORT overrides — HWI then auto-detects the
-        # adapter itself and records which chip it found for telemetry.
-        hwi_instance = HWI(
-            duck_config=config, usb_port=os.environ.get("TNKR_USB_PORT")
-        )
-        # Which adapter chip (CH343/FTDI) this robot uses — attached to all
-        # subsequent telemetry events and the device's person profile.
-        telemetry.set_sticky(servo_adapter_chip=hwi_instance.servo_adapter_chip)
-    return hwi_instance
+    with BUS_LOCK:
+        if hwi_instance is None:
+            config = DuckConfig(config_json_path=CONFIG_PATH, ignore_default=True)
+            # None unless TNKR_USB_PORT overrides — HWI then auto-detects the
+            # adapter itself and records which chip it found for telemetry.
+            hwi_instance = HWI(
+                duck_config=config, usb_port=os.environ.get("TNKR_USB_PORT")
+            )
+            # Which adapter chip (CH343/FTDI) this robot uses — attached to all
+            # subsequent telemetry events and the device's person profile.
+            telemetry.set_sticky(servo_adapter_chip=hwi_instance.servo_adapter_chip)
+        return hwi_instance
 
 
 def release_hwi(disable_torque: bool = True):
@@ -161,15 +167,23 @@ def release_hwi(disable_torque: bool = True):
     bus traffic, so freeing the port does NOT require cutting torque. Pass
     disable_torque=False to hand off the bus while the robot keeps holding its
     pose (e.g. the walking stance) — going limp mid-stand makes the duck fall.
+
+    Drops the rustypot handle (close()) under BUS_LOCK so pypot (voltage,
+    rehome) cannot open the same adapter while rustypot still holds the fd.
     """
     global hwi_instance, head_puppet_active
-    if hwi_instance is not None:
-        if disable_torque:
+    with BUS_LOCK:
+        if hwi_instance is not None:
+            if disable_torque:
+                try:
+                    hwi_instance.turn_off()
+                except Exception:
+                    pass
             try:
-                hwi_instance.turn_off()
-            except Exception:
+                hwi_instance.close()
+            except BaseException:
                 pass
-        hwi_instance = None
+            hwi_instance = None
     # A puppet session is only as live as the HWI it drives: whoever takes the
     # bus next (walk, rehome, stance) leaves the head somewhere we no longer
     # know, so the next request must re-enter rather than skip the setup.
@@ -556,7 +570,7 @@ def read_state():
     reads every joint at 50 Hz for its policy anyway); fall back to the
     last-known pose if the snapshot is missing or stale — never fight for the
     port, never serve a dead snapshot as live."""
-    global last_state_joints
+    global last_state_joints, hwi_instance
     imu_payload = None
     if is_walking():
         snap = walk_telemetry.read_snapshot()
@@ -573,15 +587,28 @@ def read_state():
                 }
     elif rehome_io is None:
         try:
-            hwi = get_hwi()
-            positions = hwi.get_present_positions()
+            # Hold the bus for get_hwi + the 14-joint read so /api/voltage
+            # cannot open pypot on the same adapter mid-poll (that double-open
+            # is what poisons rustypot's mutex and 500s every later /api/state).
+            with BUS_LOCK:
+                hwi = get_hwi()
+                positions = hwi.get_present_positions()
             if positions is not None and len(positions) == len(hwi.joints):
                 last_state_joints = {
                     n: round(float(p), 4)
                     for n, p in zip(hwi.joints.keys(), positions)
                 }
-        except Exception:
-            pass  # transient read blip → serve the cached pose
+        except BaseException as e:
+            # PanicException subclasses BaseException, not Exception — the
+            # previous `except Exception` let it kill the ASGI task.
+            if is_rust_panic(e):
+                try:
+                    release_hwi(disable_torque=False)
+                except BaseException:
+                    hwi_instance = None
+            elif not isinstance(e, Exception):
+                raise
+            # transient read blip / recovered panic → serve the cached pose
         try:
             imu_data = get_state_imu().get_data()
             imu_payload = {
@@ -602,38 +629,46 @@ def read_state():
 def check_motors():
     """Check all 14 motors for responsiveness."""
     refuse_while_walking()
-    try:
-        hwi = get_hwi()
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Cannot connect to motor controller: {e}",
-        )
-
-    motors = []
-    for joint_name, joint_id in hwi.joints.items():
-        motor_info = {
-            "jointName": joint_name,
-            "servoId": joint_id,
-            "responsive": False,
-            "position": None,
-            "error": None,
-        }
+    with BUS_LOCK:
         try:
-            hwi.io.set_kps([joint_id], [hwi.low_torque_kps[0]])
-            position = hwi.io.read_present_position([joint_id])
-            motor_info["responsive"] = True
-            motor_info["position"] = round(float(position[0]), 3)
+            hwi = get_hwi()
         except Exception as e:
-            motor_info["error"] = str(e)
-        motors.append(motor_info)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Cannot connect to motor controller: {e}",
+            )
 
-    # Disable torque after check
-    for joint_name, joint_id in hwi.joints.items():
-        try:
-            hwi.io.disable_torque([joint_id])
-        except Exception:
-            pass
+        motors = []
+        for joint_name, joint_id in hwi.joints.items():
+            motor_info = {
+                "jointName": joint_name,
+                "servoId": joint_id,
+                "responsive": False,
+                "position": None,
+                "error": None,
+            }
+            try:
+                hwi.io.set_kps([joint_id], [hwi.low_torque_kps[0]])
+                position = hwi.io.read_present_position([joint_id])
+                motor_info["responsive"] = True
+                motor_info["position"] = round(float(position[0]), 3)
+            except BaseException as e:
+                if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise
+                if is_rust_panic(e):
+                    try:
+                        hwi._reopen_io()
+                    except BaseException:
+                        pass
+                motor_info["error"] = str(e)
+            motors.append(motor_info)
+
+        # Disable torque after check
+        for joint_name, joint_id in hwi.joints.items():
+            try:
+                hwi.io.disable_torque([joint_id])
+            except Exception:
+                pass
 
     all_responsive = all(m["responsive"] for m in motors)
     add_telemetry_props(
@@ -644,176 +679,523 @@ def check_motors():
     return {"motors": motors, "allResponsive": all_responsive}
 
 
-# ── Calibration (DEPRECATED) ──────────────────────────────────────────────────
-# The per-joint "capture zero as a software offset" flow below is superseded by
-# the rehome (/api/rehome/*) + stance (/api/stance/*) endpoints. Big software
-# offsets can push init_pos + offset past the servo's ±π command seam, where
-# the value wraps to a different physical position (joints jam against the
-# shell and the firmware cuts torque). Kept for older dashboard clients.
+# ── Joint calibration (soft offsets) ─────────────────────────────────────────
+# Port of scripts/find_soft_offsets.py: the duck holds zero_pos under torque, one
+# joint is released at a time, the operator hand-poses it, and the difference
+# between two present readings becomes that joint's software offset in
+# duck_config.json.
+#
+# Known limit, and the reason /api/rehome/* exists alongside this: a walk commands
+# init_pos + offset + policy, and init_pos already spends 79 deg of the servo's 180
+# deg window at the knees. A large offset pushes past the command seam, where the
+# value wraps to a different physical position and the joint is driven into the
+# shell. NOTHING GUARDS THIS TODAY. The margin is measured and sent to telemetry as
+# seam_headroom_deg and deliberately not enforced, so fleet data decides whether a
+# threshold is worth having; there is no OFFSET_OUT_OF_RANGE code on either side
+# (jointCalErrors.test.ts asserts its absence). Rehoming avoids the seam entirely by
+# correcting inside the servo, in count-space.
+#
+# Everything here reads and writes ONE joint at a time. get_present_positions()
+# returns None if any of the fourteen fails, which made a silent joint 3 fail a
+# calibration of joint 7 with no way to name the joint that was actually quiet.
 
-# Temporary calibration state
+# Offsets accepted this session, and the pre-release reading each was measured
+# against. Both keyed by joint name, both reset by /start.
 calibration_offsets: dict[str, float] = {}
+calibration_baselines: dict[str, float] = {}
+
+# What the fleet analytics needs that a per-request event cannot carry: how long the
+# whole session took, how many attempts each joint needed, which faults came up, and
+# the init_pos the offsets will actually be added to at walk time.
+#
+# init_pos has to be SNAPSHOTTED here because /start overwrites hwi.init_pos with the
+# zero pose for the duration of the session, so by /save the real walking pose is gone.
+calibration_session: dict = {}
+
+
+def _reset_calibration_session(hwi) -> None:
+    global calibration_session
+    calibration_session = {
+        "started_at": time.time(),
+        # joint -> how many times it was released / measured / accepted. Attempts are
+        # the signal that matters most: a joint that takes four goes is either badly
+        # assembled or badly explained, and we cannot tell which from one robot.
+        "begins": {},
+        "confirms": {},
+        "accepts": {},
+        # error code -> count, so a fault that only shows up on real hardware is
+        # visible without reading a log off an SD card.
+        "faults": {},
+        # the walking pose the offsets get added to, before /start clobbers it
+        "init_pos": {k: round(float(v), 4) for k, v in hwi.init_pos.items()},
+    }
+
+
+def _bump(bucket: str, key: str) -> None:
+    counts = calibration_session.get(bucket)
+    if isinstance(counts, dict):
+        counts[key] = counts.get(key, 0) + 1
+
+
+def _note_calibration_fault(code: str, joint_name: str | None = None) -> None:
+    """Record a fault for the session summary AND on this request's own event.
+
+    `error_code` as its own property rather than only inside error_message: a string
+    like "MOTORS_SILENT: left_knee: timeout" cannot be grouped in PostHog, and the
+    grouping is the entire point of collecting it.
+    """
+    _bump("faults", code)
+    props = {"error_code": code}
+    if joint_name:
+        props["joint_name"] = joint_name
+    add_telemetry_props(**props)
+
+
+def _seam_headroom(offsets: dict, init_pos: dict) -> dict:
+    """Degrees left in each servo's +-180 command window once the offset is added.
+
+    This is the number that says whether the soft-offset approach is safe on real
+    robots. A walk commands init_pos + offset + policy, and init_pos already spends 79
+    of the 180 degrees at the knees, so a large offset leaves the policy no room and
+    the value wraps. Measuring the margin across the fleet is how we learn whether the
+    guard is worth building, instead of guessing.
+    """
+    out = {}
+    for joint, offset in offsets.items():
+        target = math.degrees(init_pos.get(joint, 0.0) + offset)
+        out[joint] = round(180.0 - abs(target), 1)
+    return out
+
+
+def _agent_error(status: int, code: str, message: str, joint: str | None = None):
+    """Raise a failure Studio can map without parsing prose.
+
+    `detail` is a DICT here, not a string. Studio's agent_client used to recover the
+    code by string-sniffing this field for a `CODE:` prefix — a protocol pretending to
+    be a log message, O(n) over the ErrorCode enum on every failure, and silent on a
+    typo: write `MOTOR_SILENT:` and nothing errors, it just falls back to the status
+    map, which is how a loose cable became "we couldn't reach your duck". A real field
+    is read once and cannot be misspelled without something visible going wrong.
+
+    `joint` travels as its own key for the same reason: the copy names the joint, and
+    scraping a joint name back out of a sentence is not a thing to build on.
+
+    Scoped to the calibration routes deliberately. The older prefix convention is still
+    how the pad/rehome/stance routes talk, those are deployed, and an older Studio only
+    understands the prefix — converting them would regress anyone who updates their
+    robot before their Studio. New routes use this; the legacy path stays until they
+    are migrated together.
+    """
+    detail: dict = {"code": code, "message": message}
+    if joint:
+        detail["joint"] = joint
+    raise HTTPException(status_code=status, detail=detail)
+
+
+def _calibration_hwi():
+    """The HWI, or a 503 naming why not. Refuses while a walk owns the bus."""
+    refuse_while_walking()
+    try:
+        return get_hwi()
+    except Exception as e:
+        _agent_error(503, "SERVO_BUS_UNAVAILABLE", str(e))
+
+
+def _calibration_joint(hwi, joint_name: str) -> str:
+    if joint_name not in hwi.joints:
+        # Its own code. This used to be a bare 400, and 400 is not in Studio's status
+        # map, so it fell through to the catch-all and told the operator their duck was
+        # unreachable — for a duck that had just answered, about a joint it does not
+        # have. A frontend bug wearing a hardware fault's message.
+        _note_calibration_fault("UNKNOWN_JOINT", joint_name)
+        _agent_error(400, "UNKNOWN_JOINT", f"no such joint: {joint_name}", joint_name)
+    return joint_name
+
+
+def _read_one(hwi, joint_name: str) -> float:
+    """One joint's present position, or a 502 that names the joint.
+
+    The code travels in the detail because agent_client maps status codes, not
+    messages, and its escape hatch honours a leading `CODE:` — without it a silent
+    servo arrives at Studio as SERVO_BUS_UNAVAILABLE ("check they're connected and
+    powered") when the bus is open and fourteen other servos are answering on it.
+    """
+    try:
+        return float(hwi.get_present_position(joint_name))
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        _note_calibration_fault("MOTORS_SILENT", joint_name)
+        _agent_error(502, "MOTORS_SILENT", str(e), joint_name)
 
 
 @app.post("/api/calibration/start")
 def calibration_start():
-    """Move all joints to zero position and prepare for calibration."""
-    global calibration_offsets
+    """Zero every offset, power on, and hold zero_pos so joints can be released."""
+    global calibration_offsets, calibration_baselines
 
-    try:
-        hwi = get_hwi()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    hwi = _calibration_hwi()
 
-    # Reset offsets to zero for calibration
     for joint_name in hwi.joints:
         hwi.joints_offsets[joint_name] = 0
     calibration_offsets = {}
+    calibration_baselines = {}
 
-    # Move to zero with low damping
+    _reset_calibration_session(hwi)
+
+    # kd 0 so a released joint is not fought on the way back, matching the script.
     hwi.set_kds([0] * len(hwi.joints))
-    hwi.init_pos = hwi.zero_pos
+    # dict(), not a bare assignment: `hwi.init_pos = hwi.zero_pos` makes the two names
+    # the same object, so any later per-joint write to one silently edits the other.
+    hwi.init_pos = dict(hwi.zero_pos)
     hwi.turn_on()
     hwi.set_position_all(hwi.zero_pos)
     time.sleep(1)
 
-    # Read current positions
+    # The whole-bus read belongs HERE and only here: arming is the one step that is
+    # about every joint, so a servo that is already silent is caught before the
+    # operator has their hands on the robot. Reported rather than swallowed - the
+    # old code returned an empty currentPositions dict and let the session continue
+    # with no baselines at all.
     positions = hwi.get_present_positions()
-    joint_names = list(hwi.joints.keys())
-    current_positions = {}
-    if positions is not None:
-        for i, name in enumerate(joint_names):
-            current_positions[name] = round(float(positions[i]), 3)
+    if positions is None:
+        _note_calibration_fault("MOTORS_SILENT")
+        _agent_error(502, "MOTORS_SILENT", "at least one joint did not answer while moving to zero")
 
-    return {
-        "joints": joint_names,
-        "currentPositions": current_positions,
+    joint_names = list(hwi.joints.keys())
+    current_positions = {
+        name: round(float(positions[i]), 3) for i, name in enumerate(joint_names)
     }
+
+    # The droop across the whole robot, at the one moment every joint is commanded to
+    # the same place under the same kd. Fleet-wide this says how much sag is normal,
+    # which is what makes an outlier joint recognisable as an outlier.
+    droop = [abs(v) for v in current_positions.values()]
+    telemetry.capture(
+        "joint_calibration_started",
+        {
+            "joint_count": len(joint_names),
+            "baselines_rad": current_positions,
+            "max_abs_droop_rad": round(max(droop), 4) if droop else 0.0,
+        },
+    )
+    return {"joints": joint_names, "currentPositions": current_positions}
 
 
 @app.post("/api/calibration/begin-joint")
 def calibration_begin_joint(req: JointRequest):
-    """Disable torque on a joint so the user can move it by hand."""
-    try:
-        hwi = get_hwi()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    """Take this joint's baseline reading, then drop its torque so it can be posed."""
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
 
-    if req.jointName not in hwi.joints:
-        raise HTTPException(status_code=400, detail=f"Unknown joint: {req.jointName}")
+    # Start this joint from scratch. Antoine's retry branch does the same
+    # (joints_offsets[joint] = 0): without it, re-doing an accepted joint measures
+    # against its own previous correction and the offsets compound.
+    hwi.joints_offsets[joint_name] = 0
 
-    joint_id = hwi.joints[req.jointName]
-
-    # Move all to zero first (in case previous joint moved things)
+    # Re-assert the pose before measuring: hand-posing one joint drags its
+    # neighbours, and their goals are what the baseline is relative to.
     hwi.set_position_all(hwi.zero_pos)
     time.sleep(0.5)
 
-    # Disable torque on this joint
-    hwi.io.disable_torque([joint_id])
+    # The baseline, and the whole reason this endpoint returns a number. kds are 0
+    # for this session, so a loaded joint settles a little off the zero it was
+    # commanded to. The offset is the difference between two PRESENT readings, which
+    # cancels that droop; comparing against a hardcoded 0.0 folds it into every
+    # saved offset instead.
+    baseline = _read_one(hwi, joint_name)
+    calibration_baselines[joint_name] = baseline
 
-    return {"success": True}
+    try:
+        hwi.set_joint_torque(joint_name, False)
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        # The joint may or may not have gone limp: a serial timeout means no reply
+        # came back, not that the write failed to land. Studio's copy says only what
+        # is safe under either state.
+        _note_calibration_fault("TORQUE_RELEASE_FAILED", joint_name)
+        _agent_error(502, "TORQUE_RELEASE_FAILED", str(e), joint_name)
+
+    _bump("begins", joint_name)
+    add_telemetry_props(
+        joint_name=joint_name,
+        baseline_rad=round(baseline, 4),
+        # 2 means the operator came back to this joint: worth knowing per joint, and
+        # worth knowing whether it is always the same joints across the fleet.
+        attempt=calibration_session.get("begins", {}).get(joint_name, 1),
+    )
+    return {"success": True, "jointName": joint_name, "baseline": round(baseline, 4)}
 
 
 @app.post("/api/calibration/confirm-position")
 def calibration_confirm_position(req: JointRequest):
-    """Read the joint's current position and calculate the offset."""
-    try:
-        hwi = get_hwi()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    """Read the posed joint and return the offset, as a delta from the baseline."""
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
 
-    if req.jointName not in hwi.joints:
-        raise HTTPException(status_code=400, detail=f"Unknown joint: {req.jointName}")
+    if joint_name not in calibration_baselines:
+        _note_calibration_fault("INVALID_STATE", joint_name)
+        _agent_error(
+            409, "INVALID_STATE", f"no baseline for {joint_name}: call begin-joint first", joint_name
+        )
 
-    joint_names = list(hwi.joints.keys())
-    joint_index = joint_names.index(req.jointName)
+    baseline = calibration_baselines[joint_name]
+    new_pos = _read_one(hwi, joint_name)
+    offset = new_pos - baseline
 
-    # The zero position command was 0.0 (since offsets are zeroed)
-    current_command = 0.0
-
-    positions = hwi.get_present_positions()
-    if positions is None:
-        raise HTTPException(status_code=503, detail="Could not read motor position")
-
-    new_pos = float(positions[joint_index])
-    offset = new_pos - current_command
-
+    _bump("confirms", joint_name)
+    add_telemetry_props(
+        joint_name=joint_name,
+        baseline_rad=round(baseline, 4),
+        measured_rad=round(new_pos, 4),
+        offset_rad=round(offset, 4),
+        offset_deg=round(math.degrees(offset), 2),
+        # how close this offset would put the joint to the servo's command seam once
+        # the walk adds init_pos on top. Reported, not enforced.
+        seam_headroom_deg=_seam_headroom(
+            {joint_name: offset}, calibration_session.get("init_pos", {})
+        ).get(joint_name),
+        attempt=calibration_session.get("confirms", {}).get(joint_name, 1),
+    )
     return {
-        "jointName": req.jointName,
+        "jointName": joint_name,
         "offset": round(offset, 4),
-        "previousPosition": round(current_command, 4),
+        "previousPosition": round(baseline, 4),
         "newPosition": round(new_pos, 4),
     }
 
 
 @app.post("/api/calibration/apply-offset")
 def calibration_apply_offset(req: ApplyOffsetRequest):
-    """Apply the offset and move joint to zero to verify."""
-    try:
-        hwi = get_hwi()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    """Hold the posed position: write the goal WITH the offset, then re-power."""
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
 
-    if req.jointName not in hwi.joints:
-        raise HTTPException(status_code=400, detail=f"Unknown joint: {req.jointName}")
+    hwi.joints_offsets[joint_name] = req.offset
 
-    joint_id = hwi.joints[req.jointName]
-
-    # Apply offset
-    hwi.joints_offsets[req.jointName] = req.offset
-
-    # Re-enable torque and move to zero (with offset applied)
-    hwi.io.enable_torque([joint_id])
+    # Goal FIRST, torque second. set_position_all writes pos + offset, so the goal is
+    # where the operator's hands are and the servo wakes already at its target: the
+    # joint stiffens in place, which is the null test the operator is judging.
+    #
+    # The reverse order looks equivalent and is not. At this moment the servo's goal
+    # register still holds the raw 0 written by begin-joint, so enabling torque first
+    # drives the joint back to the UNCALIBRATED straight pose - yanking it out of the
+    # operator's hand - before the new goal arrives and it comes back.
     hwi.set_position_all(hwi.zero_pos)
     time.sleep(0.5)
+    try:
+        hwi.set_joint_torque(joint_name, True)
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        # Its own code, not MOTORS_SILENT. Re-powering is the step that hands the
+        # joint's weight back to the servo, so failing it leaves the joint LIMP — the
+        # opposite state from a failed release, and the opposite thing to tell someone
+        # who is deciding whether to let go of it.
+        _note_calibration_fault("TORQUE_ENABLE_FAILED", joint_name)
+        _agent_error(502, "TORQUE_ENABLE_FAILED", str(e), joint_name)
 
+    add_telemetry_props(
+        joint_name=joint_name,
+        offset_rad=round(req.offset, 4),
+        offset_deg=round(math.degrees(req.offset), 2),
+    )
     return {"success": True}
 
 
 @app.post("/api/calibration/accept")
 def calibration_accept(req: AcceptJointRequest):
-    """Accept the offset for a joint."""
+    """Keep this joint's offset for the session. Nothing is on disk until /save."""
     global calibration_offsets
 
-    try:
-        hwi = get_hwi()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
 
-    if req.jointName not in hwi.joints:
-        raise HTTPException(status_code=400, detail=f"Unknown joint: {req.jointName}")
+    hwi.joints_offsets[joint_name] = req.offset
+    calibration_offsets[joint_name] = req.offset
 
-    hwi.joints_offsets[req.jointName] = req.offset
-    calibration_offsets[req.jointName] = req.offset
-
+    _bump("accepts", joint_name)
+    add_telemetry_props(
+        joint_name=joint_name,
+        offset_rad=round(req.offset, 4),
+        offset_deg=round(math.degrees(req.offset), 2),
+        accepted_count=len(calibration_offsets),
+        # attempts BEFORE this one stuck: how much work this joint cost
+        attempts=calibration_session.get("confirms", {}).get(joint_name, 1),
+    )
     return {"success": True, "offsets": calibration_offsets}
+
+
+@app.post("/api/calibration/finish")
+def calibration_finish():
+    """End the session, leaving no joint limp. Torque stays ON.
+
+    Without this, leaving the screen mid-session leaves whichever joint was released
+    hanging — the operator walks away and the duck sags on one leg. There is no other
+    route that re-powers a single joint without also accepting an offset for it.
+
+    Idempotent and best-effort per joint: a session that never opened has nothing to
+    re-power, and one servo failing to answer must not stop the other thirteen being
+    made safe. Reports which joints could not be re-powered rather than raising, because
+    the caller is a page being navigated away from and has nowhere to show an error.
+    """
+    global calibration_baselines
+
+    if hwi_instance is None:
+        calibration_baselines = {}
+        return {"success": True, "repowered": [], "failed": []}
+
+    hwi = hwi_instance
+    repowered, failed = [], []
+    for joint_name in list(hwi.joints.keys()):
+        try:
+            hwi.set_joint_torque(joint_name, True)
+            repowered.append(joint_name)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            failed.append(joint_name)
+
+    calibration_baselines = {}
+    add_telemetry_props(repowered=len(repowered), repower_failed=failed)
+    return {"success": True, "repowered": repowered, "failed": failed}
 
 
 @app.post("/api/calibration/save")
 def calibration_save():
-    """Save all calibration offsets to duck_config.json."""
+    """Merge the session's offsets into duck_config.json. Torque stays ON."""
     global calibration_offsets
+
+    # Read before release_hwi() drops the singleton — the summary event needs the full
+    # joint list to say which joints were SKIPPED, and skipped joints are by definition
+    # the ones missing from calibration_offsets.
+    hwi = hwi_instance
+    all_joints = list(hwi.joints.keys()) if hwi is not None else []
 
     try:
         config = _read_config()
+    except FileNotFoundError:
+        # A duck that has never been configured. Not an error: this is the first
+        # calibration, and _write_config creates the file. The old code let
+        # FileNotFoundError become a 500, so fourteen joints of work failed to save on
+        # exactly the robot most likely to be doing this for the first time.
+        config = {}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # A READ failure, and it never reaches a write. Almost always a corrupt
+        # duck_config.json — a half-written file from a previous power cut, or a
+        # hand-edit with a trailing comma. Refusing is correct: the file also holds
+        # start_paused, imu_upside_down and expression_features, and overwriting a file
+        # we could not parse would destroy all of it to save the offsets.
+        _note_calibration_fault("CONFIG_WRITE_FAILED")
+        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not read the existing config: {e}")
 
-    # Merge calibration offsets into config
     if "joints_offsets" not in config:
         config["joints_offsets"] = {}
     config["joints_offsets"].update(calibration_offsets)
 
     try:
         _write_config(config)
+    except OSError as e:
+        # A full card gets its own code, because it is the one cause here an operator
+        # can actually act on — free space, or swap the card. Every other write failure
+        # ends in "nothing was saved" with nothing to do about it, and folding them
+        # together would bury the one that has an action.
+        #
+        # ENOSPC comes from the .bak copy, not the config write. Measured on a real Pi
+        # (kernel 6.18.34-rpi-v8, ext4): with the filesystem at literally 0 bytes free,
+        # the failure lands at the backup step. It also needs to be at 0 — 3 KB free was
+        # enough for a 569-byte config to save fine — so this is a genuinely full card,
+        # not a nearly-full one.
+        if e.errno == errno.ENOSPC:
+            _note_calibration_fault("AGENT_DISK_FULL")
+            _agent_error(507, "AGENT_DISK_FULL", f"no space left writing the config: {e}")
+        # The classic Pi death, and the most likely of the four. The kernel remounts
+        # ext4 read-only when a failing card starts erroring, so the robot keeps running
+        # perfectly from RAM and only writes fail — which is exactly why "just a file
+        # write" is worth its own code. Naming the cause IS the action: an operator told
+        # their card is read-only knows to reflash or replace it, and nothing they do on
+        # this screen will help.
+        #
+        # errno 30 verified against a real read-only ext4 on the robot, not assumed.
+        if e.errno == errno.EROFS:
+            _note_calibration_fault("AGENT_DISK_READONLY")
+            _agent_error(500, "AGENT_DISK_READONLY", f"filesystem is read-only: {e}")
+        # What is left: the file owned by root from a sudo'd setup step while this
+        # server runs as pi, and anything else the OS reports.
+        _note_calibration_fault("CONFIG_WRITE_FAILED")
+        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not write the config: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _note_calibration_fault("CONFIG_WRITE_FAILED")
+        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not write the config: {e}")
 
-    # Reload HWI with new config
-    release_hwi()
+    # Free the bus WITHOUT dropping torque. This used to be a bare release_hwi(),
+    # whose disable_torque default is True - so the duck went limp the instant the
+    # operator saved, standing at the tall straight-leg zero pose after fourteen
+    # joints of work. Feetech servos hold position in firmware with no bus traffic,
+    # so freeing the port never requires going limp. Same fix, same reason, as
+    # stance_save.
+    release_hwi(disable_torque=False)
 
+    _capture_calibration_saved(all_joints)
     add_telemetry_props(joints_calibrated=len(calibration_offsets))
     return {"success": True, "offsets": config["joints_offsets"]}
+
+
+def _capture_calibration_saved(all_joints: list) -> None:
+    """The one event that carries a whole calibration.
+
+    The per-request events already hold each joint's numbers, but they cannot answer
+    the questions that matter across a fleet: did this session finish, which joints
+    were skipped, how many attempts did it cost, and how close does the result sit to
+    the servo's command seam. Those are session-shaped, so this is a session-shaped
+    event.
+
+    Fail-silent, and AFTER the write: telemetry must never be the reason a calibration
+    fails to save.
+    """
+    try:
+        session = calibration_session or {}
+        offsets = dict(calibration_offsets)
+        init_pos = session.get("init_pos", {})
+        magnitudes = [abs(math.degrees(v)) for v in offsets.values()]
+        headroom = _seam_headroom(offsets, init_pos)
+        started = session.get("started_at")
+        confirms = session.get("confirms", {})
+        faults = dict(session.get("faults", {}))
+        telemetry.capture(
+            "joint_calibration_saved",
+            {
+                # The values themselves, in both units: radians is what the config
+                # holds, degrees is what a human reads on a chart.
+                "offsets_rad": {k: round(v, 4) for k, v in offsets.items()},
+                "offsets_deg": {k: round(math.degrees(v), 2) for k, v in offsets.items()},
+                "joints_calibrated": len(offsets),
+                "joints_total": len(all_joints),
+                # Named, not just counted. "Everybody skips the head joints" and "this
+                # one robot skipped a knee" are different findings, and a count cannot
+                # tell them apart.
+                "joints_skipped": [j for j in all_joints if j not in offsets],
+                "max_abs_offset_deg": round(max(magnitudes), 2) if magnitudes else 0.0,
+                "mean_abs_offset_deg": (
+                    round(sum(magnitudes) / len(magnitudes), 2) if magnitudes else 0.0
+                ),
+                # How close the result puts each joint to the +-180 seam once the walk
+                # adds init_pos on top. The lowest number is the one that matters, and
+                # it is the evidence for or against building the guard.
+                "seam_headroom_deg": headroom,
+                "min_seam_headroom_deg": round(min(headroom.values()), 1) if headroom else None,
+                # Effort. Total measurements against joints kept says how often a joint
+                # had to be redone, which is the assembly-instructions signal.
+                "measure_attempts": sum(confirms.values()),
+                "joints_needing_retry": [j for j, n in confirms.items() if n > 1],
+                "faults": faults,
+                "fault_count": sum(faults.values()),
+                "duration_s": round(time.time() - started, 1) if started else None,
+            },
+        )
+    except Exception:
+        pass
 
 
 # ── Servo zero rehoming (firmware) ────────────────────────────────────────────
@@ -933,20 +1315,21 @@ def rehome_start():
         raise HTTPException(
             status_code=409, detail="Cannot rehome while a walk is running"
         )
-    if rehome_io is not None:
-        return {"joints": list(JOINTS.keys()), "alreadyStarted": True}
+    with BUS_LOCK:
+        if rehome_io is not None:
+            return {"joints": list(JOINTS.keys()), "alreadyStarted": True}
 
-    release_hwi()
-    try:
-        from pypot.feetech import FeetechSTS3215IO
+        release_hwi()
+        try:
+            from pypot.feetech import FeetechSTS3215IO
 
-        io = FeetechSTS3215IO(USB_PORT, baudrate=1000000)
-    except Exception as e:
-        raise HTTPException(
-            status_code=503, detail=f"Cannot open servo bus for rehoming: {e}"
-        )
-    rehome_io = io
-    rehome_config_backed_up = False
+            io = FeetechSTS3215IO(USB_PORT, baudrate=1000000)
+        except Exception as e:
+            raise HTTPException(
+                status_code=503, detail=f"Cannot open servo bus for rehoming: {e}"
+            )
+        rehome_io = io
+        rehome_config_backed_up = False
     return {"joints": list(JOINTS.keys()), "alreadyStarted": False}
 
 
@@ -1159,9 +1542,12 @@ def stance_offset(req: StanceOffsetRequest):
 def stance_positions():
     """Raw servo angles in radians (no offset subtraction), for pose display."""
     try:
-        hwi = get_hwi()
-        raw = hwi.io.read_present_position(list(hwi.joints.values()))
-    except Exception as e:
+        with BUS_LOCK:
+            hwi = get_hwi()
+            raw = hwi.io.read_present_position(list(hwi.joints.values()))
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
         raise HTTPException(status_code=503, detail=str(e))
     return {
         "positions": {
@@ -1508,9 +1894,22 @@ def _read_config() -> dict:
 
 def _write_config(config: dict):
     """Atomic write (temp + rename) with a .bak of the previous version — a
-    power cut mid-write must never cost the calibration in duck_config.json."""
+    power cut mid-write must never cost the calibration in duck_config.json.
+
+    The BACKUP is staged through a temp file too, and that is not symmetry for its own
+    sake. Measured on a real Pi with a full card: `shutil.copyfile` CREATES the
+    destination and then fails on the first write, so copying straight to `.bak` left a
+    zero-byte backup while the original was still intact — the one moment the safety
+    net is needed is the one moment it had just been destroyed. Staging means a failed
+    copy leaves `.bak.tmp` behind and the real `.bak` untouched.
+
+    Same reason the config itself goes through `.tmp`; the backup had simply been
+    forgotten.
+    """
     if os.path.exists(CONFIG_PATH):
-        shutil.copyfile(CONFIG_PATH, CONFIG_PATH + ".bak")
+        bak_tmp = CONFIG_PATH + ".bak.tmp"
+        shutil.copyfile(CONFIG_PATH, bak_tmp)
+        os.replace(bak_tmp, CONFIG_PATH + ".bak")
     tmp_path = CONFIG_PATH + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(config, f, indent=4)
@@ -2106,26 +2505,29 @@ def voltage():
         )
     # pypot needs the port; the next idle op lazily reopens HWI. Bus-only:
     # a battery poll must never drop a duck that is holding its stance.
-    release_hwi(disable_torque=False)
-    try:
-        from pypot.feetech import FeetechSTS3215IO
-
-        io = FeetechSTS3215IO(USB_PORT, baudrate=1000000)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Could not open servo bus: {e}")
-    names = list(JOINTS.keys())
-    try:
-        raw = io.get_present_voltage(list(JOINTS.values()))
-        per_motor = {n: round(float(v) * 0.1, 2) for n, v in zip(names, raw)}
-        raw_temp = io.get_present_temperature(list(JOINTS.values()))
-        temps = {n: int(t) for n, t in zip(names, raw_temp)}  # already °C, 1 byte
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Voltage read failed: {e}")
-    finally:
+    # Hold BUS_LOCK across the rustypot close AND the pypot session so a
+    # concurrent /api/state cannot keep rustypot's fd open on this adapter.
+    with BUS_LOCK:
+        release_hwi(disable_torque=False)
         try:
-            io.close()
-        except Exception:
-            pass
+            from pypot.feetech import FeetechSTS3215IO
+
+            io = FeetechSTS3215IO(USB_PORT, baudrate=1000000)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Could not open servo bus: {e}")
+        names = list(JOINTS.keys())
+        try:
+            raw = io.get_present_voltage(list(JOINTS.values()))
+            per_motor = {n: round(float(v) * 0.1, 2) for n, v in zip(names, raw)}
+            raw_temp = io.get_present_temperature(list(JOINTS.values()))
+            temps = {n: int(t) for n, t in zip(names, raw_temp)}  # already °C, 1 byte
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Voltage read failed: {e}")
+        finally:
+            try:
+                io.close()
+            except Exception:
+                pass
     volts = round(sum(per_motor.values()) / len(per_motor), 2) if per_motor else 0.0
     health_band = (
         "ok" if volts >= VOLTAGE_LOW else ("low" if volts >= VOLTAGE_CRITICAL else "critical")

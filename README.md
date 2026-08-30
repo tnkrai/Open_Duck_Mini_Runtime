@@ -189,8 +189,16 @@ failures that affect everyone.
 text from the setup log when it did not), API request outcomes from the robot
 server (endpoint, status, duration, failure cause), how a walk session ended
 (duration, exit code, and whether joint data was streaming, as a true/false),
-IMU calibration failures, and hardware facts: Pi model, RAM, OS, Python version,
-and which servo USB adapter chip you have (CH343 or FTDI).
+IMU calibration failures, joint calibration results (the offsets you measure,
+which joints were skipped or needed a retry, how long it took, and any faults),
+and hardware facts: Pi model, RAM, OS, Python version, and which servo USB
+adapter chip you have (CH343 or FTDI).
+
+Calibration offsets are how far each servo horn is seated from straight: a
+measurement of how your robot was assembled, not a record of anything it did.
+They are collected because they are the only way to tell whether the assembly
+instructions work, whether a batch of parts is off, and whether an offset sits
+close enough to the servo's command limit to be unsafe.
 
 **What it never sends:** joint or motion data, your recordings, your wifi
 password, session tokens, Supabase credentials, your Tnkr password, your name,

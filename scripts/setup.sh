@@ -902,10 +902,83 @@ do_systemd() {
     fi
 }
 
+# ── Address discovery ────────────────────────────────────────────────────────
+
+# Is this a dotted-quad IPv4 address? Guards every source below, because each
+# can hand back something that is not one: $SSH_CONNECTION carries an IPv6
+# address when the operator reached the Pi over IPv6, and `hostname -I` mixes
+# both families in one line. Only IPv4 is accepted, so the URL never needs
+# bracketing and never has to explain itself.
+_is_ipv4() {
+    printf '%s' "${1:-}" | awk -F. '
+        NF == 4 {
+            for (i = 1; i <= 4; i++)
+                if ($i !~ /^[0-9]+$/ || length($i) > 3 || $i + 0 > 255) exit 1
+            exit 0
+        }
+        { exit 1 }'
+}
+
+# The robot's address on the network, or nothing.
+#
+# Exists because the line above it is a `.local` name, and mDNS is not a
+# dependable way to find a machine: it works on macOS, needs avahi on Linux,
+# and on Windows it resolves erratically enough that testers have fallen back
+# to scanning the subnet for the Pi by hand. The name is still the better thing
+# to keep — it survives a DHCP lease changing, which an address does not — so
+# this is printed beside it rather than instead of it.
+lan_ip() {
+    local candidate=""
+
+    # 1. The address the operator actually reached this Pi on. $SSH_CONNECTION is
+    #    "client_ip client_port server_ip server_port", so field 3 is where their
+    #    traffic arrived. That makes it the one address already proven to work
+    #    from where they are sitting — which matters on a Pi holding both a Wi-Fi
+    #    and an Ethernet lease, where the other one may be on a network their
+    #    laptop cannot see.
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        candidate=$(printf '%s' "$SSH_CONNECTION" | awk '{print $3}')
+        _is_ipv4 "$candidate" || candidate=""
+    fi
+
+    # 2. Nobody is on the far end of an SSH pipe, so this is someone sitting at
+    #    the robot. Ask the routing table which source address the Pi would use
+    #    to leave the network. `route get` reads the table and sends no traffic,
+    #    so it answers with no route to the internet and costs nothing.
+    if [ -z "$candidate" ]; then
+        # `|| candidate=""` on the assignment, not just after it: `set -o pipefail`
+        # makes the substitution inherit `ip`'s status, and a Pi with no default
+        # route exits non-zero here. Unguarded, `set -e` would then abort a
+        # finished install while printing its success banner.
+        candidate=$(ip -4 route get 1.1.1.1 2>/dev/null |
+            awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }') ||
+            candidate=""
+        _is_ipv4 "$candidate" || candidate=""
+    fi
+
+    # 3. Last resort, and the least precise: every address on the box, in no
+    #    useful order. Takes the first IPv4 and hopes it faces the operator.
+    if [ -z "$candidate" ]; then
+        candidate=$(hostname -I 2>/dev/null | tr ' ' '\n' |
+            while read -r addr; do
+                if _is_ipv4 "$addr"; then printf '%s' "$addr"; break; fi
+            done) || candidate=""
+    fi
+
+    # Loopback is not somewhere anyone can reach this robot from, and printing
+    # it would send the operator somewhere guaranteed to fail. Better to print
+    # no address than a wrong one.
+    case "$candidate" in
+        127.*|"") return 1 ;;
+    esac
+
+    printf '%s' "$candidate"
+}
+
 # ── Success banner ───────────────────────────────────────────────────────────
 
 print_success() {
-    local server_url
+    local server_url ip_url lan
     server_url="http://$(hostname).local:$SERVER_PORT"
 
     # Driven by the tnkr CLI over SSH. Everything below is written for someone
@@ -927,6 +1000,16 @@ print_success() {
         return 0
     fi
 
+    # Below the early return: an install driven by the CLI prints none of this,
+    # and asking the routing table for an address nobody will read is work done
+    # on the slowest machine in the loop.
+    #
+    # `|| lan=""` is load-bearing under `set -e`. lan_ip returns non-zero when it
+    # has no address worth printing, and an unguarded assignment would abort a
+    # finished install over a cosmetic line.
+    lan=$(lan_ip) || lan=""
+    if [ -n "$lan" ]; then ip_url="http://$lan:$SERVER_PORT"; else ip_url=""; fi
+
     echo ""
     printf "  ${DIM}────────────────────────────────────────${RESET}\n"
     echo ""
@@ -934,6 +1017,12 @@ print_success() {
     echo ""
     printf "  ${ARROW} Server running at:\n"
     printf "    ${WHITE}%s${RESET}\n" "$server_url"
+    # Second, and only ever second: the name is what survives a new DHCP lease,
+    # so it stays the address we lead with. This one is for the operator whose
+    # machine cannot resolve it.
+    if [ -n "$ip_url" ]; then
+        printf "    ${WHITE}%s${RESET}  ${DIM}— use this if the name above doesn't work${RESET}\n" "$ip_url"
+    fi
     echo ""
     printf "  ${ARROW} Next steps:\n"
     printf "    ${DIM}1.${RESET} Check motors\n"

@@ -680,10 +680,28 @@ def check_motors():
 
 
 # ── Joint calibration (soft offsets) ─────────────────────────────────────────
-# Port of scripts/find_soft_offsets.py: the duck holds zero_pos under torque, one
-# joint is released at a time, the operator hand-poses it, and the difference
-# between two present readings becomes that joint's software offset in
-# duck_config.json.
+# The duck holds the pose it was PLACED in, one joint is released at a time, the
+# operator hand-poses that joint to straight, and the servo's reading there becomes
+# the joint's software offset in duck_config.json.
+#
+# NOTHING IS EVER COMMANDED TO SERVO-ZERO, and that is the point. The earlier flow (a
+# port of scripts/find_soft_offsets.py) drove every joint to zero_pos to arm, and took
+# each offset as a delta from the reading there. That is self-defeating on exactly the
+# joints calibration exists for: when a horn is mis-seated, servo-zero is mechanically
+# far from straight, so arming drove those joints toward their own shells — reported
+# from a real build as joints "hitting their limits and colliding with their own parts"
+# the moment calibration started. Holding the placed pose moves nothing.
+#
+# The offset is then read directly rather than differenced:
+#
+#     offset = the raw servo reading with the joint held at straight
+#
+# which IS the mounting error (a perfectly seated joint reads 0 there). At walk time
+# the HWI writes target + offset, so commanding straight puts the servo exactly where
+# the operator taught it. No droop baseline is needed, because no joint is ever held at
+# a commanded position under kd 0 for one to be measured against: the operator's hands
+# hold the joint while it is read, and a Feetech encoder reports true position with
+# torque off.
 #
 # Known limit, and the reason /api/rehome/* exists alongside this: a walk commands
 # init_pos + offset + policy, and init_pos already spends 79 deg of the servo's 180
@@ -699,10 +717,19 @@ def check_motors():
 # returns None if any of the fourteen fails, which made a silent joint 3 fail a
 # calibration of joint 7 with no way to name the joint that was actually quiet.
 
-# Offsets accepted this session, and the pre-release reading each was measured
-# against. Both keyed by joint name, both reset by /start.
+# Offsets accepted this session, and the baseline each was measured against. Both
+# keyed by joint name, both reset by /start.
 calibration_offsets: dict[str, float] = {}
 calibration_baselines: dict[str, float] = {}
+
+# The pose the session HOLDS while joints are released, in policy space (what
+# set_position_all is given; the servo goal is this plus the joint's offset).
+#
+# Starts as the pose the duck was PLACED in, so arming moves nothing. A joint's entry
+# flips to 0 — straight — once its offset is applied, so every later re-assert keeps
+# calibrated joints straight and leaves the uncalibrated ones where they were placed.
+# Empty outside a session, which makes a stray re-assert a no-op rather than a drive.
+calibration_hold: dict[str, float] = {}
 
 # What the fleet analytics needs that a per-request event cannot carry: how long the
 # whole session took, how many attempts each joint needed, which faults came up, and
@@ -831,52 +858,64 @@ def _read_one(hwi, joint_name: str) -> float:
 
 @app.post("/api/calibration/start")
 def calibration_start():
-    """Zero every offset, power on, and hold zero_pos so joints can be released."""
-    global calibration_offsets, calibration_baselines
+    """Hold the pose the duck was placed in, so joints can be released one at a time.
+
+    Moves nothing: every joint is commanded to the position it is already at.
+    """
+    global calibration_offsets, calibration_baselines, calibration_hold
 
     hwi = _calibration_hwi()
 
+    # Offsets zeroed first, so for the rest of the session a present read is the RAW
+    # servo angle — the space the offset itself is measured in.
     for joint_name in hwi.joints:
         hwi.joints_offsets[joint_name] = 0
     calibration_offsets = {}
     calibration_baselines = {}
 
+    # BEFORE hwi.init_pos is overwritten below: the saved summary needs the real
+    # walking pose to compute seam headroom, and this is the last moment it is there.
     _reset_calibration_session(hwi)
 
     # kd 0 so a released joint is not fought on the way back, matching the script.
     hwi.set_kds([0] * len(hwi.joints))
-    # dict(), not a bare assignment: `hwi.init_pos = hwi.zero_pos` makes the two names
-    # the same object, so any later per-joint write to one silently edits the other.
-    hwi.init_pos = dict(hwi.zero_pos)
-    hwi.turn_on()
-    hwi.set_position_all(hwi.zero_pos)
-    time.sleep(1)
 
-    # The whole-bus read belongs HERE and only here: arming is the one step that is
-    # about every joint, so a servo that is already silent is caught before the
-    # operator has their hands on the robot. Reported rather than swallowed - the
-    # old code returned an empty currentPositions dict and let the session continue
-    # with no baselines at all.
+    # Read BEFORE commanding anything. This is the placed pose — the thing the session
+    # will hold — and it doubles as the whole-bus silent-joint check, which belongs
+    # here and only here: arming is the one step that is about every joint, so a servo
+    # that is already quiet is caught before the operator's hands are on the robot.
+    # Reported rather than swallowed: the old code returned an empty currentPositions
+    # dict and let the session continue with no pose at all.
     positions = hwi.get_present_positions()
     if positions is None:
         _note_calibration_fault("MOTORS_SILENT")
-        _agent_error(502, "MOTORS_SILENT", "at least one joint did not answer while moving to zero")
+        _agent_error(502, "MOTORS_SILENT", "at least one joint did not answer")
 
     joint_names = list(hwi.joints.keys())
     current_positions = {
         name: round(float(positions[i]), 3) for i, name in enumerate(joint_names)
     }
 
-    # The droop across the whole robot, at the one moment every joint is commanded to
-    # the same place under the same kd. Fleet-wide this says how much sag is normal,
-    # which is what makes an outlier joint recognisable as an outlier.
-    droop = [abs(v) for v in current_positions.values()]
+    # Hold exactly where each joint already is. The offsets were zeroed above, so
+    # set_position_all writes each goal unchanged: every servo's goal IS its present
+    # position, and nothing moves. dict(), not a bare assignment — sharing one object
+    # with hwi.init_pos would make a later per-joint write silently edit both.
+    calibration_hold = dict(current_positions)
+    hwi.init_pos = dict(current_positions)
+    hwi.turn_on()
+    hwi.set_position_all(calibration_hold)
+    time.sleep(0.5)
+
+    # The placed pose, fleet-wide: how far from straight operators actually leave the
+    # duck when they calibrate. That is what says whether the on-screen reference
+    # matches what people really do with the robot in front of them.
+    placed = [abs(v) for v in current_positions.values()]
     telemetry.capture(
         "joint_calibration_started",
         {
             "joint_count": len(joint_names),
-            "baselines_rad": current_positions,
-            "max_abs_droop_rad": round(max(droop), 4) if droop else 0.0,
+            "placed_pose_rad": current_positions,
+            "max_abs_placed_rad": round(max(placed), 4) if placed else 0.0,
         },
     )
     return {"joints": joint_names, "currentPositions": current_positions}
@@ -893,17 +932,25 @@ def calibration_begin_joint(req: JointRequest):
     # against its own previous correction and the offsets compound.
     hwi.joints_offsets[joint_name] = 0
 
-    # Re-assert the pose before measuring: hand-posing one joint drags its
-    # neighbours, and their goals are what the baseline is relative to.
-    hwi.set_position_all(hwi.zero_pos)
+    # Re-assert the HELD pose before releasing: hand-posing one joint drags its
+    # neighbours off their goals. Calibrated joints are held straight (their entry
+    # flipped to 0 in apply-offset), the rest stay where the duck was placed. NOT
+    # zero_pos — driving the whole robot to servo-zero is what this flow exists to
+    # avoid. Empty outside a session, so this is a no-op rather than a drive.
+    hwi.set_position_all(calibration_hold)
     time.sleep(0.5)
 
-    # The baseline, and the whole reason this endpoint returns a number. kds are 0
-    # for this session, so a loaded joint settles a little off the zero it was
-    # commanded to. The offset is the difference between two PRESENT readings, which
-    # cancels that droop; comparing against a hardcoded 0.0 folds it into every
-    # saved offset instead.
-    baseline = _read_one(hwi, joint_name)
+    # Read the joint, but NOT for a baseline: the offset is measured against straight,
+    # so the baseline is 0 by definition and there is nothing to subtract. The read
+    # earns its place as a liveness check — this is the last moment before the
+    # operator's hands go on the joint, and "this joint did not answer" is worth
+    # saying now rather than after they have posed it.
+    pre_release = _read_one(hwi, joint_name)
+
+    # Recorded even though it is a constant: confirm-position stays a subtraction, the
+    # response shape is unchanged, and its presence is what marks this joint released
+    # (see the INVALID_STATE guard there).
+    baseline = 0.0
     calibration_baselines[joint_name] = baseline
 
     try:
@@ -921,6 +968,11 @@ def calibration_begin_joint(req: JointRequest):
     add_telemetry_props(
         joint_name=joint_name,
         baseline_rad=round(baseline, 4),
+        # Where the joint sat before the operator touched it. Not a baseline any more,
+        # but the distance from here to the straight pose is how far a mis-seated horn
+        # actually had to be moved — which the old flow could never report, because it
+        # had already dragged every joint to servo-zero before anyone looked.
+        pre_release_rad=round(pre_release, 4),
         # 2 means the operator came back to this joint: worth knowing per joint, and
         # worth knowing whether it is always the same joints across the fleet.
         attempt=calibration_session.get("begins", {}).get(joint_name, 1),
@@ -930,7 +982,12 @@ def calibration_begin_joint(req: JointRequest):
 
 @app.post("/api/calibration/confirm-position")
 def calibration_confirm_position(req: JointRequest):
-    """Read the posed joint and return the offset, as a delta from the baseline."""
+    """Read the joint at the straight pose. That raw reading IS the offset.
+
+    Kept as a subtraction against the baseline (0) rather than collapsed to the read:
+    the arithmetic is the thing being asserted, and a future baseline that is not zero
+    would otherwise have to reintroduce it.
+    """
     hwi = _calibration_hwi()
     joint_name = _calibration_joint(hwi, req.jointName)
 
@@ -974,15 +1031,24 @@ def calibration_apply_offset(req: ApplyOffsetRequest):
 
     hwi.joints_offsets[joint_name] = req.offset
 
+    # This joint now holds STRAIGHT. With its offset set, a policy-zero goal puts the
+    # servo at raw = offset, which is exactly where the operator's hands are — so the
+    # entry flips to 0 and every later re-assert keeps it there.
+    calibration_hold[joint_name] = 0.0
+
     # Goal FIRST, torque second. set_position_all writes pos + offset, so the goal is
     # where the operator's hands are and the servo wakes already at its target: the
     # joint stiffens in place, which is the null test the operator is judging.
     #
     # The reverse order looks equivalent and is not. At this moment the servo's goal
-    # register still holds the raw 0 written by begin-joint, so enabling torque first
-    # drives the joint back to the UNCALIBRATED straight pose - yanking it out of the
-    # operator's hand - before the new goal arrives and it comes back.
-    hwi.set_position_all(hwi.zero_pos)
+    # register still holds what begin-joint wrote, so enabling torque first drives the
+    # joint back there — yanking it out of the operator's hand — before the new goal
+    # arrives and it comes back.
+    #
+    # Commanding calibration_hold rather than zero_pos is what keeps the promise for
+    # the OTHER thirteen: an uncalibrated joint stays where the duck was placed instead
+    # of being dragged to servo-zero behind the operator's back.
+    hwi.set_position_all(calibration_hold)
     time.sleep(0.5)
     try:
         hwi.set_joint_torque(joint_name, True)
@@ -1040,10 +1106,11 @@ def calibration_finish():
     made safe. Reports which joints could not be re-powered rather than raising, because
     the caller is a page being navigated away from and has nowhere to show an error.
     """
-    global calibration_baselines
+    global calibration_baselines, calibration_hold
 
     if hwi_instance is None:
         calibration_baselines = {}
+        calibration_hold = {}
         return {"success": True, "repowered": [], "failed": []}
 
     hwi = hwi_instance
@@ -1058,6 +1125,9 @@ def calibration_finish():
             failed.append(joint_name)
 
     calibration_baselines = {}
+    # Cleared with the rest of the session: a stale hold pose would let a later
+    # re-assert command a pose the operator never placed the duck in.
+    calibration_hold = {}
     add_telemetry_props(repowered=len(repowered), repower_failed=failed)
     return {"success": True, "repowered": repowered, "failed": failed}
 

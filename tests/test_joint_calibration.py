@@ -1,10 +1,17 @@
 """Per-joint soft-offset calibration (/api/calibration/*).
 
-Four behaviours this flow got wrong, each with a test here:
+The session HOLDS the pose the duck was placed in and never commands a joint to
+servo-zero; each offset is the joint's raw reading at the straight pose. The two
+tests at the bottom pin that, because the failure it replaces was a real one: driving
+to zero_pos to arm sent mis-seated joints — the joints calibration exists for — into
+their own shells.
 
-  1. The offset was measured against a hardcoded 0.0 instead of the joint's real
-     pre-release reading, so servo droop (kds are 0 for this session) landed in every
-     saved offset.
+Behaviours this flow got wrong, each with a test here:
+
+  1. The offset was measured against a hardcoded 0.0 while the joint was ALSO being
+     held at a commanded zero under kd 0, so servo droop landed in every saved offset.
+     (Moot under hold-pose: nothing is held at a commanded zero, and the joint is read
+     while the operator's hands hold it, so there is no droop to cancel.)
   2. `get_present_positions()` reads all fourteen and returns None if ANY fails, so a
      silent joint 3 failed a calibration of joint 7 and nothing could name the joint
      that was actually quiet.
@@ -78,6 +85,7 @@ def hwi(monkeypatch, tmp_path):
     monkeypatch.setattr(tnkr_server, "CONFIG_PATH", str(tmp_path / "duck_config.json"))
     monkeypatch.setattr(tnkr_server, "calibration_offsets", {})
     monkeypatch.setattr(tnkr_server, "calibration_baselines", {})
+    monkeypatch.setattr(tnkr_server, "calibration_hold", {})
 
     fake = FakeHWI()
 
@@ -92,21 +100,64 @@ def hwi(monkeypatch, tmp_path):
     return fake
 
 
-def test_offset_is_a_delta_between_two_readings_not_an_absolute(client, hwi):
-    """The droop fix. A joint commanded to zero settles at 0.02 rad under its own
-    load; the operator then poses it to 0.17. The offset is 0.15, not 0.17."""
-    hwi.readings["left_knee"] = 0.02
+def test_the_offset_is_the_reading_at_the_straight_pose(client, hwi):
+    """The offset is measured against STRAIGHT, not against wherever the duck sits.
+
+    The joint is placed at 0.02, released, and posed to straight where it reads 0.17.
+    0.17 IS the mounting error, and the offset. Differencing against the placed pose
+    would bake that pose into every saved offset — a knee calibrated in a crouch would
+    carry the crouch into the walk.
+    """
+    hwi.readings["left_knee"] = 0.02  # wherever the operator placed it
     r = client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
     assert r.status_code == 200
-    assert r.json()["baseline"] == pytest.approx(0.02)
+    assert r.json()["baseline"] == 0.0
 
-    hwi.readings["left_knee"] = 0.17
+    hwi.readings["left_knee"] = 0.17  # posed to straight
     r = client.post("/api/calibration/confirm-position", json={"jointName": "left_knee"})
     assert r.status_code == 200
     body = r.json()
-    assert body["offset"] == pytest.approx(0.15)
-    assert body["previousPosition"] == pytest.approx(0.02)
+    assert body["offset"] == pytest.approx(0.17)
+    assert body["previousPosition"] == 0.0
     assert body["newPosition"] == pytest.approx(0.17)
+
+
+def test_start_holds_the_placed_pose_and_never_commands_zero(client, hwi):
+    """The whole reason this flow changed.
+
+    Arming used to drive every joint to servo-zero. On a mis-seated horn servo-zero is
+    mechanically far from straight, so that drove exactly the joints calibration exists
+    for into their own shells. Every goal written here is the joint's own present
+    position: nothing moves.
+    """
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    commanded = []
+    hwi.set_position_all = lambda positions: commanded.append(dict(positions))
+
+    r = client.post("/api/calibration/start")
+    assert r.status_code == 200
+    assert r.json()["currentPositions"] == pytest.approx(hwi.readings)
+    assert commanded == [pytest.approx(hwi.readings)]
+
+
+def test_apply_holds_this_joint_straight_and_leaves_the_others_where_they_were(client, hwi):
+    """The other half of the promise. Applying an offset must not be a back door to the
+    drive this flow removed: the calibrated joint flips to straight, and the twelve the
+    operator has not reached yet stay exactly where the duck was placed."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+
+    commanded = []
+    hwi.set_position_all = lambda positions: commanded.append(dict(positions))
+    r = client.post(
+        "/api/calibration/apply-offset", json={"jointName": "left_knee", "offset": 0.15}
+    )
+    assert r.status_code == 200
+
+    held = commanded[-1]
+    assert held["left_knee"] == 0.0  # goal 0 + offset 0.15 = the posed position
+    assert held["right_knee"] == pytest.approx(-0.9)
+    assert held["head_yaw"] == pytest.approx(0.2)
 
 
 def test_begin_joint_reads_only_the_joint_it_is_releasing(client, hwi):
@@ -149,7 +200,7 @@ def test_begin_joint_resets_this_joints_offset_so_redos_do_not_compound(client, 
     hwi.readings["left_knee"] = 0.02
     client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
     assert hwi.joints_offsets["left_knee"] == 0
-    assert tnkr_server.calibration_baselines["left_knee"] == pytest.approx(0.02)
+    assert tnkr_server.calibration_baselines["left_knee"] == 0.0
 
 
 def test_confirm_without_begin_is_a_state_error_not_a_wrong_number(client, hwi):
@@ -286,14 +337,18 @@ def _event(captured, name):
     return hits[-1]["properties"]
 
 
-def test_start_reports_the_droop_across_the_whole_robot(client, hwi, captured):
-    hwi.readings = {"left_knee": 0.02, "right_knee": -0.03, "head_yaw": 0.0}
+def test_start_reports_the_pose_the_duck_was_placed_in(client, hwi, captured):
+    """Was droop-at-zero, which no longer exists: nothing is commanded to zero, so
+    there is no sag against a commanded zero to measure. What arming can report now is
+    the pose operators actually leave the duck in, which is what says whether the
+    on-screen straight reference matches the robot in front of them."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.03, "head_yaw": 0.0}
     client.post("/api/calibration/start")
     props = _event(captured, "joint_calibration_started")
     assert props["joint_count"] == 3
-    assert props["baselines_rad"]["right_knee"] == pytest.approx(-0.03)
-    # the outlier is what makes an outlier joint recognisable fleet-wide
-    assert props["max_abs_droop_rad"] == pytest.approx(0.03)
+    assert props["placed_pose_rad"]["right_knee"] == pytest.approx(-0.03)
+    # the joint furthest from straight: how much hand-posing this session will cost
+    assert props["max_abs_placed_rad"] == pytest.approx(1.3)
 
 
 def test_measuring_reports_the_offset_and_its_seam_headroom(client, hwi, captured):

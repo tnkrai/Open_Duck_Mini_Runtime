@@ -20,6 +20,10 @@ Behaviours this flow got wrong, each with a test here:
      new goal arrived.
   4. save called release_hwi(), whose disable_torque default is True, so the duck went
      limp the instant the operator saved.
+  5. begin-joint zeroed a redone joint's offset and then re-asserted a hold entry
+     written in the old offset space, so the re-assert drove that joint to servo-zero.
+  6. finish enabled torque against stale goal registers, and left the HWI singleton
+     carrying the session's zeroed offsets for the next route to drive through.
 """
 
 import pytest
@@ -44,8 +48,12 @@ class FakeHWI:
         self.read_fails = read_fails or set()
         self.torque_calls = []          # (joint, enabled)
         self.position_writes = 0
+        # every goal as the servo receives it, position + offset: RAW, per write
+        self.raw_goals = []
         self.turned_off = False
+        self.turned_on = False
         self.kds = None
+        self.kps = None
 
     # -- the vector read, used only by /start --
     def get_present_positions(self):
@@ -67,14 +75,20 @@ class FakeHWI:
     def set_kds(self, kds):
         self.kds = kds
 
+    def set_kps(self, kps):
+        self.kps = kps
+
     def turn_on(self):
-        pass
+        self.turned_on = True
 
     def turn_off(self):
         self.turned_off = True
 
     def set_position_all(self, positions):
         self.position_writes += 1
+        self.raw_goals.append(
+            {j: p + self.joints_offsets.get(j, 0.0) for j, p in positions.items()}
+        )
 
     def close(self):
         pass
@@ -160,6 +174,30 @@ def test_apply_holds_this_joint_straight_and_leaves_the_others_where_they_were(c
     assert held["head_yaw"] == pytest.approx(0.2)
 
 
+def test_start_writes_every_goal_before_powering_and_never_ramps(client, hwi):
+    """turn_on() would have ramped every joint through kp 2 for a second — a loaded
+    knee sags under the body and is hauled back when the real kp lands — and driven
+    to hwi.init_pos on the way. Gains are written directly at the hold stiffness the
+    operator's own script was proven with, the goals land, and only then does each
+    joint get its explicit enable."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    stance = dict(hwi.init_pos)
+    order = []
+    hwi.set_position_all = lambda positions: order.append("goal")
+    hwi.set_joint_torque = lambda joint_name, enabled: order.append(
+        f"torque:{joint_name}:{enabled}"
+    )
+
+    r = client.post("/api/calibration/start")
+    assert r.status_code == 200
+    assert r.json()["mode"] == "hold"
+    assert order == ["goal"] + [f"torque:{j}:True" for j in JOINTS]
+    assert hwi.turned_on is False
+    assert hwi.kps == [tnkr_server.CALIBRATION_HOLD_KP] * len(JOINTS)
+    assert hwi.kds == [0] * len(JOINTS)
+    assert hwi.init_pos == stance  # the walking stance is not the session's to edit
+
+
 def test_begin_joint_reads_only_the_joint_it_is_releasing(client, hwi):
     """The attribution fix. A silent joint elsewhere on the bus must not fail the
     joint being calibrated — that conflation is why 'this joint did not answer' was
@@ -201,6 +239,32 @@ def test_begin_joint_resets_this_joints_offset_so_redos_do_not_compound(client, 
     client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
     assert hwi.joints_offsets["left_knee"] == 0
     assert tnkr_server.calibration_baselines["left_knee"] == 0.0
+    # and its hold entry is re-read in the new (offset 0) space: the raw position
+    assert tnkr_server.calibration_hold["left_knee"] == pytest.approx(0.02)
+
+
+def test_redoing_a_calibrated_joint_holds_it_where_it_is(client, hwi):
+    """Found by review before it reached a robot. After apply-offset a joint's hold
+    entry is 0 in a space where its offset carries the whole correction. begin-joint
+    zeroes that offset for the redo, and re-asserting the entry as it stood would
+    write raw 0 — servo-zero, the mis-seated horn's shell — to a powered joint at full
+    stiffness. The entry has to be re-read in the new space first."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    hwi.readings["left_knee"] = 0.5  # posed straight: the horn is 0.5 rad off
+    m = client.post("/api/calibration/confirm-position", json={"jointName": "left_knee"}).json()
+    client.post(
+        "/api/calibration/apply-offset", json={"jointName": "left_knee", "offset": m["offset"]}
+    )
+    assert hwi.raw_goals[-1]["left_knee"] == pytest.approx(0.5)  # held straight
+
+    r = client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    assert r.status_code == 200
+    goals = hwi.raw_goals[-1]
+    assert goals["left_knee"] == pytest.approx(0.5)  # not 0.0
+    assert goals["right_knee"] == pytest.approx(-0.9)
+    assert goals["head_yaw"] == pytest.approx(0.2)
 
 
 def test_confirm_without_begin_is_a_state_error_not_a_wrong_number(client, hwi):
@@ -588,3 +652,50 @@ def test_finish_on_a_session_that_never_opened_is_a_no_op(client, monkeypatch):
     r = client.post("/api/calibration/finish")
     assert r.status_code == 200
     assert r.json() == {"success": True, "repowered": [], "failed": []}
+
+
+def test_finish_re_powers_each_joint_where_it_is_and_frees_the_bus(client, hwi):
+    """A released joint's goal register still says where it was before the operator's
+    hands took it, so enabling torque against it is a drive. The goal is rewritten to
+    the present position first. Then the singleton is dropped bus-only: it is carrying
+    the session's zeroed offsets, and the next route to reuse it (head puppet turns
+    the robot on through it) would command its stance through them."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    hwi.readings["left_knee"] = 0.9  # let go of, and sagged
+
+    order = []
+    hwi.set_position_all = lambda positions: order.append(("goal", dict(positions)))
+    hwi.set_joint_torque = lambda joint_name, enabled: order.append(
+        ("torque", joint_name, enabled)
+    )
+    r = client.post("/api/calibration/finish")
+    assert r.status_code == 200
+    assert order[0] == ("goal", {"left_knee": pytest.approx(0.9)})
+    assert order[1] == ("torque", "left_knee", True)
+    assert tnkr_server.hwi_instance is None  # bus freed...
+    assert hwi.turned_off is False  # ...torque kept
+    assert tnkr_server.calibration_hold == {}
+
+
+def test_save_clears_the_hold_so_a_later_release_cannot_replay_it(client, hwi):
+    """After a save the next HWI loads the saved offsets, and the placed pose was
+    recorded against zeros: re-asserting it would move every skipped joint by its
+    on-disk offset. The accepted offsets stay, because a failed save retries on them."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/accept", json={"jointName": "left_knee", "offset": 0.15})
+    r = client.post("/api/calibration/save")
+    assert r.status_code == 200
+    assert tnkr_server.calibration_hold == {}
+    assert tnkr_server.calibration_baselines == {}
+    assert tnkr_server.calibration_offsets == {"left_knee": pytest.approx(0.15)}
+
+
+def test_health_advertises_the_hold_so_studio_can_refuse_an_older_agent(client):
+    """Studio checks this at connect and refuses to arm without it. It cannot wait for
+    /start's reply: an older agent has driven every joint to servo-zero by then."""
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["calibrationMode"] == "hold"

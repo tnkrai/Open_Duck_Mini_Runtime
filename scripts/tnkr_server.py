@@ -558,6 +558,13 @@ def health():
         "walking": is_walking(),
         "paused": is_paused(),
         "walkExitCode": walk_exit_code(),
+        # What /api/calibration/start does to the robot. Studio reads this at connect
+        # and refuses to arm a joint calibration against an agent that does not say
+        # "hold": the older flow drove every joint to servo-zero the moment it was
+        # armed, and the screen that arms it now promises the opposite. It has to be
+        # here rather than in /start's reply, because by the time an old agent has
+        # replied it has already moved the duck.
+        "calibrationMode": "hold",
     }
 
 
@@ -728,15 +735,25 @@ calibration_baselines: dict[str, float] = {}
 # Starts as the pose the duck was PLACED in, so arming moves nothing. A joint's entry
 # flips to 0 — straight — once its offset is applied, so every later re-assert keeps
 # calibrated joints straight and leaves the uncalibrated ones where they were placed.
-# Empty outside a session, which makes a stray re-assert a no-op rather than a drive.
+# An entry is only meaningful in the offset space it was written in, which is why
+# begin-joint re-reads the joint it is about to release and rewrites its entry in the
+# same breath as zeroing its offset (see there). Cleared by /finish and /save, so a
+# stray re-assert after either is a no-op rather than a drive.
 calibration_hold: dict[str, float] = {}
+
+# Stiffness for the held pose. The walk's kp of 32 is more than keeping a placed duck
+# still needs; 20 is what the operator's own hold-and-release script was proven with
+# on the robot. kd is 0 for the session so a released joint is not fought.
+CALIBRATION_HOLD_KP = 20
 
 # What the fleet analytics needs that a per-request event cannot carry: how long the
 # whole session took, how many attempts each joint needed, which faults came up, and
 # the init_pos the offsets will actually be added to at walk time.
 #
-# init_pos has to be SNAPSHOTTED here because /start overwrites hwi.init_pos with the
-# zero pose for the duration of the session, so by /save the real walking pose is gone.
+# init_pos is copied here rather than read at /save because /save runs after the HWI
+# may have been dropped. hwi.init_pos itself is never touched by the session: the
+# placed pose is written as goals, not installed as the stance, so nothing that turns
+# the robot on later walks to it.
 calibration_session: dict = {}
 
 
@@ -873,12 +890,7 @@ def calibration_start():
     calibration_offsets = {}
     calibration_baselines = {}
 
-    # BEFORE hwi.init_pos is overwritten below: the saved summary needs the real
-    # walking pose to compute seam headroom, and this is the last moment it is there.
     _reset_calibration_session(hwi)
-
-    # kd 0 so a released joint is not fought on the way back, matching the script.
-    hwi.set_kds([0] * len(hwi.joints))
 
     # Read BEFORE commanding anything. This is the placed pose — the thing the session
     # will hold — and it doubles as the whole-bus silent-joint check, which belongs
@@ -896,14 +908,37 @@ def calibration_start():
         name: round(float(positions[i]), 3) for i, name in enumerate(joint_names)
     }
 
+    # Gains written directly, once. NOT turn_on(): that ramps every joint through kp 2
+    # for a second before its goal lands, and with kd at 0 a loaded knee sags under
+    # the body for those seconds and is hauled back when the real kp arrives — a
+    # visible dip on a duck that was promised nothing would move. It would also have
+    # driven every joint to hwi.init_pos on the way, which is not where the duck is.
+    try:
+        hwi.set_kds([0] * len(joint_names))
+        hwi.set_kps([CALIBRATION_HOLD_KP] * len(joint_names))
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        _note_calibration_fault("MOTORS_SILENT")
+        _agent_error(502, "MOTORS_SILENT", str(e))
+
     # Hold exactly where each joint already is. The offsets were zeroed above, so
     # set_position_all writes each goal unchanged: every servo's goal IS its present
-    # position, and nothing moves. dict(), not a bare assignment — sharing one object
-    # with hwi.init_pos would make a later per-joint write silently edit both.
+    # position, and nothing moves. Goal first, torque second, per joint — the order
+    # apply-offset uses, for the same reason: a servo that wakes up already at its
+    # target stiffens in place, and an explicit enable after the goal does not depend
+    # on the firmware doing it for us. dict(), not a bare assignment — sharing the
+    # object with anything else would make a later per-joint write edit both.
     calibration_hold = dict(current_positions)
-    hwi.init_pos = dict(current_positions)
-    hwi.turn_on()
     hwi.set_position_all(calibration_hold)
+    for joint_name in joint_names:
+        try:
+            hwi.set_joint_torque(joint_name, True)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            _note_calibration_fault("TORQUE_ENABLE_FAILED", joint_name)
+            _agent_error(502, "TORQUE_ENABLE_FAILED", str(e), joint_name)
     time.sleep(0.5)
 
     # The placed pose, fleet-wide: how far from straight operators actually leave the
@@ -918,7 +953,9 @@ def calibration_start():
             "max_abs_placed_rad": round(max(placed), 4) if placed else 0.0,
         },
     )
-    return {"joints": joint_names, "currentPositions": current_positions}
+    # `mode` is the belt to /api/health's braces: Studio refuses to arm against an
+    # agent whose health does not say "hold", and checks this on the way back.
+    return {"joints": joint_names, "currentPositions": current_positions, "mode": "hold"}
 
 
 @app.post("/api/calibration/begin-joint")
@@ -932,20 +969,29 @@ def calibration_begin_joint(req: JointRequest):
     # against its own previous correction and the offsets compound.
     hwi.joints_offsets[joint_name] = 0
 
+    # Read the joint where it is — raw, now that its offset is 0 — and make THAT its
+    # hold entry before anything is re-asserted. The entry it had cannot survive the
+    # offset change: after apply-offset it is 0 in a space where the offset carried
+    # the whole correction, and re-asserting that 0 with the offset just zeroed would
+    # send a redone joint from straight to servo-zero at full stiffness, which is the
+    # one drive this flow exists never to make. Reading fresh also means a joint that
+    # is limp is held where it hangs rather than hauled back to where it was released.
+    #
+    # NOT a baseline: the offset is measured against straight, so the baseline is 0
+    # by definition and there is nothing to subtract. The read earns its place as the
+    # liveness check — this is the last moment before the operator's hands go on the
+    # joint, and "this joint did not answer" is worth saying now rather than after
+    # they have posed it.
+    pre_release = _read_one(hwi, joint_name)
+    calibration_hold[joint_name] = pre_release
+
     # Re-assert the HELD pose before releasing: hand-posing one joint drags its
     # neighbours off their goals. Calibrated joints are held straight (their entry
-    # flipped to 0 in apply-offset), the rest stay where the duck was placed. NOT
-    # zero_pos — driving the whole robot to servo-zero is what this flow exists to
-    # avoid. Empty outside a session, so this is a no-op rather than a drive.
+    # flipped to 0 in apply-offset), the rest stay where the duck was placed, and this
+    # joint's goal is the position it is already at. NOT zero_pos — driving the whole
+    # robot to servo-zero is what this flow exists to avoid.
     hwi.set_position_all(calibration_hold)
     time.sleep(0.5)
-
-    # Read the joint, but NOT for a baseline: the offset is measured against straight,
-    # so the baseline is 0 by definition and there is nothing to subtract. The read
-    # earns its place as a liveness check — this is the last moment before the
-    # operator's hands go on the joint, and "this joint did not answer" is worth
-    # saying now rather than after they have posed it.
-    pre_release = _read_one(hwi, joint_name)
 
     # Recorded even though it is a constant: confirm-position stays a subtraction, the
     # response shape is unchanged, and its presence is what marks this joint released
@@ -1095,16 +1141,26 @@ def calibration_accept(req: AcceptJointRequest):
 
 @app.post("/api/calibration/finish")
 def calibration_finish():
-    """End the session, leaving no joint limp. Torque stays ON.
+    """End the session, leaving no joint limp and moving none. Torque stays ON.
 
     Without this, leaving the screen mid-session leaves whichever joint was released
     hanging — the operator walks away and the duck sags on one leg. There is no other
     route that re-powers a single joint without also accepting an offset for it.
 
+    Each joint is re-powered at the position it is in NOW, not at its goal register: a
+    released joint's register still says where it was before the operator's hands took
+    it, and enabling torque against that is a drive, not a hold. Goal first, torque
+    second — apply-offset's rule, for apply-offset's reason.
+
     Idempotent and best-effort per joint: a session that never opened has nothing to
     re-power, and one servo failing to answer must not stop the other thirteen being
     made safe. Reports which joints could not be re-powered rather than raising, because
     the caller is a page being navigated away from and has nowhere to show an error.
+
+    Ends by dropping the HWI singleton bus-only, as /save does. The session zeroed every
+    offset in memory, so the singleton carries a calibration that is not the one on
+    disk, and the next route to reuse it — /api/head/puppet turns the robot on through
+    it — would command its stance through those offsets. A fresh HWI reloads the file.
     """
     global calibration_baselines, calibration_hold
 
@@ -1117,6 +1173,7 @@ def calibration_finish():
     repowered, failed = [], []
     for joint_name in list(hwi.joints.keys()):
         try:
+            hwi.set_position_all({joint_name: hwi.get_present_position(joint_name)})
             hwi.set_joint_torque(joint_name, True)
             repowered.append(joint_name)
         except BaseException as e:
@@ -1128,6 +1185,7 @@ def calibration_finish():
     # Cleared with the rest of the session: a stale hold pose would let a later
     # re-assert command a pose the operator never placed the duck in.
     calibration_hold = {}
+    release_hwi(disable_torque=False)
     add_telemetry_props(repowered=len(repowered), repower_failed=failed)
     return {"success": True, "repowered": repowered, "failed": failed}
 
@@ -1135,7 +1193,7 @@ def calibration_finish():
 @app.post("/api/calibration/save")
 def calibration_save():
     """Merge the session's offsets into duck_config.json. Torque stays ON."""
-    global calibration_offsets
+    global calibration_offsets, calibration_baselines, calibration_hold
 
     # Read before release_hwi() drops the singleton — the summary event needs the full
     # joint list to say which joints were SKIPPED, and skipped joints are by definition
@@ -1209,6 +1267,14 @@ def calibration_save():
 
     _capture_calibration_saved(all_joints)
     add_telemetry_props(joints_calibrated=len(calibration_offsets))
+
+    # The hold is over once the offsets are on disk. Left behind, a Redo after saving
+    # would re-assert the placed pose through a freshly built HWI whose offsets are
+    # now the saved ones rather than the zeros the pose was recorded against, and
+    # every skipped joint would move by its on-disk offset. calibration_offsets stays:
+    # a save that fails is retried against it.
+    calibration_baselines = {}
+    calibration_hold = {}
     return {"success": True, "offsets": config["joints_offsets"]}
 
 

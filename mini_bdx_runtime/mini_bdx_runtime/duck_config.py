@@ -4,6 +4,23 @@ import os
 
 HOME_DIR = os.path.expanduser("~")
 
+JOINT_NAMES = [
+    "left_hip_yaw",
+    "left_hip_roll",
+    "left_hip_pitch",
+    "left_knee",
+    "left_ankle",
+    "neck_pitch",
+    "head_pitch",
+    "head_yaw",
+    "head_roll",
+    "right_hip_yaw",
+    "right_hip_roll",
+    "right_hip_pitch",
+    "right_knee",
+    "right_ankle",
+]
+
 
 class DuckConfig:
 
@@ -81,3 +98,19 @@ class DuckConfig:
                 "right_ankle": 0.0,
             },
         )
+
+        # Per-joint direction, +1 or -1 (see rustypot_position_hwi.joints_signs).
+        # Only the inverted joints need listing; every other joint is +1. A value
+        # that is not exactly -1 is treated as +1 rather than silently scaling a
+        # joint by whatever a hand edit left there.
+        signs = self.json_config.get("joints_signs", {}) or {}
+        self.joints_signs = {
+            name: -1 if _is_minus_one(signs.get(name)) else 1 for name in JOINT_NAMES
+        }
+
+
+def _is_minus_one(value) -> bool:
+    try:
+        return int(value) == -1
+    except (TypeError, ValueError):
+        return False

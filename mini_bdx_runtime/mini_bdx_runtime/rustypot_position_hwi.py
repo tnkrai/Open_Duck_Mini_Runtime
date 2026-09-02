@@ -143,6 +143,22 @@ class HWI:
 
         self.joints_offsets = self.duck_config.joints_offset
 
+        # Per-joint direction, +1 or -1, from duck_config.json "joints_signs". A servo
+        # mounted mirrored to the model turns the wrong way for every command and
+        # reports the wrong way for every read, and a walk on it stalls that joint
+        # into its shell. The sign is applied at this boundary and nowhere else, so
+        # the policy, the calibration routes and the walk loop all work in model
+        # space:
+        #
+        #     raw = sign * position + offset        position = sign * (raw - offset)
+        #
+        # The offset stays in raw servo space, which is why it is measured at the
+        # straight pose (raw = sign * 0 + offset) and survives a later sign flip.
+        self.joints_signs = {
+            name: int(getattr(self.duck_config, "joints_signs", {}).get(name, 1))
+            for name in self.joints
+        }
+
         self.kps = np.ones(len(self.joints)) * 32  # default kp
         self.kds = np.ones(len(self.joints)) * 0  # default kd
         self.low_torque_kps = np.ones(len(self.joints)) * 2
@@ -276,7 +292,7 @@ class HWI:
         pos is in radians
         """
         id = self.joints[joint_name]
-        pos = pos + self.joints_offsets[joint_name]
+        pos = self.joints_signs.get(joint_name, 1) * pos + self.joints_offsets[joint_name]
         self._io_retry(
             lambda: self.io.write_goal_position([id], [pos]),
             joint_name,
@@ -292,7 +308,7 @@ class HWI:
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
         for joint, position in joints_positions.items():
             id = self.joints[joint]
-            target = position + self.joints_offsets[joint]
+            target = self.joints_signs.get(joint, 1) * position + self.joints_offsets[joint]
             self._io_retry(
                 lambda i=id, p=target: self.io.write_goal_position([i], [p]),
                 joint,
@@ -320,7 +336,7 @@ class HWI:
             return None
 
         present_positions = [
-            pos - self.joints_offsets[joint]
+            self.joints_signs.get(joint, 1) * (pos - self.joints_offsets[joint])
             for joint, pos in zip(self.joints.keys(), present_positions)
             if joint not in ignore
         ]
@@ -338,10 +354,10 @@ class HWI:
         and lets `_io_retry`'s OSError through — that message names the joint and its
         id. Callers turn it into a message about that joint.
 
-        Offset-corrected like the plural version, so the two cannot disagree about what
-        "position" means. `.get(..., 0.0)` rather than `[...]` because a hand-edited
-        duck_config.json can carry a partial joints_offsets dict, and a KeyError here
-        would read as a dead servo.
+        Offset- and sign-corrected like the plural version, so the two cannot disagree
+        about what "position" means. `.get(..., 0.0)` rather than `[...]` because a
+        hand-edited duck_config.json can carry a partial joints_offsets dict, and a
+        KeyError here would read as a dead servo.
         """
         joint_id = self.joints[joint_name]
         raw = self._io_retry(
@@ -349,7 +365,8 @@ class HWI:
             joint_name,
             "read_present_position",
         )
-        return round(float(raw) - self.joints_offsets.get(joint_name, 0.0), 3)
+        sign = self.joints_signs.get(joint_name, 1)
+        return round(sign * (float(raw) - self.joints_offsets.get(joint_name, 0.0)), 3)
 
     @_with_bus_lock
     def set_joint_torque(self, joint_name, enabled):
@@ -390,7 +407,7 @@ class HWI:
             return None
 
         present_velocities = [
-            vel
+            self.joints_signs.get(joint, 1) * vel
             for joint, vel in zip(self.joints.keys(), present_velocities)
             if joint not in ignore
         ]

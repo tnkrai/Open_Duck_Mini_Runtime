@@ -40,6 +40,7 @@ class FakeHWI:
     def __init__(self, readings=None, torque_fails=None, read_fails=None):
         self.joints = dict(JOINTS)
         self.joints_offsets = {n: 0.0 for n in JOINTS}
+        self.joints_signs = {n: 1 for n in JOINTS}
         self.zero_pos = {n: 0.0 for n in JOINTS}
         self.init_pos = dict(self.zero_pos)
         # joint -> present position the bus will report
@@ -59,13 +60,18 @@ class FakeHWI:
     def get_present_positions(self):
         if self.read_fails:
             return None
-        return [self.readings[n] for n in self.joints]
+        return [self._model_space(n) for n in self.joints]
+
+    def _model_space(self, joint_name):
+        # what the real HWI hands back: sign * (raw - offset)
+        sign = self.joints_signs.get(joint_name, 1)
+        return sign * (self.readings[joint_name] - self.joints_offsets.get(joint_name, 0.0))
 
     # -- the single-joint primitives the flow runs on --
     def get_present_position(self, joint_name):
         if joint_name in self.read_fails:
             raise OSError(f"read_present_position failed for '{joint_name}' (id ?)")
-        return self.readings[joint_name] - self.joints_offsets.get(joint_name, 0.0)
+        return self._model_space(joint_name)
 
     def set_joint_torque(self, joint_name, enabled):
         if joint_name in self.torque_fails:
@@ -87,7 +93,10 @@ class FakeHWI:
     def set_position_all(self, positions):
         self.position_writes += 1
         self.raw_goals.append(
-            {j: p + self.joints_offsets.get(j, 0.0) for j, p in positions.items()}
+            {
+                j: self.joints_signs.get(j, 1) * p + self.joints_offsets.get(j, 0.0)
+                for j, p in positions.items()
+            }
         )
 
     def close(self):
@@ -134,6 +143,26 @@ def test_the_offset_is_the_reading_at_the_straight_pose(client, hwi):
     assert body["offset"] == pytest.approx(0.17)
     assert body["previousPosition"] == 0.0
     assert body["newPosition"] == pytest.approx(0.17)
+
+
+def test_a_mirrored_joint_saves_its_raw_reading_as_the_offset(client, hwi):
+    """joints_signs flips reads and writes at the HWI boundary, but the offset lives in
+    raw servo space (the HWI adds it AFTER the sign). A mirrored joint posed straight
+    reads -raw; saving that would hold it at the mirror of where the hands are."""
+    hwi.joints_signs["left_knee"] = -1
+    hwi.readings["left_knee"] = 0.2  # the raw servo angle at straight
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    r = client.post("/api/calibration/confirm-position", json={"jointName": "left_knee"})
+    assert r.status_code == 200
+    assert r.json()["newPosition"] == pytest.approx(-0.2)  # what the model sees
+    assert r.json()["offset"] == pytest.approx(0.2)  # what the servo needs
+
+    client.post(
+        "/api/calibration/apply-offset", json={"jointName": "left_knee", "offset": 0.2}
+    )
+    # held exactly where the hands are, not at their mirror
+    assert hwi.raw_goals[-1]["left_knee"] == pytest.approx(0.2)
 
 
 def test_start_holds_the_placed_pose_and_never_commands_zero(client, hwi):

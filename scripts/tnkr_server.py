@@ -269,6 +269,8 @@ class DuckConfigModel(BaseModel):
     phase_frequency_factor_offset: float = 0.0
     expression_features: dict = {}
     joints_offsets: dict = {}
+    # per-joint direction, +1 or -1 (see HWI.joints_signs); written by /api/directions/save
+    joints_signs: dict = {}
 
 
 class CommandRequest(BaseModel):
@@ -856,6 +858,11 @@ def _calibration_joint(hwi, joint_name: str) -> str:
     return joint_name
 
 
+def _joint_sign(hwi, joint_name: str) -> int:
+    """+1 or -1: the joint's direction relative to the model (HWI.joints_signs)."""
+    return int(getattr(hwi, "joints_signs", {}).get(joint_name, 1))
+
+
 def _read_one(hwi, joint_name: str) -> float:
     """One joint's present position, or a 502 that names the joint.
 
@@ -1045,7 +1052,11 @@ def calibration_confirm_position(req: JointRequest):
 
     baseline = calibration_baselines[joint_name]
     new_pos = _read_one(hwi, joint_name)
-    offset = new_pos - baseline
+    # The read is in model space: sign * raw, with the offset at 0 for the session.
+    # The offset lives in raw servo space (the HWI adds it AFTER the sign), so the
+    # sign is undone here: a mirrored joint posed straight reads -raw and must save
+    # +raw, or applying it would hold the joint at the mirror of where the hands are.
+    offset = _joint_sign(hwi, joint_name) * (new_pos - baseline)
 
     _bump("confirms", joint_name)
     add_telemetry_props(
@@ -1190,6 +1201,70 @@ def calibration_finish():
     return {"success": True, "repowered": repowered, "failed": failed}
 
 
+def _config_for_update() -> dict:
+    """duck_config.json as a dict to merge into, or the agent error that names why not.
+
+    A duck that has never been configured is not an error: this is its first
+    calibration, and _write_config creates the file. The old code let FileNotFoundError
+    become a 500, so fourteen joints of work failed to save on exactly the robot most
+    likely to be doing this for the first time.
+
+    A READ failure never reaches a write. It is almost always a corrupt
+    duck_config.json — a half-written file from a previous power cut, or a hand-edit
+    with a trailing comma. Refusing is correct: the file also holds start_paused,
+    imu_upside_down and expression_features, and overwriting a file we could not
+    parse would destroy all of it to save one section.
+    """
+    try:
+        return _read_config()
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        _note_calibration_fault("CONFIG_WRITE_FAILED")
+        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not read the existing config: {e}")
+
+
+def _save_config(config: dict) -> None:
+    """Write duck_config.json, or raise the agent error that names why not.
+
+    A full card gets its own code, because it is the one cause here an operator can
+    actually act on — free space, or swap the card. Every other write failure ends in
+    "nothing was saved" with nothing to do about it, and folding them together would
+    bury the one that has an action.
+
+    ENOSPC comes from the .bak copy, not the config write. Measured on a real Pi
+    (kernel 6.18.34-rpi-v8, ext4): with the filesystem at literally 0 bytes free, the
+    failure lands at the backup step. It also needs to be at 0 — 3 KB free was enough
+    for a 569-byte config to save fine — so this is a genuinely full card, not a
+    nearly-full one.
+
+    A read-only card is the classic Pi death, and the most likely of the four. The
+    kernel remounts ext4 read-only when a failing card starts erroring, so the robot
+    keeps running perfectly from RAM and only writes fail — which is exactly why
+    "just a file write" is worth its own code. Naming the cause IS the action: an
+    operator told their card is read-only knows to reflash or replace it, and nothing
+    they do on this screen will help. errno 30 verified against a real read-only ext4
+    on the robot, not assumed.
+
+    What is left: the file owned by root from a sudo'd setup step while this server
+    runs as pi, and anything else the OS reports.
+    """
+    try:
+        _write_config(config)
+    except OSError as e:
+        if e.errno == errno.ENOSPC:
+            _note_calibration_fault("AGENT_DISK_FULL")
+            _agent_error(507, "AGENT_DISK_FULL", f"no space left writing the config: {e}")
+        if e.errno == errno.EROFS:
+            _note_calibration_fault("AGENT_DISK_READONLY")
+            _agent_error(500, "AGENT_DISK_READONLY", f"filesystem is read-only: {e}")
+        _note_calibration_fault("CONFIG_WRITE_FAILED")
+        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not write the config: {e}")
+    except Exception as e:
+        _note_calibration_fault("CONFIG_WRITE_FAILED")
+        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not write the config: {e}")
+
+
 @app.post("/api/calibration/save")
 def calibration_save():
     """Merge the session's offsets into duck_config.json. Torque stays ON."""
@@ -1201,61 +1276,11 @@ def calibration_save():
     hwi = hwi_instance
     all_joints = list(hwi.joints.keys()) if hwi is not None else []
 
-    try:
-        config = _read_config()
-    except FileNotFoundError:
-        # A duck that has never been configured. Not an error: this is the first
-        # calibration, and _write_config creates the file. The old code let
-        # FileNotFoundError become a 500, so fourteen joints of work failed to save on
-        # exactly the robot most likely to be doing this for the first time.
-        config = {}
-    except Exception as e:
-        # A READ failure, and it never reaches a write. Almost always a corrupt
-        # duck_config.json — a half-written file from a previous power cut, or a
-        # hand-edit with a trailing comma. Refusing is correct: the file also holds
-        # start_paused, imu_upside_down and expression_features, and overwriting a file
-        # we could not parse would destroy all of it to save the offsets.
-        _note_calibration_fault("CONFIG_WRITE_FAILED")
-        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not read the existing config: {e}")
-
+    config = _config_for_update()
     if "joints_offsets" not in config:
         config["joints_offsets"] = {}
     config["joints_offsets"].update(calibration_offsets)
-
-    try:
-        _write_config(config)
-    except OSError as e:
-        # A full card gets its own code, because it is the one cause here an operator
-        # can actually act on — free space, or swap the card. Every other write failure
-        # ends in "nothing was saved" with nothing to do about it, and folding them
-        # together would bury the one that has an action.
-        #
-        # ENOSPC comes from the .bak copy, not the config write. Measured on a real Pi
-        # (kernel 6.18.34-rpi-v8, ext4): with the filesystem at literally 0 bytes free,
-        # the failure lands at the backup step. It also needs to be at 0 — 3 KB free was
-        # enough for a 569-byte config to save fine — so this is a genuinely full card,
-        # not a nearly-full one.
-        if e.errno == errno.ENOSPC:
-            _note_calibration_fault("AGENT_DISK_FULL")
-            _agent_error(507, "AGENT_DISK_FULL", f"no space left writing the config: {e}")
-        # The classic Pi death, and the most likely of the four. The kernel remounts
-        # ext4 read-only when a failing card starts erroring, so the robot keeps running
-        # perfectly from RAM and only writes fail — which is exactly why "just a file
-        # write" is worth its own code. Naming the cause IS the action: an operator told
-        # their card is read-only knows to reflash or replace it, and nothing they do on
-        # this screen will help.
-        #
-        # errno 30 verified against a real read-only ext4 on the robot, not assumed.
-        if e.errno == errno.EROFS:
-            _note_calibration_fault("AGENT_DISK_READONLY")
-            _agent_error(500, "AGENT_DISK_READONLY", f"filesystem is read-only: {e}")
-        # What is left: the file owned by root from a sudo'd setup step while this
-        # server runs as pi, and anything else the OS reports.
-        _note_calibration_fault("CONFIG_WRITE_FAILED")
-        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not write the config: {e}")
-    except Exception as e:
-        _note_calibration_fault("CONFIG_WRITE_FAILED")
-        _agent_error(500, "CONFIG_WRITE_FAILED", f"could not write the config: {e}")
+    _save_config(config)
 
     # Free the bus WITHOUT dropping torque. This used to be a bare release_hwi(),
     # whose disable_torque default is True - so the duck went limp the instant the
@@ -1332,6 +1357,237 @@ def _capture_calibration_saved(all_joints: list) -> None:
         )
     except Exception:
         pass
+
+
+# ── Joint directions (per-joint signs) ───────────────────────────────────────
+# The last thing between a fresh build and a walk: does each servo turn the way the
+# model expects? A mirrored horn passes every position read — the servo tracks its
+# numeric goal either way — and only shows itself when the joint MOVES, which on a
+# walk means driving that joint into its own shell at full stiffness. So this moves
+# the left and right joint of a pair together at low stiffness and asks the operator
+# two questions: did both sides move the same way (else which side is wrong — flip
+# that joint), and was it the way the model shows (else flip both). The signs flip
+# LIVE in the HWI, so the retest uses them, and persist to duck_config.json as
+# "joints_signs", which the HWI applies to every command and read from then on.
+#
+# Pairs, not single joints, because a mirrored joint is easiest to see beside its
+# twin, and the model's mirrored axes (left hip pitch -0.63, right +0.635 in the
+# stance) are exactly the trap nobody can judge from a number.
+#
+# The targets are a fraction of the walking stance in each joint's own direction, so
+# the expected motion is "a bit of the crouch": the safest way to move a straight leg
+# on a stand, and what the picture on screen is drawn from.
+
+DIRECTION_HOLD_KP = 8  # low stiffness: a wrong-way joint meeting its shell stalls softly
+
+DIRECTION_PAIRS = [
+    {
+        "id": "hip_pitch",
+        "label": "Hip pitch",
+        "left": "left_hip_pitch",
+        "leftTarget": -0.3,
+        "right": "right_hip_pitch",
+        "rightTarget": 0.3,
+        "expect": "Both thighs tilt backward, toward the tail.",
+    },
+    {
+        "id": "knee",
+        "label": "Knee",
+        "left": "left_knee",
+        "leftTarget": 0.5,
+        "right": "right_knee",
+        "rightTarget": 0.5,
+        "expect": "Both shins fold heel-toward-tail, like a sitting bird.",
+    },
+    {
+        "id": "ankle",
+        "label": "Ankle",
+        "left": "left_ankle",
+        "leftTarget": -0.4,
+        "right": "right_ankle",
+        "rightTarget": -0.4,
+        "expect": "Both feet tilt toes-up, toward the sky.",
+    },
+]
+
+# The open session: which pair, if any, is displaced right now. None outside one.
+directions_session: dict | None = None
+
+
+class PairRequest(BaseModel):
+    pairId: str
+
+
+def _direction_pair(pair_id: str) -> dict:
+    for pair in DIRECTION_PAIRS:
+        if pair["id"] == pair_id:
+            return pair
+    _agent_error(400, "UNKNOWN_PAIR", f"no such joint pair: {pair_id}")
+
+
+def _directions_open() -> dict:
+    if directions_session is None:
+        _agent_error(
+            409, "INVALID_STATE", "no direction session: call /api/directions/start first"
+        )
+    return directions_session
+
+
+def _write_pair(hwi, pair: dict, extended: bool) -> None:
+    """Both joints of the pair to their targets, or both back to straight."""
+    for side in ("left", "right"):
+        joint = pair[side]
+        target = pair[f"{side}Target"] if extended else 0.0
+        try:
+            hwi.set_position(joint, target)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            _note_calibration_fault("MOTORS_SILENT", joint)
+            _agent_error(502, "MOTORS_SILENT", str(e), joint)
+
+
+@app.post("/api/directions/start")
+def directions_start():
+    """Stand the duck straight at low stiffness, ready to move pairs.
+
+    Straight IS a drive here, and a deliberate one: this runs after the offsets are
+    set, so zero is the straight pose by construction, and kp 8 is what the operator's
+    own script used so that a wrong-way joint stalls softly instead of pushing.
+    """
+    global directions_session
+    hwi = _calibration_hwi()
+
+    # the whole-bus liveness check, before anything is commanded
+    if hwi.get_present_positions() is None:
+        _note_calibration_fault("MOTORS_SILENT")
+        _agent_error(502, "MOTORS_SILENT", "at least one joint did not answer")
+
+    joint_names = list(hwi.joints.keys())
+    try:
+        hwi.set_kds([0] * len(joint_names))
+        hwi.set_kps([DIRECTION_HOLD_KP] * len(joint_names))
+        hwi.set_position_all(hwi.zero_pos)
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        _note_calibration_fault("MOTORS_SILENT")
+        _agent_error(502, "MOTORS_SILENT", str(e))
+    # goal first, torque second: the calibration rule, for the calibration reason
+    for joint_name in joint_names:
+        try:
+            hwi.set_joint_torque(joint_name, True)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            _note_calibration_fault("TORQUE_ENABLE_FAILED", joint_name)
+            _agent_error(502, "TORQUE_ENABLE_FAILED", str(e), joint_name)
+    time.sleep(2.0)
+
+    directions_session = {"moved": None}
+    signs = {name: _joint_sign(hwi, name) for name in joint_names}
+    add_telemetry_props(inverted_before=[j for j, s in signs.items() if s == -1])
+    return {"pairs": DIRECTION_PAIRS, "signs": signs}
+
+
+@app.post("/api/directions/move")
+def directions_move(req: PairRequest):
+    """Both joints of the pair to their targets. Answers once they have had time to
+    arrive, so the operator is asked about a motion that has finished."""
+    hwi = _calibration_hwi()
+    session = _directions_open()
+    pair = _direction_pair(req.pairId)
+    _write_pair(hwi, pair, extended=True)
+    session["moved"] = pair["id"]
+    time.sleep(1.5)
+    add_telemetry_props(pair=pair["id"])
+    return {"success": True, "pairId": pair["id"]}
+
+
+@app.post("/api/directions/rest")
+def directions_rest(req: PairRequest):
+    """Both joints of the pair back to straight."""
+    hwi = _calibration_hwi()
+    session = _directions_open()
+    pair = _direction_pair(req.pairId)
+    _write_pair(hwi, pair, extended=False)
+    session["moved"] = None
+    time.sleep(1.0)
+    return {"success": True, "pairId": pair["id"]}
+
+
+@app.post("/api/directions/flip")
+def directions_flip(req: JointRequest):
+    """Invert this joint's direction, live.
+
+    Nothing moves on its own: straight is raw = offset whichever way the sign points,
+    and the next move or rest is what uses the new sign. Live only — /save is what
+    writes it to the config, and leaving without saving forgets it, because the next
+    HWI is built from the file.
+    """
+    hwi = _calibration_hwi()
+    _directions_open()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    hwi.joints_signs[joint_name] = -_joint_sign(hwi, joint_name)
+    signs = {name: _joint_sign(hwi, name) for name in hwi.joints}
+    add_telemetry_props(joint_name=joint_name, sign=signs[joint_name])
+    return {"jointName": joint_name, "sign": signs[joint_name], "signs": signs}
+
+
+@app.post("/api/directions/save")
+def directions_save():
+    """Write the signs into duck_config.json. Torque stays ON, the bus is freed.
+
+    Every joint is written, not only the inverted ones, so a person reading the file
+    sees each joint's direction stated rather than inferred from an absence.
+    """
+    global directions_session
+    hwi = _calibration_hwi()
+    session = _directions_open()
+
+    signs = {name: _joint_sign(hwi, name) for name in hwi.joints}
+    config = _config_for_update()
+    config["joints_signs"] = signs
+    _save_config(config)
+
+    if session.get("moved"):
+        _write_pair(hwi, _direction_pair(session["moved"]), extended=False)
+    directions_session = None
+    # Same hand-off as the offsets: the servos hold in firmware, the port is freed,
+    # and the next HWI is built from the file that now carries the signs.
+    release_hwi(disable_torque=False)
+
+    inverted = [j for j, s in signs.items() if s == -1]
+    telemetry.capture(
+        "joint_directions_saved",
+        {"signs": signs, "inverted": inverted, "inverted_count": len(inverted)},
+    )
+    return {"success": True, "signs": signs}
+
+
+@app.post("/api/directions/finish")
+def directions_finish():
+    """End the session: rest a displaced pair, keep torque, free the bus.
+
+    Idempotent and best-effort, like calibration/finish: the caller is a page being
+    navigated away from. Unsaved flips are forgotten with the HWI, which is the point
+    of a save step.
+    """
+    global directions_session
+    if directions_session is None or hwi_instance is None:
+        directions_session = None
+        return {"success": True}
+
+    moved = directions_session.get("moved")
+    if moved:
+        try:
+            _write_pair(hwi_instance, _direction_pair(moved), extended=False)
+            time.sleep(0.5)
+        except HTTPException:
+            pass
+    directions_session = None
+    release_hwi(disable_torque=False)
+    return {"success": True}
 
 
 # ── Servo zero rehoming (firmware) ────────────────────────────────────────────
@@ -1535,10 +1791,14 @@ stance_holding = False
 
 def _stance_unreachable(hwi) -> list[str]:
     """Joints whose commanded target falls outside the servo's drivable window."""
+    # the raw servo target is sign * init_pos + offset (see HWI.joints_signs)
     return [
         name
         for name in hwi.joints
-        if abs(float(hwi.init_pos[name]) + float(hwi.joints_offsets.get(name, 0.0)))
+        if abs(
+            _joint_sign(hwi, name) * float(hwi.init_pos[name])
+            + float(hwi.joints_offsets.get(name, 0.0))
+        )
         > SERVO_RANGE_RAD
     ]
 
@@ -1587,10 +1847,10 @@ def stance_release():
 def stance_capture():
     """Capture all offsets from the current physical pose.
 
-    get_present_positions() already returns raw - offset_current, so:
-        offset_new = offset_current + (present - init_pos) = raw - init_pos
+    get_present_positions() returns sign * (raw - offset_current), so:
+        offset_new = offset_current + sign * (present - init_pos) = raw - sign * init_pos
     which makes the robot's CURRENT pose read back as init_pos, no matter how
-    far the old offsets had drifted.
+    far the old offsets had drifted, and whichever way the joint is mounted.
     """
     try:
         hwi = get_hwi()
@@ -1603,8 +1863,9 @@ def stance_capture():
 
     for name, p in zip(hwi.joints.keys(), present):
         cur = float(hwi.joints_offsets.get(name, 0.0))
+        sign = _joint_sign(hwi, name)
         hwi.joints_offsets[name] = round(
-            cur + float(p) - float(hwi.init_pos[name]), 4
+            cur + sign * (float(p) - float(hwi.init_pos[name])), 4
         )
 
     return {
@@ -1656,9 +1917,11 @@ def stance_offset(req: StanceOffsetRequest):
         raise HTTPException(status_code=400, detail=f"Unknown joint: {req.jointName}")
 
     init = float(hwi.init_pos[req.jointName])
-    target = init + float(req.offset)
+    sign = _joint_sign(hwi, req.jointName)
+    # the raw servo target is sign * init + offset; the offset is what is stored
+    target = sign * init + float(req.offset)
     clamped_target = max(-SERVO_RANGE_RAD, min(SERVO_RANGE_RAD, target))
-    hwi.joints_offsets[req.jointName] = round(clamped_target - init, 4)
+    hwi.joints_offsets[req.jointName] = round(clamped_target - sign * init, 4)
 
     if stance_holding:
         try:
@@ -2064,8 +2327,18 @@ def get_config():
 
 @app.post("/api/config")
 def update_config(config: DuckConfigModel):
+    # Merged over the file, not written wholesale. Studio sends the fields it knows,
+    # and a rewrite from those alone dropped everything else: the joint directions a
+    # calibration had just saved, and any key a newer runtime adds before Studio
+    # learns it. Only the fields the client actually sent replace what is there.
     try:
-        _write_config(config.model_dump())
+        existing = _read_config()
+    except Exception:
+        existing = {}
+    merged = dict(existing)
+    merged.update(config.model_dump(exclude_unset=True))
+    try:
+        _write_config(merged)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

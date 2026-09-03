@@ -122,6 +122,20 @@ class DuckConfig:
         self.swapped_pairs = sorted({str(p) for p in (pairs or []) if str(p) in LEG_PAIRS})
         self.legs_swapped = set(self.swapped_pairs) == set(LEG_PAIRS)
 
+        # "servo_ids": {"left_hip_yaw": 21, ...}: the joints whose servo id differs from
+        # the HWI's table, by name. Written by the calibration when a released joint
+        # went loose somewhere else: a real build had one leg's hip yaw and hip roll
+        # ids programmed onto each other's servos, which no left/right swap can say.
+        # Applied after swapped_pairs, and wins over it.
+        raw_ids = self.json_config.get("servo_ids") or {}
+        self.servo_ids = {}
+        for name, servo_id in (raw_ids.items() if isinstance(raw_ids, dict) else []):
+            try:
+                if str(name) in JOINT_NAMES:
+                    self.servo_ids[str(name)] = int(servo_id)
+            except (TypeError, ValueError):
+                continue
+
 
 def _is_minus_one(value) -> bool:
     try:

@@ -78,6 +78,29 @@ def _with_bus_lock(fn):
     return wrapped
 
 
+# Which servo id each joint name drives on a duck built to the guide. A build can
+# differ (see duck_config: swapped_pairs and servo_ids); the walk, the gains and the
+# policy index by the ORDER of this table, never by the ids.
+DEFAULT_SERVO_IDS = {
+    "left_hip_yaw": 20,
+    "left_hip_roll": 21,
+    "left_hip_pitch": 22,
+    "left_knee": 23,
+    "left_ankle": 24,
+    "neck_pitch": 30,
+    "head_pitch": 31,
+    "head_yaw": 32,
+    "head_roll": 33,
+    # "left_antenna": None,
+    # "right_antenna": None,
+    "right_hip_yaw": 10,
+    "right_hip_roll": 11,
+    "right_hip_pitch": 12,
+    "right_knee": 13,
+    "right_ankle": 14,
+}
+
+
 class HWI:
     def __init__(self, duck_config: DuckConfig, usb_port: str | None = None):
 

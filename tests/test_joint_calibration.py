@@ -115,6 +115,9 @@ def hwi(monkeypatch, tmp_path):
     monkeypatch.setattr(tnkr_server, "calibration_offsets", {})
     monkeypatch.setattr(tnkr_server, "calibration_baselines", {})
     monkeypatch.setattr(tnkr_server, "calibration_hold", {})
+    monkeypatch.setattr(tnkr_server, "identify_open", False)
+    monkeypatch.setattr(tnkr_server, "identify_assignments", {})
+    monkeypatch.setattr(tnkr_server, "identify_watch", None)
 
     fake = FakeHWI()
 
@@ -770,23 +773,27 @@ def test_swap_legs_writes_the_config_and_ends_the_hold_for_a_re_arm(client, hwi,
     assert r.status_code == 200
     assert r.json()["legsSwapped"] is True
     saved = json.loads((tmp_path / "duck_config.json").read_text())
-    assert saved["legs_swapped"] is True
+    assert saved["servo_ids"] == {"left_knee": 13, "right_knee": 23}
     assert tnkr_server.hwi_instance is None
     assert hwi.turned_off is False
     assert tnkr_server.calibration_hold == {}
 
 
 def test_start_reports_which_pairs_are_swapped(client, hwi):
-    import types
-
+    """Derived from the ids the HWI drives, never from a flag: a pair is swapped when
+    each side drives the id the table gives the other side."""
     body = client.post("/api/calibration/start").json()
     assert body["swappedPairs"] == [] and body["legsSwapped"] is False
-    hwi.duck_config = types.SimpleNamespace(swapped_pairs=["hip_yaw"])
+    assert body["servoIds"] == {"left_knee": 23, "right_knee": 13, "head_yaw": 32}
+    hwi.joints["left_knee"], hwi.joints["right_knee"] = 13, 23
     body = client.post("/api/calibration/start").json()
-    assert body["swappedPairs"] == ["hip_yaw"] and body["legsSwapped"] is False
-    hwi.duck_config = types.SimpleNamespace(swapped_pairs=list(tnkr_server.LEG_PAIRS))
-    assert client.post("/api/calibration/start").json()["legsSwapped"] is True
-
+    assert body["swappedPairs"] == ["knee"]
+    # every pair this HWI has is crossed: the whole-leg answer
+    assert body["legsSwapped"] is True
+    # a leg whose ids are shuffled some other way is not a swapped pair
+    hwi.joints["left_knee"], hwi.joints["right_knee"] = 32, 23
+    body = client.post("/api/calibration/start").json()
+    assert body["swappedPairs"] == [] and body["legsSwapped"] is False
 
 def test_swap_pair_swaps_one_pair_and_holds_again_without_losing_the_session(
     client, hwi, tmp_path, monkeypatch
@@ -803,18 +810,20 @@ def test_swap_pair_swaps_one_pair_and_holds_again_without_losing_the_session(
     client.post("/api/calibration/accept", json={"jointName": "head_yaw", "offset": 0.11})
     client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})  # limp now
 
-    # the HWI the agent rebuilds after dropping the old one, on the new ids
-    rebuilt = FakeHWI()
-    rebuilt.readings = dict(hwi.readings)
-    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: rebuilt)
+    # the HWI the agent rebuilds after dropping the old one reads the saved ids, as
+    # the real one does from duck_config.json
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: _rebuilt(tmp_path, hwi))
 
     r = client.post("/api/calibration/swap-pair", json={"jointName": "left_knee"})
     assert r.status_code == 200, r.text
+    rebuilt = _BUILT[-1]
     assert r.json()["swappedPairs"] == ["knee"]
-    assert r.json()["legsSwapped"] is False
+    assert r.json()["servoIds"] == {"left_knee": 13, "right_knee": 23, "head_yaw": 32}
+    # the knees are the only pair this HWI has, so crossing them is the whole leg
+    assert r.json()["legsSwapped"] is True
     saved = json.loads((tmp_path / "duck_config.json").read_text())
-    assert saved["swapped_pairs"] == ["knee"]
-    assert saved["legs_swapped"] is False
+    assert saved["servo_ids"] == {"left_knee": 13, "right_knee": 23}
+    assert saved["swapped_pairs"] == [] and saved["legs_swapped"] is False
 
     # the other joint's accepted offset survives, in the session and on the new HWI;
     # the pair's session state is gone
@@ -846,3 +855,152 @@ def test_health_advertises_the_hold_so_studio_can_refuse_an_older_agent(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     assert r.json()["calibrationMode"] == "hold"
+
+
+_BUILT: list = []
+
+
+def _rebuilt(tmp_path, old):
+    """What get_hwi hands back after a swap: a fresh HWI on the saved ids, reading the
+    same bus positions as the one that was dropped. Kept in _BUILT for the assertions."""
+    import json
+
+    path = tmp_path / "duck_config.json"
+    saved = json.loads(path.read_text()) if path.exists() else {}
+    h = FakeHWI()
+    h.readings = dict(old.readings)
+    h.joints.update(saved.get("servo_ids", {}))
+    _BUILT.append(h)
+    return h
+
+
+def test_swap_ids_swaps_any_two_joints_and_keeps_the_session(
+    client, hwi, tmp_path, monkeypatch
+):
+    """A real build had one leg's hip yaw and hip roll ids programmed onto each other's
+    servos: releasing "hip yaw" went limp at the roll, and the leg check (a knee wiggle)
+    said nothing. No left/right swap can say that; naming the joint that went limp can."""
+    import json
+
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    hwi.readings = {"left_knee": 0.4, "right_knee": -0.2, "head_yaw": 0.1}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/accept", json={"jointName": "right_knee", "offset": 0.05})
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})  # limp now
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: _rebuilt(tmp_path, hwi))
+
+    r = client.post(
+        "/api/calibration/swap-ids", json={"jointName": "left_knee", "otherJointName": "head_yaw"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 32, "right_knee": 13, "head_yaw": 23}
+    assert r.json()["swappedPairs"] == []
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["servo_ids"] == {"left_knee": 32, "head_yaw": 23}
+    # both start over; the third joint keeps its accepted offset, on the new HWI too
+    assert tnkr_server.calibration_offsets == {"right_knee": pytest.approx(0.05)}
+    assert "left_knee" not in tnkr_server.calibration_baselines
+    rebuilt = _BUILT[-1]
+    assert rebuilt.joints["left_knee"] == 32
+    assert rebuilt.joints_offsets["right_knee"] == pytest.approx(0.05)
+    # held again where every joint is, the limp one re-powered in place
+    assert rebuilt.raw_goals[-1]["left_knee"] == pytest.approx(0.4)
+    assert ("left_knee", True) in rebuilt.torque_calls
+
+    # the same two again puts them back, and the file no longer lists them
+    r = client.post(
+        "/api/calibration/swap-ids", json={"jointName": "head_yaw", "otherJointName": "left_knee"}
+    )
+    assert r.json()["servoIds"] == {"left_knee": 23, "right_knee": 13, "head_yaw": 32}
+    assert json.loads((tmp_path / "duck_config.json").read_text())["servo_ids"] == {}
+
+
+def test_swap_ids_refuses_itself_an_unknown_joint_and_no_held_pose(client, hwi):
+    body = {"jointName": "left_knee", "otherJointName": "head_yaw"}
+    assert client.post("/api/calibration/swap-ids", json=body).status_code == 409
+    client.post("/api/calibration/start")
+    body["otherJointName"] = "left_knee"
+    assert client.post("/api/calibration/swap-ids", json=body).status_code == 400
+    body["otherJointName"] = "nope"
+    assert client.post("/api/calibration/swap-ids", json=body).status_code == 400
+
+
+def test_identify_watches_the_bus_for_the_servo_that_moved(client, hwi, tmp_path, monkeypatch):
+    """The operator moves one named joint by hand; whichever servo travelled IS that
+    joint. The watch is fed here as the sampler thread feeds it, sample by sample."""
+    import json
+
+    monkeypatch.setattr(tnkr_server, "_identify_sampler", lambda watch: None)
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    r = client.post("/api/identify/start")
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 23, "right_knee": 13, "head_yaw": 32}
+    # every joint let go, in place
+    assert {j for j, on in hwi.torque_calls if on is False} == set(JOINTS)
+
+    r = client.post("/api/identify/watch", json={"jointName": "right_knee"})
+    assert r.status_code == 200 and r.json()["watching"] is True
+    w = tnkr_server.identify_watch
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 0.0)
+    assert client.get("/api/identify/status").json()["done"] is False
+    # the servo the duck calls left_knee is the one that travels
+    w.feed({"left_knee": 0.3, "right_knee": 0.0, "head_yaw": 0.01}, w.started_at + 0.2)
+    w.feed({"left_knee": 0.3, "right_knee": 0.0, "head_yaw": 0.01}, w.started_at + 0.5)
+    assert client.get("/api/identify/status").json()["done"] is False  # not still long enough
+    w.feed({"left_knee": 0.3, "right_knee": 0.0, "head_yaw": 0.01}, w.started_at + 1.2)
+    status = client.get("/api/identify/status").json()
+    assert status["done"] is True and status["timedOut"] is False
+    assert status["moved"] == {"servoId": 23, "name": "left_knee", "range": pytest.approx(0.3)}
+    assert status["runnerUp"] is None
+
+    # the answer: right_knee is servo 23; the joint that had 23 takes right_knee's 13
+    r = client.post("/api/identify/assign", json={"jointName": "right_knee", "servoId": 23})
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 13, "right_knee": 23, "head_yaw": 32}
+
+    # finish: written, rebuilt on it, every joint powered back on where it is
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: _rebuilt(tmp_path, hwi))
+    r = client.post("/api/identify/finish", json={"save": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 13, "right_knee": 23, "head_yaw": 32}
+    assert r.json()["changed"] == ["left_knee", "right_knee"]
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["servo_ids"] == {"left_knee": 13, "right_knee": 23}
+    rebuilt = _BUILT[-1]
+    assert rebuilt.joints["right_knee"] == 23
+    assert ("right_knee", True) in rebuilt.torque_calls
+    assert tnkr_server.identify_open is False
+
+
+def test_identify_reports_a_second_mover_a_timeout_and_refuses_out_of_session(
+    client, hwi, monkeypatch
+):
+    monkeypatch.setattr(tnkr_server, "_identify_sampler", lambda watch: None)
+    assert client.post("/api/identify/watch", json={"jointName": "right_knee"}).status_code == 409
+    client.post("/api/identify/start")
+    client.post("/api/identify/watch", json={"jointName": "right_knee"})
+    w = tnkr_server.identify_watch
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 0.0)
+    w.feed({"left_knee": 0.2, "right_knee": 0.4, "head_yaw": 0.0}, w.started_at + 0.3)
+    w.feed({"left_knee": 0.2, "right_knee": 0.4, "head_yaw": 0.0}, w.started_at + 0.4)
+    w.feed({"left_knee": 0.2, "right_knee": 0.4, "head_yaw": 0.0}, w.started_at + 1.5)
+    status = client.get("/api/identify/status").json()
+    assert status["moved"]["name"] == "right_knee"
+    assert status["runnerUp"]["name"] == "left_knee"
+
+    # nothing moved for the whole watch: done, and said so
+    client.post("/api/identify/watch", json={"jointName": "head_yaw"})
+    w = tnkr_server.identify_watch
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 0.0)
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 30.0)
+    status = client.get("/api/identify/status").json()
+    assert status["done"] is True and status["timedOut"] is True and status["moved"] is None
+
+    # a servo id the duck does not have
+    r = client.post("/api/identify/assign", json={"jointName": "head_yaw", "servoId": 99})
+    assert r.status_code == 400
+    # finish without saving: powered back on, nothing written
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    r = client.post("/api/identify/finish", json={"save": False})
+    assert r.status_code == 200 and r.json()["changed"] == []
+    assert ("head_yaw", True) in hwi.torque_calls

@@ -42,6 +42,7 @@ import uvicorn
 
 from mini_bdx_runtime.rustypot_position_hwi import (
     BUS_LOCK,
+    DEFAULT_SERVO_IDS,
     HWI,
     find_servo_adapter,
     is_rust_panic,
@@ -249,6 +250,13 @@ def release_state_imu():
 
 # ── Request/Response models ───────────────────────────────────────────────────
 
+class SwapIdsRequest(BaseModel):
+    """The released joint, and the joint that actually went limp."""
+
+    jointName: str
+    otherJointName: str
+
+
 class JointRequest(BaseModel):
     jointName: str
 
@@ -275,6 +283,10 @@ class DuckConfigModel(BaseModel):
     # the part of the name after the side; written by /api/calibration/swap-pair and
     # swap-legs (see HWI.__init__). legs_swapped is the older whole-leg form.
     swapped_pairs: list = []
+    # the joints whose servo id differs from the HWI's table, by name: written by
+    # /api/calibration/swap-ids, /api/identify/finish, and the pair and leg swaps,
+    # which fold into it
+    servo_ids: dict = {}
     legs_swapped: bool = False
 
 
@@ -868,14 +880,53 @@ def _joint_sign(hwi, joint_name: str) -> int:
     return int(getattr(hwi, "joints_signs", {}).get(joint_name, 1))
 
 
+def _servo_ids(hwi) -> dict[str, int]:
+    """Every joint's servo id as the HWI drives it now, by name."""
+    return {name: int(servo_id) for name, servo_id in hwi.joints.items()}
+
+
+def _pair_crossed(ids: dict[str, int], pair: str) -> bool:
+    """Each side of the pair drives the id the table gives the other side."""
+    left, right = f"left_{pair}", f"right_{pair}"
+    return (
+        left in ids
+        and right in ids
+        and ids[left] == DEFAULT_SERVO_IDS.get(right)
+        and ids[right] == DEFAULT_SERVO_IDS.get(left)
+    )
+
+
 def _swapped_pairs(hwi) -> list[str]:
-    """The left/right pairs whose servo ids this build has the other way round."""
-    return sorted(getattr(getattr(hwi, "duck_config", None), "swapped_pairs", []) or [])
+    """The left/right pairs whose servo ids this build has the other way round.
+
+    Derived from the ids the HWI drives, never from a flag: a pair is swapped when each
+    side drives the id the table gives the other side, whichever route wrote it.
+    """
+    ids = _servo_ids(hwi)
+    return sorted(pair for pair in LEG_PAIRS if _pair_crossed(ids, pair))
 
 
 def _legs_swapped(hwi) -> bool:
-    """Every leg pair swapped: the older whole-leg answer, still reported for the screen."""
-    return set(_swapped_pairs(hwi)) == set(LEG_PAIRS)
+    """Every leg pair this HWI has is swapped: the whole-leg answer the leg check gives."""
+    ids = _servo_ids(hwi)
+    present = [p for p in LEG_PAIRS if f"left_{p}" in ids and f"right_{p}" in ids]
+    return bool(present) and all(_pair_crossed(ids, p) for p in present)
+
+
+def _save_servo_ids(ids: dict[str, int]) -> dict[str, int]:
+    """Write the joints whose servo id differs from the table, by name, and retire the
+    older spellings: the running HWI already had swapped_pairs applied, so the ids
+    passed in carry them, and one representation is one fewer to disagree."""
+    config = _config_for_update()
+    config["servo_ids"] = {
+        name: int(servo_id)
+        for name, servo_id in ids.items()
+        if int(servo_id) != DEFAULT_SERVO_IDS.get(name)
+    }
+    config["swapped_pairs"] = []
+    config["legs_swapped"] = False
+    _save_config(config)
+    return config["servo_ids"]
 
 
 def _pair_of(joint_name: str) -> str | None:
@@ -1005,6 +1056,7 @@ def calibration_start():
         "joints": joint_names,
         "currentPositions": current_positions,
         "mode": "hold",
+        "servoIds": _servo_ids(hwi),
         "swappedPairs": _swapped_pairs(hwi),
         "legsSwapped": _legs_swapped(hwi),
     }
@@ -1257,10 +1309,14 @@ def calibration_swap_legs(req: SwapLegsRequest):
     """
     global calibration_baselines, calibration_hold, calibration_offsets
     refuse_while_walking()
-    config = _config_for_update()
-    config["swapped_pairs"] = list(LEG_PAIRS) if req.swapped else []
-    config["legs_swapped"] = bool(req.swapped)
-    _save_config(config)
+    # Each pair to the asked-for state relative to the ids the HWI drives now, so a
+    # leg whose ids were shuffled some other way keeps that and only crosses sides.
+    ids = _servo_ids(_calibration_hwi())
+    for pair in LEG_PAIRS:
+        left, right = f"left_{pair}", f"right_{pair}"
+        if left in ids and right in ids and bool(req.swapped) != _pair_crossed(ids, pair):
+            ids[left], ids[right] = ids[right], ids[left]
+    _save_servo_ids(ids)
     calibration_baselines = {}
     calibration_hold = {}
     calibration_offsets = {}
@@ -1269,43 +1325,36 @@ def calibration_swap_legs(req: SwapLegsRequest):
     return {"success": True, "legsSwapped": bool(req.swapped)}
 
 
-@app.post("/api/calibration/swap-pair")
-def calibration_swap_pair(req: JointRequest):
-    """This name reached the OTHER side's servo: swap the pair's ids and hold again.
+def _swap_servo_ids(joint_name: str, other_name: str) -> dict:
+    """Swap two joints' servo ids on the duck and hold again, keeping the session.
 
-    Found on a real build: releasing left_hip_yaw went limp on the right hip, while
-    the knees answered to their names — the builder had programmed the hip yaw ids the
-    other way round and nothing else. A whole-leg swap cannot say that; a pair can.
+    The released joint went loose somewhere ELSE: this name reaches the other joint's
+    servo, because the build programmed the two ids onto each other's servos. Any two
+    joints, not only a left/right pair: one real build had the hip yaws crossed left
+    to right, another had one leg's hip yaw and hip roll crossed, and the leg check
+    (a knee wiggle) passes both.
 
-    Keeps the session. The other joints' accepted offsets stay; the pair's own are
-    dropped, because they were measured on the other servos. The HWI is rebuilt on the
-    new names, its offsets set back to the session's, and every joint is held where it
-    is — which re-powers the limp one in place. Nothing moves.
+    The two joints' accepted offsets and baselines are dropped, because they were
+    measured on the wrong servos; the others survive. The HWI is rebuilt on the new
+    ids, its offsets set back to the session's, and every joint held where it is,
+    which re-powers the limp one in place. Nothing moves.
     """
     global calibration_hold
     hwi = _calibration_hwi()
-    joint_name = _calibration_joint(hwi, req.jointName)
-    pair = _pair_of(joint_name)
-    if pair is None:
-        _note_calibration_fault("UNKNOWN_JOINT", joint_name)
-        _agent_error(400, "UNKNOWN_JOINT", f"{joint_name} has no left/right twin", joint_name)
     if not calibration_hold:
         _note_calibration_fault("INVALID_STATE", joint_name)
         _agent_error(
             409, "INVALID_STATE", "no held pose: call /api/calibration/start first", joint_name
         )
+    if other_name == joint_name:
+        _note_calibration_fault("UNKNOWN_JOINT", joint_name)
+        _agent_error(400, "UNKNOWN_JOINT", f"{joint_name} cannot swap ids with itself", joint_name)
 
-    config = _config_for_update()
-    pairs = set(config.get("swapped_pairs") or [])
-    if not config.get("swapped_pairs") and config.get("legs_swapped"):
-        pairs = set(LEG_PAIRS)  # the older whole-leg form, made explicit before editing
-    pairs ^= {pair}
-    config["swapped_pairs"] = sorted(pairs)
-    config["legs_swapped"] = pairs == set(LEG_PAIRS)
-    _save_config(config)
+    ids = _servo_ids(hwi)
+    ids[joint_name], ids[other_name] = ids[other_name], ids[joint_name]
+    saved = _save_servo_ids(ids)
 
-    twin = _twin_of(joint_name)
-    for name in (joint_name, twin):
+    for name in (joint_name, other_name):
         calibration_offsets.pop(name, None)
         calibration_baselines.pop(name, None)
 
@@ -1316,13 +1365,39 @@ def calibration_swap_pair(req: JointRequest):
     current_positions = _hold_where_it_is(hwi)
     calibration_hold = dict(current_positions)
 
-    add_telemetry_props(joint_name=joint_name, swapped_pairs=sorted(pairs))
+    add_telemetry_props(joint_name=joint_name, other_joint=other_name, servo_ids=saved)
     return {
         "joints": list(hwi.joints.keys()),
         "currentPositions": current_positions,
-        "swappedPairs": sorted(pairs),
-        "legsSwapped": pairs == set(LEG_PAIRS),
+        "servoIds": _servo_ids(hwi),
+        "swappedPairs": _swapped_pairs(hwi),
+        "legsSwapped": _legs_swapped(hwi),
     }
+
+
+@app.post("/api/calibration/swap-pair")
+def calibration_swap_pair(req: JointRequest):
+    """This name reached the OTHER side's servo: swap the pair's ids and hold again.
+
+    The left/right case of swap-ids, kept as its own route: the twin is the joint a
+    crossed pair most often turns out to be.
+    """
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    if _pair_of(joint_name) is None:
+        _note_calibration_fault("UNKNOWN_JOINT", joint_name)
+        _agent_error(400, "UNKNOWN_JOINT", f"{joint_name} has no left/right twin", joint_name)
+    return _swap_servo_ids(joint_name, _twin_of(joint_name))
+
+
+@app.post("/api/calibration/swap-ids")
+def calibration_swap_ids(req: SwapIdsRequest):
+    """This name reached some OTHER joint's servo, and the operator named which: swap
+    the two ids and hold again. See _swap_servo_ids."""
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    other_name = _calibration_joint(hwi, req.otherJointName)
+    return _swap_servo_ids(joint_name, other_name)
 
 
 @app.post("/api/calibration/finish")
@@ -3150,6 +3225,276 @@ def send_commands(req: CommandRequest):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+
+# ── Which servo is which ─────────────────────────────────────────────────────
+# Before the joints are calibrated: the duck goes loose, the operator moves one named
+# joint on the real duck, and the bus is watched for the servo that actually moved.
+# Nothing to read off a screen, no left or right to get wrong: whichever servo moved
+# IS that joint, whatever id the build gave it. Two real builds needed this and passed
+# every other check: hip yaws crossed left to right, and one leg's hip yaw and hip
+# roll programmed onto each other's servos.
+from threading import Event as _Event
+
+IDENTIFY_MOVED_RAD = 0.12  # a servo has to travel this far to count as moved
+IDENTIFY_STILL_RAD = 0.02  # and this little, sample to sample, to count as still
+IDENTIFY_SETTLE_S = 0.6  # still for this long after moving: the answer is in
+IDENTIFY_TIMEOUT_S = 25.0  # give up watching after this
+IDENTIFY_SAMPLE_S = 0.05
+
+identify_open = False
+identify_assignments: dict[str, int] = {}
+identify_watch: "IdentifyWatch | None" = None
+
+
+class IdentifyWatch:
+    """One watch: which servo moves while the operator handles one named joint.
+
+    Fed samples by the sampler thread (or a test), keeps each joint's travel so far,
+    and decides. The answer is the joint with the most travel once everything has
+    been still for IDENTIFY_SETTLE_S; a second joint with real travel is reported as
+    the runner-up so the screen can say the move was not clean.
+    """
+
+    def __init__(self, joint_name: str, names: list[str], started_at: float):
+        self.joint_name = joint_name
+        self.names = list(names)
+        self.started_at = started_at
+        self.low: dict[str, float] = {}
+        self.high: dict[str, float] = {}
+        self.last: dict[str, float] = {}
+        self.moved_at: float | None = None
+        self.still_since: float | None = None
+        self.done = False
+        self.timed_out = False
+        self.error: str | None = None
+        self.stop = _Event()
+
+    def ranges(self) -> dict[str, float]:
+        return {n: round(self.high[n] - self.low[n], 4) for n in self.names if n in self.low}
+
+    def feed(self, positions: dict[str, float], now: float) -> None:
+        if self.done:
+            return
+        moving = False
+        for name, value in positions.items():
+            if name not in self.names:
+                continue
+            value = float(value)
+            if name in self.last and abs(value - self.last[name]) > IDENTIFY_STILL_RAD:
+                moving = True
+            self.last[name] = value
+            self.low[name] = min(self.low.get(name, value), value)
+            self.high[name] = max(self.high.get(name, value), value)
+        travelled = max(self.ranges().values(), default=0.0)
+        if self.moved_at is None and travelled >= IDENTIFY_MOVED_RAD:
+            self.moved_at = now
+        if moving or self.moved_at is None:
+            self.still_since = None
+        elif self.still_since is None:
+            self.still_since = now
+        elif now - self.still_since >= IDENTIFY_SETTLE_S:
+            self.done = True
+        if not self.done and now - self.started_at >= IDENTIFY_TIMEOUT_S:
+            self.done = True
+            self.timed_out = self.moved_at is None
+
+    def verdict(self, hwi) -> dict:
+        ranges = self.ranges()
+        ordered = sorted(ranges.items(), key=lambda kv: kv[1], reverse=True)
+        moved = None
+        runner_up = None
+        if ordered and ordered[0][1] >= IDENTIFY_MOVED_RAD:
+            name, travel = ordered[0]
+            moved = {"servoId": int(hwi.joints[name]), "name": name, "range": travel}
+            if len(ordered) > 1 and ordered[1][1] >= IDENTIFY_MOVED_RAD:
+                name2, travel2 = ordered[1]
+                runner_up = {"servoId": int(hwi.joints[name2]), "name": name2, "range": travel2}
+        return {
+            "jointName": self.joint_name,
+            "watching": not self.done,
+            "done": self.done,
+            "timedOut": self.timed_out,
+            "moved": moved,
+            "runnerUp": runner_up,
+            "ranges": ranges,
+            "error": self.error,
+        }
+
+
+def _identify_sampler(watch: IdentifyWatch) -> None:
+    """Read every joint until the watch decides. Under BUS_LOCK per read, like
+    /api/state: the state poll keeps running while the operator moves the leg."""
+    while not watch.stop.is_set() and not watch.done:
+        try:
+            with BUS_LOCK:
+                hwi = hwi_instance
+                positions = hwi.get_present_positions() if hwi is not None else None
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            watch.error = str(e)
+            watch.done = True
+            return
+        if hwi is None:
+            watch.error = "the servo bus was taken by another flow"
+            watch.done = True
+            return
+        if positions is not None:
+            names = list(hwi.joints.keys())
+            watch.feed({n: positions[i] for i, n in enumerate(names)}, time.monotonic())
+        time.sleep(IDENTIFY_SAMPLE_S)
+
+
+def _identify_stop_watch() -> None:
+    w = identify_watch
+    if w is not None:
+        w.stop.set()
+        w.done = True
+
+
+def _identify_projected(hwi) -> dict[str, int]:
+    """The id table the answers so far would give. Each answer moves the named joint
+    onto its servo and hands the joint that had that servo the named joint's old id,
+    so the table stays one servo per joint however the answers came in."""
+    ids = _servo_ids(hwi)
+    for name, servo_id in identify_assignments.items():
+        if ids.get(name) == servo_id:
+            continue
+        holder = next((n for n, i in ids.items() if i == servo_id), None)
+        old = ids[name]
+        ids[name] = servo_id
+        if holder is not None:
+            ids[holder] = old
+    return ids
+
+
+class IdentifyWatchRequest(BaseModel):
+    jointName: str
+
+
+class IdentifyAssignRequest(BaseModel):
+    jointName: str
+    servoId: int
+
+
+class IdentifyFinishRequest(BaseModel):
+    save: bool = True
+
+
+@app.post("/api/identify/start")
+def identify_start():
+    """The duck goes loose, ready for the operator to move one joint at a time.
+
+    Torque off on every joint, in place: the operator was told to lay the duck down or
+    hold it. Any calibration session ends here, since its held pose is over.
+    """
+    global identify_open, identify_assignments
+    global calibration_hold, calibration_baselines, calibration_offsets
+    hwi = _calibration_hwi()
+    _identify_stop_watch()
+    failed: list[str] = []
+    for name in hwi.joints:
+        try:
+            hwi.set_joint_torque(name, False)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            failed.append(name)
+    if failed:
+        _note_calibration_fault("TORQUE_RELEASE_FAILED", failed[0])
+        _agent_error(
+            502, "TORQUE_RELEASE_FAILED", f"could not release {', '.join(failed)}", failed[0]
+        )
+    calibration_hold = {}
+    calibration_baselines = {}
+    calibration_offsets = {}
+    identify_assignments = {}
+    identify_open = True
+    telemetry.capture("identify_started", {"joint_count": len(hwi.joints)})
+    return {"joints": list(hwi.joints.keys()), "servoIds": _servo_ids(hwi)}
+
+
+@app.post("/api/identify/watch")
+def identify_watch_start(req: IdentifyWatchRequest):
+    """Watch the bus for the servo that moves while the operator handles this joint."""
+    global identify_watch
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    if not identify_open:
+        _note_calibration_fault("INVALID_STATE", joint_name)
+        _agent_error(
+            409, "INVALID_STATE", "not identifying: call /api/identify/start first", joint_name
+        )
+    _identify_stop_watch()
+    watch = IdentifyWatch(joint_name, list(hwi.joints.keys()), time.monotonic())
+    identify_watch = watch
+    Thread(target=_identify_sampler, args=(watch,), daemon=True).start()
+    return {"jointName": joint_name, "watching": True}
+
+
+@app.get("/api/identify/status")
+def identify_status():
+    hwi = _calibration_hwi()
+    w = identify_watch
+    if w is None:
+        return {
+            "jointName": None,
+            "watching": False,
+            "done": False,
+            "timedOut": False,
+            "moved": None,
+            "runnerUp": None,
+            "ranges": {},
+            "error": None,
+        }
+    return w.verdict(hwi)
+
+
+@app.post("/api/identify/assign")
+def identify_assign(req: IdentifyAssignRequest):
+    """The operator's answer for one joint: this name is that servo. Kept until finish."""
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    if not identify_open:
+        _note_calibration_fault("INVALID_STATE", joint_name)
+        _agent_error(
+            409, "INVALID_STATE", "not identifying: call /api/identify/start first", joint_name
+        )
+    if int(req.servoId) not in {int(v) for v in hwi.joints.values()}:
+        _note_calibration_fault("UNKNOWN_JOINT", joint_name)
+        _agent_error(400, "UNKNOWN_JOINT", f"no servo with id {req.servoId}", joint_name)
+    identify_assignments[joint_name] = int(req.servoId)
+    return {
+        "jointName": joint_name,
+        "servoId": int(req.servoId),
+        "servoIds": _identify_projected(hwi),
+    }
+
+
+@app.post("/api/identify/finish")
+def identify_finish(req: IdentifyFinishRequest):
+    """Write the table the answers gave, rebuild the HWI on it, and power every joint
+    back on where it is. With save false: no write, power back on, nothing else."""
+    global identify_open, identify_assignments, identify_watch
+    hwi = _calibration_hwi()
+    _identify_stop_watch()
+    identify_watch = None
+    before = _servo_ids(hwi)
+    changed: list[str] = []
+    if req.save and identify_assignments:
+        ids = _identify_projected(hwi)
+        changed = sorted(n for n in ids if ids[n] != before.get(n))
+        _save_servo_ids(ids)
+        release_hwi(disable_torque=False)
+        hwi = _calibration_hwi()
+    identify_assignments = {}
+    identify_open = False
+    current = _hold_where_it_is(hwi)
+    add_telemetry_props(identify_changed=changed)
+    telemetry.capture("identify_finished", {"saved": bool(req.save), "changed": changed})
+    return {"servoIds": _servo_ids(hwi), "changed": changed, "currentPositions": current}
+
 
 if __name__ == "__main__":
     telemetry.capture("server_started", {"server_port": SERVER_PORT})

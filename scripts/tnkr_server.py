@@ -1388,7 +1388,7 @@ DIRECTION_PAIRS = [
         "leftTarget": -0.3,
         "right": "right_hip_pitch",
         "rightTarget": 0.3,
-        "expect": "Both thighs tilt backward, toward the tail.",
+        "expect": "Both thighs swing backward, feet toward the tail.",
     },
     {
         "id": "knee",
@@ -1397,7 +1397,7 @@ DIRECTION_PAIRS = [
         "leftTarget": 0.5,
         "right": "right_knee",
         "rightTarget": 0.5,
-        "expect": "Both shins fold heel-toward-tail, like a sitting bird.",
+        "expect": "Both feet swing forward and the knees poke backward, like a bird's.",
     },
     {
         "id": "ankle",
@@ -1406,7 +1406,7 @@ DIRECTION_PAIRS = [
         "leftTarget": -0.4,
         "right": "right_ankle",
         "rightTarget": -0.4,
-        "expect": "Both feet tilt toes-up, toward the sky.",
+        "expect": "Both feet tip toes-down, heels up.",
     },
 ]
 

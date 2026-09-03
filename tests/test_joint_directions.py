@@ -317,3 +317,23 @@ def test_hwi_applies_the_sign_on_the_way_out_and_undoes_it_on_the_way_back(tmp_p
     velocities = dict(zip(hwi.joints.keys(), hwi.get_present_velocities()))
     assert velocities["left_knee"] == pytest.approx(-2.0)
     assert velocities["right_knee"] == pytest.approx(2.0)
+
+
+def test_a_stale_whole_leg_swap_survives_a_saved_round_trip(tmp_path):
+    """A file written before swapped_pairs existed says legs_swapped: true and nothing
+    else. Studio reads such a file back with swapped_pairs: [] filled in by its model
+    and saves it from the apply step; that empty list must not cancel the swap the
+    file still names. Every writer that clears the pairs clears legs_swapped too, so
+    the pair of them agreeing on "none" is the only way to mean none."""
+    from mini_bdx_runtime.duck_config import LEG_PAIRS
+
+    cfg = tmp_path / "duck_config.json"
+    cfg.write_text(json.dumps({"swapped_pairs": [], "legs_swapped": True}))
+    parsed = DuckConfig(config_json_path=str(cfg), ignore_default=True)
+    assert parsed.swapped_pairs == sorted(LEG_PAIRS)
+    assert parsed.legs_swapped is True
+
+    cfg.write_text(json.dumps({"swapped_pairs": [], "legs_swapped": False}))
+    parsed = DuckConfig(config_json_path=str(cfg), ignore_default=True)
+    assert parsed.swapped_pairs == []
+    assert parsed.legs_swapped is False

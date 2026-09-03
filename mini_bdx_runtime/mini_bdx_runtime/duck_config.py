@@ -117,7 +117,7 @@ class DuckConfig:
         # calibration, where a released joint going loose on the wrong side names the
         # pair. "legs_swapped": true is the older whole-leg form and means all five.
         pairs = self.json_config.get("swapped_pairs")
-        if pairs is None and self.json_config.get("legs_swapped"):
+        if not pairs and self.json_config.get("legs_swapped"):
             pairs = list(LEG_PAIRS)
         self.swapped_pairs = sorted({str(p) for p in (pairs or []) if str(p) in LEG_PAIRS})
         self.legs_swapped = set(self.swapped_pairs) == set(LEG_PAIRS)

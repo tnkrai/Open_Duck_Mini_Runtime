@@ -271,6 +271,9 @@ class DuckConfigModel(BaseModel):
     joints_offsets: dict = {}
     # per-joint direction, +1 or -1 (see HWI.joints_signs); written by /api/directions/save
     joints_signs: dict = {}
+    # the build gave the right leg's servo ids to the left leg; written by
+    # /api/calibration/swap-legs (see HWI.__init__)
+    legs_swapped: bool = False
 
 
 class CommandRequest(BaseModel):
@@ -863,6 +866,11 @@ def _joint_sign(hwi, joint_name: str) -> int:
     return int(getattr(hwi, "joints_signs", {}).get(joint_name, 1))
 
 
+def _legs_swapped(hwi) -> bool:
+    """Whether this build's left and right leg ids are the other way round (config)."""
+    return bool(getattr(getattr(hwi, "duck_config", None), "legs_swapped", False))
+
+
 def _read_one(hwi, joint_name: str) -> float:
     """One joint's present position, or a 502 that names the joint.
 
@@ -962,7 +970,12 @@ def calibration_start():
     )
     # `mode` is the belt to /api/health's braces: Studio refuses to arm against an
     # agent whose health does not say "hold", and checks this on the way back.
-    return {"joints": joint_names, "currentPositions": current_positions, "mode": "hold"}
+    return {
+        "joints": joint_names,
+        "currentPositions": current_positions,
+        "mode": "hold",
+        "legsSwapped": _legs_swapped(hwi),
+    }
 
 
 @app.post("/api/calibration/begin-joint")
@@ -1148,6 +1161,79 @@ def calibration_accept(req: AcceptJointRequest):
         attempts=calibration_session.get("confirms", {}).get(joint_name, 1),
     )
     return {"success": True, "offsets": calibration_offsets}
+
+
+# How far the identity check rocks a joint about its held pose, in radians: a few
+# degrees, enough to see which leg answers to a name and not enough to matter.
+CALIBRATION_WIGGLE_RAD = 0.08
+
+
+class SwapLegsRequest(BaseModel):
+    swapped: bool
+
+
+@app.post("/api/calibration/wiggle")
+def calibration_wiggle(req: JointRequest):
+    """Rock ONE held joint a few degrees and put it back: which physical joint answers
+    to this name?
+
+    The identity check before the offsets. A build that programmed the right leg's
+    servo ids into the left leg's servos passes every other check — each joint reads,
+    holds and measures fine — and only shows itself when a name moves the wrong leg.
+    So the screen wiggles a right-leg joint, asks which leg moved, and swaps the leg
+    names (see /swap-legs) if the answer is the left one.
+    """
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    if joint_name not in calibration_hold:
+        _note_calibration_fault("INVALID_STATE", joint_name)
+        _agent_error(
+            409, "INVALID_STATE", "no held pose: call /api/calibration/start first", joint_name
+        )
+    if joint_name in calibration_baselines:
+        _note_calibration_fault("INVALID_STATE", joint_name)
+        _agent_error(
+            409, "INVALID_STATE", f"{joint_name} is released; a limp joint cannot wiggle", joint_name
+        )
+    centre = float(calibration_hold[joint_name])
+    try:
+        for _ in range(2):
+            hwi.set_position(joint_name, centre + CALIBRATION_WIGGLE_RAD)
+            time.sleep(0.25)
+            hwi.set_position(joint_name, centre - CALIBRATION_WIGGLE_RAD)
+            time.sleep(0.25)
+        hwi.set_position(joint_name, centre)
+        time.sleep(0.25)
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        _note_calibration_fault("MOTORS_SILENT", joint_name)
+        _agent_error(502, "MOTORS_SILENT", str(e), joint_name)
+    add_telemetry_props(joint_name=joint_name)
+    return {"success": True, "jointName": joint_name}
+
+
+@app.post("/api/calibration/swap-legs")
+def calibration_swap_legs(req: SwapLegsRequest):
+    """Record that this build's left and right leg servo ids are the other way round,
+    and rebuild the HWI on it.
+
+    Ends the hold session rather than patching it: the held pose was read per NAME
+    under the old naming, so under the new one every value would sit on the other leg.
+    The caller arms again with /start, which reads the pose afresh. Torque stays on
+    throughout and the servos keep their goals in firmware, so nothing moves.
+    """
+    global calibration_baselines, calibration_hold, calibration_offsets
+    refuse_while_walking()
+    config = _config_for_update()
+    config["legs_swapped"] = bool(req.swapped)
+    _save_config(config)
+    calibration_baselines = {}
+    calibration_hold = {}
+    calibration_offsets = {}
+    release_hwi(disable_torque=False)
+    telemetry.capture("legs_swapped", {"swapped": bool(req.swapped)})
+    return {"success": True, "legsSwapped": bool(req.swapped)}
 
 
 @app.post("/api/calibration/finish")

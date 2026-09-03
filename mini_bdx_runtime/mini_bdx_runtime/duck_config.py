@@ -108,6 +108,12 @@ class DuckConfig:
             name: -1 if _is_minus_one(signs.get(name)) else 1 for name in JOINT_NAMES
         }
 
+        # True when this build programmed the right leg's servo ids into the LEFT
+        # leg's servos and vice versa. The HWI then swaps the ids by name, so every
+        # left_* name drives the physical left leg. Found by the identity check at
+        # the start of the joint calibration (see /api/calibration/wiggle).
+        self.legs_swapped = bool(self.json_config.get("legs_swapped", False))
+
 
 def _is_minus_one(value) -> bool:
     try:

@@ -246,6 +246,28 @@ def test_a_config_without_signs_is_all_plus_one(tmp_path):
     assert set(signs.values()) == {1}
 
 
+def test_hwi_swaps_the_leg_ids_by_name_when_the_config_says_so(tmp_path, monkeypatch):
+    """A build that programmed the right leg's ids into the left leg's servos: every
+    left_* name must reach the physical left leg. Swapped in place, so the dict order
+    the policy's vectors and the gain arrays index by is untouched."""
+    import mini_bdx_runtime.rustypot_position_hwi as hwi_mod
+
+    monkeypatch.setattr(hwi_mod.rustypot, "feetech", lambda port, baud: object())
+    cfg = tmp_path / "duck_config.json"
+    cfg.write_text(json.dumps({"legs_swapped": True}))
+    hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
+    assert hwi.joints["left_knee"] == 13 and hwi.joints["right_knee"] == 23
+    assert hwi.joints["left_hip_yaw"] == 10 and hwi.joints["right_hip_yaw"] == 20
+    assert hwi.joints["head_yaw"] == 32  # the head is not a leg
+    assert list(hwi.joints)[:5] == [
+        "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle"
+    ]
+
+    cfg.write_text(json.dumps({"legs_swapped": False}))
+    hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
+    assert hwi.joints["left_knee"] == 23 and hwi.joints["right_knee"] == 13
+
+
 def test_hwi_applies_the_sign_on_the_way_out_and_undoes_it_on_the_way_back(tmp_path, monkeypatch):
     """raw = sign * position + offset, position = sign * (raw - offset): the offset is
     added AFTER the sign, so a calibration done before the direction test survives it."""

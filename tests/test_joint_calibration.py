@@ -51,6 +51,7 @@ class FakeHWI:
         self.position_writes = 0
         # every goal as the servo receives it, position + offset: RAW, per write
         self.raw_goals = []
+        self.single_writes = []  # (joint, raw goal) from set_position, in order
         self.turned_off = False
         self.turned_on = False
         self.kds = None
@@ -98,6 +99,11 @@ class FakeHWI:
                 for j, p in positions.items()
             }
         )
+
+    def set_position(self, joint_name, pos):
+        # one joint, as the wiggle writes it; recorded in RAW terms like the rest
+        raw = self.joints_signs.get(joint_name, 1) * pos + self.joints_offsets.get(joint_name, 0.0)
+        self.single_writes.append((joint_name, raw))
 
     def close(self):
         pass
@@ -720,6 +726,62 @@ def test_save_clears_the_hold_so_a_later_release_cannot_replay_it(client, hwi):
     assert tnkr_server.calibration_hold == {}
     assert tnkr_server.calibration_baselines == {}
     assert tnkr_server.calibration_offsets == {"left_knee": pytest.approx(0.15)}
+
+
+def test_wiggle_rocks_the_joint_about_its_held_pose_and_puts_it_back(client, hwi, monkeypatch):
+    """The identity check: which physical joint answers to this name? A few degrees
+    either side of where the joint is held, then back, and nothing else moves."""
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+
+    r = client.post("/api/calibration/wiggle", json={"jointName": "right_knee"})
+    assert r.status_code == 200
+    assert r.json()["jointName"] == "right_knee"
+    assert all(j == "right_knee" for j, _ in hwi.single_writes)
+    goals = [g for _, g in hwi.single_writes]
+    assert max(goals) == pytest.approx(-0.9 + tnkr_server.CALIBRATION_WIGGLE_RAD)
+    assert min(goals) == pytest.approx(-0.9 - tnkr_server.CALIBRATION_WIGGLE_RAD)
+    assert goals[-1] == pytest.approx(-0.9)  # back where it was held
+
+
+def test_wiggle_needs_a_held_pose_and_a_powered_joint(client, hwi, monkeypatch):
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    r = client.post("/api/calibration/wiggle", json={"jointName": "right_knee"})
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "INVALID_STATE"
+
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "right_knee"})
+    # a released joint is limp: a goal write would re-power it under a hand
+    r = client.post("/api/calibration/wiggle", json={"jointName": "right_knee"})
+    assert r.status_code == 409
+    assert hwi.single_writes == []
+
+
+def test_swap_legs_writes_the_config_and_ends_the_hold_for_a_re_arm(client, hwi, tmp_path):
+    """The held pose was read per NAME under the old naming, so it cannot be patched:
+    the session ends, the bus is freed (torque kept), and the screen arms again."""
+    import json
+
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    r = client.post("/api/calibration/swap-legs", json={"swapped": True})
+    assert r.status_code == 200
+    assert r.json()["legsSwapped"] is True
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["legs_swapped"] is True
+    assert tnkr_server.hwi_instance is None
+    assert hwi.turned_off is False
+    assert tnkr_server.calibration_hold == {}
+
+
+def test_start_reports_whether_the_legs_are_swapped(client, hwi):
+    import types
+
+    assert client.post("/api/calibration/start").json()["legsSwapped"] is False
+    hwi.duck_config = types.SimpleNamespace(legs_swapped=True)
+    assert client.post("/api/calibration/start").json()["legsSwapped"] is True
 
 
 def test_health_advertises_the_hold_so_studio_can_refuse_an_older_agent(client):

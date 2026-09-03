@@ -2639,25 +2639,49 @@ def get_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# The keys the calibration steps own, each written by its own route (calibration/save,
+# directions/save, identify/finish, the swaps). A settings or apply screen that sends
+# the config back whole can only ever carry an OLDER copy of these than the file has:
+# a real operator changed a direction, and a screen that had read the config before
+# the change wrote the old sign back over it. So this route never takes them.
+CALIBRATION_OWNED = ("joints_signs", "servo_ids", "swapped_pairs", "legs_swapped")
+# dicts merged one key at a time, so a client that sends one joint's trim or one
+# feature's tick does not replace the rest
+MERGED_BY_KEY = ("joints_offsets", "expression_features")
+
+
 @app.post("/api/config")
 def update_config(config: DuckConfigModel):
     # Merged over the file, not written wholesale. Studio sends the fields it knows,
     # and a rewrite from those alone dropped everything else: the joint directions a
     # calibration had just saved, and any key a newer runtime adds before Studio
-    # learns it. Only the fields the client actually sent replace what is there.
+    # learns it. Only the fields the client actually sent replace what is there, the
+    # calibration's own keys never do, and the per-joint and per-feature dicts merge
+    # one key at a time.
     try:
         existing = _read_config()
     except Exception:
         existing = {}
+    incoming = config.model_dump(exclude_unset=True)
+    ignored = [key for key in CALIBRATION_OWNED if key in incoming]
+    for key in ignored:
+        incoming.pop(key)
+    if ignored:
+        print(f"[config] ignoring calibration-owned keys on /api/config: {', '.join(ignored)}")
     merged = dict(existing)
-    merged.update(config.model_dump(exclude_unset=True))
+    for key, value in incoming.items():
+        if key in MERGED_BY_KEY and isinstance(value, dict) and isinstance(existing.get(key), dict):
+            merged[key] = {**existing[key], **value}
+        else:
+            merged[key] = value
     try:
         _write_config(merged)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Reload HWI with new config
-    release_hwi()
+    # The next HWI is built from the file. The servos keep holding in firmware: a
+    # settings tick must not drop a duck that is standing on its stand.
+    release_hwi(disable_torque=False)
 
     # Keys only (capped) — the dict is open-typed, so never forward values.
     add_telemetry_props(

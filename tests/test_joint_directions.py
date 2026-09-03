@@ -413,3 +413,46 @@ def test_finish_rests_a_crouch_and_crouch_needs_a_session(client, hwi):
     client.post("/api/directions/crouch")
     assert client.post("/api/directions/finish").status_code == 200
     assert hwi.raw_goals["left_hip_pitch"] == pytest.approx(hwi.joints_offsets["left_hip_pitch"])
+
+
+def test_a_config_save_never_carries_the_calibration_keys_back(client, hwi, tmp_path):
+    """A screen that read the config before a direction was changed and then saved
+    a tick sent the old sign back over the new one. The calibration's own keys are
+    ignored on this route, the per-joint and per-feature dicts merge by key, and the
+    servos keep holding through the save."""
+    import json
+
+    path = tmp_path / "duck_config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "joints_offsets": {"left_knee": 0.1, "right_knee": -0.2},
+                "joints_signs": {"left_knee": -1, "right_knee": 1},
+                "servo_ids": {"left_hip_yaw": 11, "left_hip_roll": 10},
+                "swapped_pairs": ["knee"],
+                "legs_swapped": False,
+                "expression_features": {"eyes": True, "antennas": False},
+            }
+        )
+    )
+    r = client.post(
+        "/api/config",
+        json={
+            "joints_offsets": {"left_knee": 0.3},
+            "joints_signs": {"left_knee": 1, "right_knee": 1},
+            "servo_ids": {},
+            "swapped_pairs": [],
+            "legs_swapped": True,
+            "expression_features": {"antennas": True},
+            "imu_upside_down": True,
+        },
+    )
+    assert r.status_code == 200, r.text
+    saved = json.loads(path.read_text())
+    assert saved["joints_signs"] == {"left_knee": -1, "right_knee": 1}
+    assert saved["servo_ids"] == {"left_hip_yaw": 11, "left_hip_roll": 10}
+    assert saved["swapped_pairs"] == ["knee"] and saved["legs_swapped"] is False
+    assert saved["joints_offsets"] == {"left_knee": 0.3, "right_knee": -0.2}
+    assert saved["expression_features"] == {"eyes": True, "antennas": True}
+    assert saved["imu_upside_down"] is True
+    assert hwi.turned_off is False

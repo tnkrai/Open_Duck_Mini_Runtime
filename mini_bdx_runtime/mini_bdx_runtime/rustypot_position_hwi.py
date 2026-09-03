@@ -138,6 +138,14 @@ class HWI:
             if left in self.joints and right in self.joints:
                 self.joints[left], self.joints[right] = self.joints[right], self.joints[left]
 
+        # Any joint by NAME, whichever id the build gave its servo: "servo_ids" lists the
+        # joints that differ from the table (a real build had one leg's hip yaw and hip
+        # roll ids on each other's servos, on top of the whole leg swapped). Set in
+        # place, after the pairs, and wins over them.
+        for name, servo_id in (getattr(self.duck_config, "servo_ids", {}) or {}).items():
+            if name in self.joints:
+                self.joints[name] = int(servo_id)
+
         self.zero_pos = {
             "left_hip_yaw": 0,
             "left_hip_roll": 0,

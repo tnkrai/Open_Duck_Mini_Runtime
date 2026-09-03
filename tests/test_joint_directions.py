@@ -337,3 +337,35 @@ def test_a_stale_whole_leg_swap_survives_a_saved_round_trip(tmp_path):
     parsed = DuckConfig(config_json_path=str(cfg), ignore_default=True)
     assert parsed.swapped_pairs == []
     assert parsed.legs_swapped is False
+
+
+def test_hwi_takes_servo_ids_by_name_over_the_pairs(tmp_path, monkeypatch):
+    """A real build had the whole leg swapped AND, within the left leg, the hip yaw and
+    hip roll ids on each other's servos. servo_ids names the joints that differ from
+    the table, is applied after the pairs, and wins; the joint order stays as declared."""
+    import mini_bdx_runtime.rustypot_position_hwi as hwi_mod
+
+    monkeypatch.setattr(hwi_mod.rustypot, "feetech", lambda port, baud: object())
+    cfg = tmp_path / "duck_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "legs_swapped": True,
+                "swapped_pairs": ["hip_yaw", "hip_roll", "hip_pitch", "knee", "ankle"],
+                "servo_ids": {"left_hip_yaw": 11, "left_hip_roll": 10},
+            }
+        )
+    )
+    hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
+    assert hwi.joints["left_hip_yaw"] == 11 and hwi.joints["left_hip_roll"] == 10
+    assert hwi.joints["right_hip_yaw"] == 20 and hwi.joints["right_hip_roll"] == 21
+    assert hwi.joints["left_knee"] == 13
+    assert list(hwi.joints) == list(hwi_mod.DEFAULT_SERVO_IDS)
+
+    # on its own, over the table; a name the duck lacks or a value that is not an id is dropped
+    cfg.write_text(
+        json.dumps({"servo_ids": {"left_hip_yaw": 21, "left_hip_roll": 20, "nope": 5, "head_yaw": "x"}})
+    )
+    hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
+    assert hwi.joints["left_hip_yaw"] == 21 and hwi.joints["left_hip_roll"] == 20
+    assert hwi.joints["head_yaw"] == 32 and "nope" not in hwi.joints

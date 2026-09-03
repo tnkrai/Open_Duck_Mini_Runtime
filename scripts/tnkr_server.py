@@ -1697,6 +1697,43 @@ def _write_pair(hwi, pair: dict, extended: bool) -> None:
             _agent_error(502, "MOTORS_SILENT", str(e), joint)
 
 
+# The walking crouch: the pose the walk starts from (HWI.init_pos), on the pairs the
+# check moves. Shown whole at the end of the check, so the operator confirms the very
+# pose the walk will send, with the signs the answers gave, before the walk does.
+CROUCH = "crouch"
+
+
+def _crouch_targets(hwi) -> dict[str, float]:
+    return {
+        pair[side]: float(hwi.init_pos[pair[side]])
+        for pair in DIRECTION_PAIRS
+        for side in ("left", "right")
+        if pair[side] in hwi.init_pos
+    }
+
+
+def _write_crouch(hwi, extended: bool) -> dict[str, float]:
+    """Every pair joint into the walking crouch, or every one back to straight."""
+    targets = _crouch_targets(hwi)
+    for joint, target in targets.items():
+        try:
+            hwi.set_position(joint, target if extended else 0.0)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            _note_calibration_fault("MOTORS_SILENT", joint)
+            _agent_error(502, "MOTORS_SILENT", str(e), joint)
+    return targets
+
+
+def _rest_displaced(hwi, moved) -> None:
+    """Whatever the session left displaced, back to straight: a pair, or the crouch."""
+    if moved == CROUCH:
+        _write_crouch(hwi, extended=False)
+    elif moved:
+        _write_pair(hwi, _direction_pair(moved), extended=False)
+
+
 @app.post("/api/directions/start")
 def directions_start():
     """Stand the duck straight at low stiffness, ready to move pairs.
@@ -1766,6 +1803,34 @@ def directions_rest(req: PairRequest):
     return {"success": True, "pairId": pair["id"]}
 
 
+@app.post("/api/directions/crouch")
+def directions_crouch():
+    """Every pair joint into the walking crouch, with the signs as they stand.
+
+    The end of the check: the pairs were judged one at a time, and this is the whole
+    pose the walk will send first, so the operator confirms that, not its parts. A
+    joint that goes the other way here is flipped and the crouch sent again.
+    """
+    hwi = _calibration_hwi()
+    session = _directions_open()
+    targets = _write_crouch(hwi, extended=True)
+    session["moved"] = CROUCH
+    time.sleep(1.5)
+    add_telemetry_props(pair=CROUCH)
+    return {"success": True, "targets": targets}
+
+
+@app.post("/api/directions/stand")
+def directions_stand():
+    """Every pair joint back to straight."""
+    hwi = _calibration_hwi()
+    session = _directions_open()
+    _write_crouch(hwi, extended=False)
+    session["moved"] = None
+    time.sleep(1.0)
+    return {"success": True}
+
+
 @app.post("/api/directions/flip")
 def directions_flip(req: JointRequest):
     """Invert this joint's direction, live.
@@ -1800,8 +1865,7 @@ def directions_save():
     config["joints_signs"] = signs
     _save_config(config)
 
-    if session.get("moved"):
-        _write_pair(hwi, _direction_pair(session["moved"]), extended=False)
+    _rest_displaced(hwi, session.get("moved"))
     directions_session = None
     # Same hand-off as the offsets: the servos hold in firmware, the port is freed,
     # and the next HWI is built from the file that now carries the signs.
@@ -1831,7 +1895,7 @@ def directions_finish():
     moved = directions_session.get("moved")
     if moved:
         try:
-            _write_pair(hwi_instance, _direction_pair(moved), extended=False)
+            _rest_displaced(hwi_instance, moved)
             time.sleep(0.5)
         except HTTPException:
             pass

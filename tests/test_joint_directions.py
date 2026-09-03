@@ -369,3 +369,47 @@ def test_hwi_takes_servo_ids_by_name_over_the_pairs(tmp_path, monkeypatch):
     hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
     assert hwi.joints["left_hip_yaw"] == 21 and hwi.joints["left_hip_roll"] == 20
     assert hwi.joints["head_yaw"] == 32 and "nope" not in hwi.joints
+
+
+def test_crouch_sends_the_walking_stance_through_sign_and_offset_and_rests_on_save(
+    client, hwi, tmp_path
+):
+    """The end of the check is the pose the walk starts from, whole: every pair joint
+    to HWI.init_pos, through the sign and offset the walk will use. Stand and save put
+    the pairs back to straight; save writes the signs that were confirmed."""
+    import json
+
+    client.post("/api/directions/start")
+    client.post("/api/directions/flip", json={"jointName": "left_knee"})
+    r = client.post("/api/directions/crouch")
+    assert r.status_code == 200, r.text
+    targets = r.json()["targets"]
+    assert set(targets) == {
+        "left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee", "left_ankle", "right_ankle",
+    }
+    assert targets["left_knee"] == pytest.approx(hwi.init_pos["left_knee"])
+    # the servo sees sign * target + offset, the walk's own arithmetic
+    written = hwi.raw_goals
+    assert written["left_knee"] == pytest.approx(-hwi.init_pos["left_knee"] + hwi.joints_offsets["left_knee"])
+    assert written["right_knee"] == pytest.approx(hwi.init_pos["right_knee"] + hwi.joints_offsets["right_knee"])
+    assert written["left_ankle"] == pytest.approx(hwi.init_pos["left_ankle"] + hwi.joints_offsets["left_ankle"])
+
+    assert client.post("/api/directions/stand").status_code == 200
+    assert hwi.raw_goals["left_knee"] == pytest.approx(hwi.joints_offsets["left_knee"])
+
+    client.post("/api/directions/crouch")
+    r = client.post("/api/directions/save")
+    assert r.status_code == 200, r.text
+    assert r.json()["signs"]["left_knee"] == -1
+    # saved with the crouch rested first: the last write to every pair joint is straight
+    assert hwi.raw_goals["right_ankle"] == pytest.approx(hwi.joints_offsets["right_ankle"])
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["joints_signs"]["left_knee"] == -1
+
+
+def test_finish_rests_a_crouch_and_crouch_needs_a_session(client, hwi):
+    assert client.post("/api/directions/crouch").status_code == 409
+    client.post("/api/directions/start")
+    client.post("/api/directions/crouch")
+    assert client.post("/api/directions/finish").status_code == 200
+    assert hwi.raw_goals["left_hip_pitch"] == pytest.approx(hwi.joints_offsets["left_hip_pitch"])

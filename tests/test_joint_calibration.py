@@ -776,12 +776,68 @@ def test_swap_legs_writes_the_config_and_ends_the_hold_for_a_re_arm(client, hwi,
     assert tnkr_server.calibration_hold == {}
 
 
-def test_start_reports_whether_the_legs_are_swapped(client, hwi):
+def test_start_reports_which_pairs_are_swapped(client, hwi):
     import types
 
-    assert client.post("/api/calibration/start").json()["legsSwapped"] is False
-    hwi.duck_config = types.SimpleNamespace(legs_swapped=True)
+    body = client.post("/api/calibration/start").json()
+    assert body["swappedPairs"] == [] and body["legsSwapped"] is False
+    hwi.duck_config = types.SimpleNamespace(swapped_pairs=["hip_yaw"])
+    body = client.post("/api/calibration/start").json()
+    assert body["swappedPairs"] == ["hip_yaw"] and body["legsSwapped"] is False
+    hwi.duck_config = types.SimpleNamespace(swapped_pairs=list(tnkr_server.LEG_PAIRS))
     assert client.post("/api/calibration/start").json()["legsSwapped"] is True
+
+
+def test_swap_pair_swaps_one_pair_and_holds_again_without_losing_the_session(
+    client, hwi, tmp_path, monkeypatch
+):
+    """Found on a real build: releasing left_hip_yaw went limp on the RIGHT hip while
+    the knees answered to their names. The pair's ids swap on the duck, the other
+    joints' accepted offsets survive, the pair's own are dropped, and every joint is
+    held where it is — the limp one re-powered in place."""
+    import json
+
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/accept", json={"jointName": "head_yaw", "offset": 0.11})
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})  # limp now
+
+    # the HWI the agent rebuilds after dropping the old one, on the new ids
+    rebuilt = FakeHWI()
+    rebuilt.readings = dict(hwi.readings)
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: rebuilt)
+
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "left_knee"})
+    assert r.status_code == 200, r.text
+    assert r.json()["swappedPairs"] == ["knee"]
+    assert r.json()["legsSwapped"] is False
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["swapped_pairs"] == ["knee"]
+    assert saved["legs_swapped"] is False
+
+    # the other joint's accepted offset survives, in the session and on the new HWI;
+    # the pair's session state is gone
+    assert tnkr_server.calibration_offsets == {"head_yaw": pytest.approx(0.11)}
+    assert rebuilt.joints_offsets["head_yaw"] == pytest.approx(0.11)
+    assert "left_knee" not in tnkr_server.calibration_baselines
+    # held again where every joint is, the limp one included, torque on
+    assert rebuilt.raw_goals[-1]["left_knee"] == pytest.approx(1.3)
+    assert ("left_knee", True) in rebuilt.torque_calls
+    assert tnkr_server.calibration_hold["head_yaw"] == pytest.approx(0.2 - 0.11)
+
+    # a second swap of the same pair puts it back
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "right_knee"})
+    assert r.json()["swappedPairs"] == []
+
+
+def test_swap_pair_refuses_a_joint_without_a_twin_and_needs_a_held_pose(client, hwi):
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "left_knee"})
+    assert r.status_code == 409
+    client.post("/api/calibration/start")
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "head_yaw"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "UNKNOWN_JOINT"
 
 
 def test_health_advertises_the_hold_so_studio_can_refuse_an_older_agent(client):

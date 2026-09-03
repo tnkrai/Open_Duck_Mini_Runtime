@@ -46,7 +46,7 @@ from mini_bdx_runtime.rustypot_position_hwi import (
     find_servo_adapter,
     is_rust_panic,
 )
-from mini_bdx_runtime.duck_config import DuckConfig
+from mini_bdx_runtime.duck_config import DuckConfig, LEG_PAIRS
 from mini_bdx_runtime import telemetry
 from mini_bdx_runtime import walk_telemetry
 from mini_bdx_runtime import walk_pause
@@ -271,8 +271,10 @@ class DuckConfigModel(BaseModel):
     joints_offsets: dict = {}
     # per-joint direction, +1 or -1 (see HWI.joints_signs); written by /api/directions/save
     joints_signs: dict = {}
-    # the build gave the right leg's servo ids to the left leg; written by
-    # /api/calibration/swap-legs (see HWI.__init__)
+    # left/right pairs whose servo ids the build programmed the other way round, by
+    # the part of the name after the side; written by /api/calibration/swap-pair and
+    # swap-legs (see HWI.__init__). legs_swapped is the older whole-leg form.
+    swapped_pairs: list = []
     legs_swapped: bool = False
 
 
@@ -866,9 +868,28 @@ def _joint_sign(hwi, joint_name: str) -> int:
     return int(getattr(hwi, "joints_signs", {}).get(joint_name, 1))
 
 
+def _swapped_pairs(hwi) -> list[str]:
+    """The left/right pairs whose servo ids this build has the other way round."""
+    return sorted(getattr(getattr(hwi, "duck_config", None), "swapped_pairs", []) or [])
+
+
 def _legs_swapped(hwi) -> bool:
-    """Whether this build's left and right leg ids are the other way round (config)."""
-    return bool(getattr(getattr(hwi, "duck_config", None), "legs_swapped", False))
+    """Every leg pair swapped: the older whole-leg answer, still reported for the screen."""
+    return set(_swapped_pairs(hwi)) == set(LEG_PAIRS)
+
+
+def _pair_of(joint_name: str) -> str | None:
+    """'left_knee' -> 'knee'; None for a joint with no left/right twin."""
+    for side in ("left_", "right_"):
+        if joint_name.startswith(side) and joint_name[len(side) :] in LEG_PAIRS:
+            return joint_name[len(side) :]
+    return None
+
+
+def _twin_of(joint_name: str) -> str:
+    if joint_name.startswith("left_"):
+        return "right_" + joint_name[len("left_") :]
+    return "left_" + joint_name[len("right_") :]
 
 
 def _read_one(hwi, joint_name: str) -> float:
@@ -886,6 +907,57 @@ def _read_one(hwi, joint_name: str) -> float:
             raise
         _note_calibration_fault("MOTORS_SILENT", joint_name)
         _agent_error(502, "MOTORS_SILENT", str(e), joint_name)
+
+
+def _hold_where_it_is(hwi) -> dict:
+    """Read every joint, then hold each exactly where it is. The shared core of /start
+    and /swap-pair.
+
+    Read BEFORE commanding anything. The read doubles as the whole-bus silent-joint
+    check, which belongs here and only here: holding is the one step that is about
+    every joint, so a servo that is already quiet is caught before the operator's
+    hands are on the robot. Reported rather than swallowed: the old code returned an
+    empty currentPositions dict and let the session continue with no pose at all.
+
+    Gains written directly, once. NOT turn_on(): that ramps every joint through kp 2
+    for a second before its goal lands, and with kd at 0 a loaded knee sags under the
+    body for those seconds and is hauled back when the real kp arrives — a visible dip
+    on a duck that was promised nothing would move. It would also have driven every
+    joint to hwi.init_pos on the way, which is not where the duck is.
+
+    Goal first, torque second, per joint — the order apply-offset uses, for the same
+    reason: a servo that wakes up already at its target stiffens in place, and an
+    explicit enable after the goal does not depend on the firmware doing it for us.
+    """
+    positions = hwi.get_present_positions()
+    if positions is None:
+        _note_calibration_fault("MOTORS_SILENT")
+        _agent_error(502, "MOTORS_SILENT", "at least one joint did not answer")
+
+    joint_names = list(hwi.joints.keys())
+    current_positions = {
+        name: round(float(positions[i]), 3) for i, name in enumerate(joint_names)
+    }
+    try:
+        hwi.set_kds([0] * len(joint_names))
+        hwi.set_kps([CALIBRATION_HOLD_KP] * len(joint_names))
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        _note_calibration_fault("MOTORS_SILENT")
+        _agent_error(502, "MOTORS_SILENT", str(e))
+
+    hwi.set_position_all(dict(current_positions))
+    for joint_name in joint_names:
+        try:
+            hwi.set_joint_torque(joint_name, True)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            _note_calibration_fault("TORQUE_ENABLE_FAILED", joint_name)
+            _agent_error(502, "TORQUE_ENABLE_FAILED", str(e), joint_name)
+    time.sleep(0.5)
+    return current_positions
 
 
 @app.post("/api/calibration/start")
@@ -907,54 +979,13 @@ def calibration_start():
 
     _reset_calibration_session(hwi)
 
-    # Read BEFORE commanding anything. This is the placed pose — the thing the session
-    # will hold — and it doubles as the whole-bus silent-joint check, which belongs
-    # here and only here: arming is the one step that is about every joint, so a servo
-    # that is already quiet is caught before the operator's hands are on the robot.
-    # Reported rather than swallowed: the old code returned an empty currentPositions
-    # dict and let the session continue with no pose at all.
-    positions = hwi.get_present_positions()
-    if positions is None:
-        _note_calibration_fault("MOTORS_SILENT")
-        _agent_error(502, "MOTORS_SILENT", "at least one joint did not answer")
-
+    # Hold exactly where each joint already is (see _hold_where_it_is). The offsets
+    # were zeroed above, so every servo's goal IS its present position, and nothing
+    # moves. dict(), not a bare assignment — sharing the object with anything else
+    # would make a later per-joint write edit both.
     joint_names = list(hwi.joints.keys())
-    current_positions = {
-        name: round(float(positions[i]), 3) for i, name in enumerate(joint_names)
-    }
-
-    # Gains written directly, once. NOT turn_on(): that ramps every joint through kp 2
-    # for a second before its goal lands, and with kd at 0 a loaded knee sags under
-    # the body for those seconds and is hauled back when the real kp arrives — a
-    # visible dip on a duck that was promised nothing would move. It would also have
-    # driven every joint to hwi.init_pos on the way, which is not where the duck is.
-    try:
-        hwi.set_kds([0] * len(joint_names))
-        hwi.set_kps([CALIBRATION_HOLD_KP] * len(joint_names))
-    except BaseException as e:
-        if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-            raise
-        _note_calibration_fault("MOTORS_SILENT")
-        _agent_error(502, "MOTORS_SILENT", str(e))
-
-    # Hold exactly where each joint already is. The offsets were zeroed above, so
-    # set_position_all writes each goal unchanged: every servo's goal IS its present
-    # position, and nothing moves. Goal first, torque second, per joint — the order
-    # apply-offset uses, for the same reason: a servo that wakes up already at its
-    # target stiffens in place, and an explicit enable after the goal does not depend
-    # on the firmware doing it for us. dict(), not a bare assignment — sharing the
-    # object with anything else would make a later per-joint write edit both.
+    current_positions = _hold_where_it_is(hwi)
     calibration_hold = dict(current_positions)
-    hwi.set_position_all(calibration_hold)
-    for joint_name in joint_names:
-        try:
-            hwi.set_joint_torque(joint_name, True)
-        except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-                raise
-            _note_calibration_fault("TORQUE_ENABLE_FAILED", joint_name)
-            _agent_error(502, "TORQUE_ENABLE_FAILED", str(e), joint_name)
-    time.sleep(0.5)
 
     # The placed pose, fleet-wide: how far from straight operators actually leave the
     # duck when they calibrate. That is what says whether the on-screen reference
@@ -974,6 +1005,7 @@ def calibration_start():
         "joints": joint_names,
         "currentPositions": current_positions,
         "mode": "hold",
+        "swappedPairs": _swapped_pairs(hwi),
         "legsSwapped": _legs_swapped(hwi),
     }
 
@@ -1226,6 +1258,7 @@ def calibration_swap_legs(req: SwapLegsRequest):
     global calibration_baselines, calibration_hold, calibration_offsets
     refuse_while_walking()
     config = _config_for_update()
+    config["swapped_pairs"] = list(LEG_PAIRS) if req.swapped else []
     config["legs_swapped"] = bool(req.swapped)
     _save_config(config)
     calibration_baselines = {}
@@ -1234,6 +1267,62 @@ def calibration_swap_legs(req: SwapLegsRequest):
     release_hwi(disable_torque=False)
     telemetry.capture("legs_swapped", {"swapped": bool(req.swapped)})
     return {"success": True, "legsSwapped": bool(req.swapped)}
+
+
+@app.post("/api/calibration/swap-pair")
+def calibration_swap_pair(req: JointRequest):
+    """This name reached the OTHER side's servo: swap the pair's ids and hold again.
+
+    Found on a real build: releasing left_hip_yaw went limp on the right hip, while
+    the knees answered to their names — the builder had programmed the hip yaw ids the
+    other way round and nothing else. A whole-leg swap cannot say that; a pair can.
+
+    Keeps the session. The other joints' accepted offsets stay; the pair's own are
+    dropped, because they were measured on the other servos. The HWI is rebuilt on the
+    new names, its offsets set back to the session's, and every joint is held where it
+    is — which re-powers the limp one in place. Nothing moves.
+    """
+    global calibration_hold
+    hwi = _calibration_hwi()
+    joint_name = _calibration_joint(hwi, req.jointName)
+    pair = _pair_of(joint_name)
+    if pair is None:
+        _note_calibration_fault("UNKNOWN_JOINT", joint_name)
+        _agent_error(400, "UNKNOWN_JOINT", f"{joint_name} has no left/right twin", joint_name)
+    if not calibration_hold:
+        _note_calibration_fault("INVALID_STATE", joint_name)
+        _agent_error(
+            409, "INVALID_STATE", "no held pose: call /api/calibration/start first", joint_name
+        )
+
+    config = _config_for_update()
+    pairs = set(config.get("swapped_pairs") or [])
+    if not config.get("swapped_pairs") and config.get("legs_swapped"):
+        pairs = set(LEG_PAIRS)  # the older whole-leg form, made explicit before editing
+    pairs ^= {pair}
+    config["swapped_pairs"] = sorted(pairs)
+    config["legs_swapped"] = pairs == set(LEG_PAIRS)
+    _save_config(config)
+
+    twin = _twin_of(joint_name)
+    for name in (joint_name, twin):
+        calibration_offsets.pop(name, None)
+        calibration_baselines.pop(name, None)
+
+    release_hwi(disable_torque=False)
+    hwi = _calibration_hwi()
+    for name in hwi.joints:
+        hwi.joints_offsets[name] = calibration_offsets.get(name, 0)
+    current_positions = _hold_where_it_is(hwi)
+    calibration_hold = dict(current_positions)
+
+    add_telemetry_props(joint_name=joint_name, swapped_pairs=sorted(pairs))
+    return {
+        "joints": list(hwi.joints.keys()),
+        "currentPositions": current_positions,
+        "swappedPairs": sorted(pairs),
+        "legsSwapped": pairs == set(LEG_PAIRS),
+    }
 
 
 @app.post("/api/calibration/finish")

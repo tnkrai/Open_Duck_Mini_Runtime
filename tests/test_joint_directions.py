@@ -254,16 +254,24 @@ def test_hwi_swaps_the_leg_ids_by_name_when_the_config_says_so(tmp_path, monkeyp
 
     monkeypatch.setattr(hwi_mod.rustypot, "feetech", lambda port, baud: object())
     cfg = tmp_path / "duck_config.json"
-    cfg.write_text(json.dumps({"legs_swapped": True}))
+
+    # one crossed pair: the real build's hip yaws, and nothing else
+    cfg.write_text(json.dumps({"swapped_pairs": ["hip_yaw"]}))
     hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
-    assert hwi.joints["left_knee"] == 13 and hwi.joints["right_knee"] == 23
     assert hwi.joints["left_hip_yaw"] == 10 and hwi.joints["right_hip_yaw"] == 20
+    assert hwi.joints["left_knee"] == 23 and hwi.joints["right_knee"] == 13
     assert hwi.joints["head_yaw"] == 32  # the head is not a leg
     assert list(hwi.joints)[:5] == [
         "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle"
     ]
 
-    cfg.write_text(json.dumps({"legs_swapped": False}))
+    # the older whole-leg form still means all five
+    cfg.write_text(json.dumps({"legs_swapped": True}))
+    hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
+    assert hwi.joints["left_knee"] == 13 and hwi.joints["right_knee"] == 23
+    assert hwi.duck_config.legs_swapped is True
+
+    cfg.write_text(json.dumps({"swapped_pairs": [], "legs_swapped": False}))
     hwi = hwi_mod.HWI(DuckConfig(config_json_path=str(cfg), ignore_default=True), usb_port="/dev/fake")
     assert hwi.joints["left_knee"] == 23 and hwi.joints["right_knee"] == 13
 

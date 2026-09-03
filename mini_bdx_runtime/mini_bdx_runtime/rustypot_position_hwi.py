@@ -104,18 +104,16 @@ class HWI:
         }
 
         # Left and right by NAME, whichever ids the build gave the servos. A build that
-        # programmed the right leg's ids into the left leg's servos would otherwise
-        # have every left_* name drive the physical right leg: the walk still walks
-        # (the gait is mirror-symmetric) but every lateral joint turns the wrong way,
-        # and no per-joint sign can undo a swapped pair. The ids are swapped IN PLACE
-        # so the dict order stays as declared: the policy's vectors and the gain
-        # arrays index by it.
-        if getattr(self.duck_config, "legs_swapped", False):
-            for name in list(self.joints):
-                if name.startswith("left_"):
-                    twin = "right_" + name[len("left_") :]
-                    if twin in self.joints:
-                        self.joints[name], self.joints[twin] = self.joints[twin], self.joints[name]
+        # programmed a pair's ids the other way round (a real one had the hip yaws
+        # crossed and nothing else) would otherwise have that left_* name drive the
+        # physical right joint: the walk still walks (the gait is mirror-symmetric)
+        # but the joint turns the wrong way, and no per-joint sign can undo a crossed
+        # pair. The ids are swapped IN PLACE so the dict order stays as declared: the
+        # policy's vectors and the gain arrays index by it.
+        for pair in getattr(self.duck_config, "swapped_pairs", []) or []:
+            left, right = f"left_{pair}", f"right_{pair}"
+            if left in self.joints and right in self.joints:
+                self.joints[left], self.joints[right] = self.joints[right], self.joints[left]
 
         self.zero_pos = {
             "left_hip_yaw": 0,

@@ -4,6 +4,9 @@ import os
 
 HOME_DIR = os.path.expanduser("~")
 
+# the left/right pairs of the legs, by the part of the name after the side
+LEG_PAIRS = ("hip_yaw", "hip_roll", "hip_pitch", "knee", "ankle")
+
 JOINT_NAMES = [
     "left_hip_yaw",
     "left_hip_roll",
@@ -108,11 +111,16 @@ class DuckConfig:
             name: -1 if _is_minus_one(signs.get(name)) else 1 for name in JOINT_NAMES
         }
 
-        # True when this build programmed the right leg's servo ids into the LEFT
-        # leg's servos and vice versa. The HWI then swaps the ids by name, so every
-        # left_* name drives the physical left leg. Found by the identity check at
-        # the start of the joint calibration (see /api/calibration/wiggle).
-        self.legs_swapped = bool(self.json_config.get("legs_swapped", False))
+        # Left/right pairs whose servo ids this build programmed the other way round:
+        # "swapped_pairs": ["hip_yaw", ...]. The HWI swaps those ids by name, so each
+        # left_* name drives the physical left joint. Found during the joint
+        # calibration, where a released joint going loose on the wrong side names the
+        # pair. "legs_swapped": true is the older whole-leg form and means all five.
+        pairs = self.json_config.get("swapped_pairs")
+        if pairs is None and self.json_config.get("legs_swapped"):
+            pairs = list(LEG_PAIRS)
+        self.swapped_pairs = sorted({str(p) for p in (pairs or []) if str(p) in LEG_PAIRS})
+        self.legs_swapped = set(self.swapped_pairs) == set(LEG_PAIRS)
 
 
 def _is_minus_one(value) -> bool:

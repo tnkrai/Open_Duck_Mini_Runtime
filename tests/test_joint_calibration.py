@@ -1,10 +1,17 @@
 """Per-joint soft-offset calibration (/api/calibration/*).
 
-Four behaviours this flow got wrong, each with a test here:
+The session HOLDS the pose the duck was placed in and never commands a joint to
+servo-zero; each offset is the joint's raw reading at the straight pose. The two
+tests at the bottom pin that, because the failure it replaces was a real one: driving
+to zero_pos to arm sent mis-seated joints — the joints calibration exists for — into
+their own shells.
 
-  1. The offset was measured against a hardcoded 0.0 instead of the joint's real
-     pre-release reading, so servo droop (kds are 0 for this session) landed in every
-     saved offset.
+Behaviours this flow got wrong, each with a test here:
+
+  1. The offset was measured against a hardcoded 0.0 while the joint was ALSO being
+     held at a commanded zero under kd 0, so servo droop landed in every saved offset.
+     (Moot under hold-pose: nothing is held at a commanded zero, and the joint is read
+     while the operator's hands hold it, so there is no droop to cancel.)
   2. `get_present_positions()` reads all fourteen and returns None if ANY fails, so a
      silent joint 3 failed a calibration of joint 7 and nothing could name the joint
      that was actually quiet.
@@ -13,6 +20,10 @@ Four behaviours this flow got wrong, each with a test here:
      new goal arrived.
   4. save called release_hwi(), whose disable_torque default is True, so the duck went
      limp the instant the operator saved.
+  5. begin-joint zeroed a redone joint's offset and then re-asserted a hold entry
+     written in the old offset space, so the re-assert drove that joint to servo-zero.
+  6. finish enabled torque against stale goal registers, and left the HWI singleton
+     carrying the session's zeroed offsets for the next route to drive through.
 """
 
 import pytest
@@ -29,6 +40,7 @@ class FakeHWI:
     def __init__(self, readings=None, torque_fails=None, read_fails=None):
         self.joints = dict(JOINTS)
         self.joints_offsets = {n: 0.0 for n in JOINTS}
+        self.joints_signs = {n: 1 for n in JOINTS}
         self.zero_pos = {n: 0.0 for n in JOINTS}
         self.init_pos = dict(self.zero_pos)
         # joint -> present position the bus will report
@@ -37,20 +49,30 @@ class FakeHWI:
         self.read_fails = read_fails or set()
         self.torque_calls = []          # (joint, enabled)
         self.position_writes = 0
+        # every goal as the servo receives it, position + offset: RAW, per write
+        self.raw_goals = []
+        self.single_writes = []  # (joint, raw goal) from set_position, in order
         self.turned_off = False
+        self.turned_on = False
         self.kds = None
+        self.kps = None
 
     # -- the vector read, used only by /start --
     def get_present_positions(self):
         if self.read_fails:
             return None
-        return [self.readings[n] for n in self.joints]
+        return [self._model_space(n) for n in self.joints]
+
+    def _model_space(self, joint_name):
+        # what the real HWI hands back: sign * (raw - offset)
+        sign = self.joints_signs.get(joint_name, 1)
+        return sign * (self.readings[joint_name] - self.joints_offsets.get(joint_name, 0.0))
 
     # -- the single-joint primitives the flow runs on --
     def get_present_position(self, joint_name):
         if joint_name in self.read_fails:
             raise OSError(f"read_present_position failed for '{joint_name}' (id ?)")
-        return self.readings[joint_name] - self.joints_offsets.get(joint_name, 0.0)
+        return self._model_space(joint_name)
 
     def set_joint_torque(self, joint_name, enabled):
         if joint_name in self.torque_fails:
@@ -60,14 +82,28 @@ class FakeHWI:
     def set_kds(self, kds):
         self.kds = kds
 
+    def set_kps(self, kps):
+        self.kps = kps
+
     def turn_on(self):
-        pass
+        self.turned_on = True
 
     def turn_off(self):
         self.turned_off = True
 
     def set_position_all(self, positions):
         self.position_writes += 1
+        self.raw_goals.append(
+            {
+                j: self.joints_signs.get(j, 1) * p + self.joints_offsets.get(j, 0.0)
+                for j, p in positions.items()
+            }
+        )
+
+    def set_position(self, joint_name, pos):
+        # one joint, as the wiggle writes it; recorded in RAW terms like the rest
+        raw = self.joints_signs.get(joint_name, 1) * pos + self.joints_offsets.get(joint_name, 0.0)
+        self.single_writes.append((joint_name, raw))
 
     def close(self):
         pass
@@ -78,6 +114,10 @@ def hwi(monkeypatch, tmp_path):
     monkeypatch.setattr(tnkr_server, "CONFIG_PATH", str(tmp_path / "duck_config.json"))
     monkeypatch.setattr(tnkr_server, "calibration_offsets", {})
     monkeypatch.setattr(tnkr_server, "calibration_baselines", {})
+    monkeypatch.setattr(tnkr_server, "calibration_hold", {})
+    monkeypatch.setattr(tnkr_server, "identify_open", False)
+    monkeypatch.setattr(tnkr_server, "identify_assignments", {})
+    monkeypatch.setattr(tnkr_server, "identify_watch", None)
 
     fake = FakeHWI()
 
@@ -92,21 +132,108 @@ def hwi(monkeypatch, tmp_path):
     return fake
 
 
-def test_offset_is_a_delta_between_two_readings_not_an_absolute(client, hwi):
-    """The droop fix. A joint commanded to zero settles at 0.02 rad under its own
-    load; the operator then poses it to 0.17. The offset is 0.15, not 0.17."""
-    hwi.readings["left_knee"] = 0.02
+def test_the_offset_is_the_reading_at_the_straight_pose(client, hwi):
+    """The offset is measured against STRAIGHT, not against wherever the duck sits.
+
+    The joint is placed at 0.02, released, and posed to straight where it reads 0.17.
+    0.17 IS the mounting error, and the offset. Differencing against the placed pose
+    would bake that pose into every saved offset — a knee calibrated in a crouch would
+    carry the crouch into the walk.
+    """
+    hwi.readings["left_knee"] = 0.02  # wherever the operator placed it
     r = client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
     assert r.status_code == 200
-    assert r.json()["baseline"] == pytest.approx(0.02)
+    assert r.json()["baseline"] == 0.0
 
-    hwi.readings["left_knee"] = 0.17
+    hwi.readings["left_knee"] = 0.17  # posed to straight
     r = client.post("/api/calibration/confirm-position", json={"jointName": "left_knee"})
     assert r.status_code == 200
     body = r.json()
-    assert body["offset"] == pytest.approx(0.15)
-    assert body["previousPosition"] == pytest.approx(0.02)
+    assert body["offset"] == pytest.approx(0.17)
+    assert body["previousPosition"] == 0.0
     assert body["newPosition"] == pytest.approx(0.17)
+
+
+def test_a_mirrored_joint_saves_its_raw_reading_as_the_offset(client, hwi):
+    """joints_signs flips reads and writes at the HWI boundary, but the offset lives in
+    raw servo space (the HWI adds it AFTER the sign). A mirrored joint posed straight
+    reads -raw; saving that would hold it at the mirror of where the hands are."""
+    hwi.joints_signs["left_knee"] = -1
+    hwi.readings["left_knee"] = 0.2  # the raw servo angle at straight
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    r = client.post("/api/calibration/confirm-position", json={"jointName": "left_knee"})
+    assert r.status_code == 200
+    assert r.json()["newPosition"] == pytest.approx(-0.2)  # what the model sees
+    assert r.json()["offset"] == pytest.approx(0.2)  # what the servo needs
+
+    client.post(
+        "/api/calibration/apply-offset", json={"jointName": "left_knee", "offset": 0.2}
+    )
+    # held exactly where the hands are, not at their mirror
+    assert hwi.raw_goals[-1]["left_knee"] == pytest.approx(0.2)
+
+
+def test_start_holds_the_placed_pose_and_never_commands_zero(client, hwi):
+    """The whole reason this flow changed.
+
+    Arming used to drive every joint to servo-zero. On a mis-seated horn servo-zero is
+    mechanically far from straight, so that drove exactly the joints calibration exists
+    for into their own shells. Every goal written here is the joint's own present
+    position: nothing moves.
+    """
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    commanded = []
+    hwi.set_position_all = lambda positions: commanded.append(dict(positions))
+
+    r = client.post("/api/calibration/start")
+    assert r.status_code == 200
+    assert r.json()["currentPositions"] == pytest.approx(hwi.readings)
+    assert commanded == [pytest.approx(hwi.readings)]
+
+
+def test_apply_holds_this_joint_straight_and_leaves_the_others_where_they_were(client, hwi):
+    """The other half of the promise. Applying an offset must not be a back door to the
+    drive this flow removed: the calibrated joint flips to straight, and the twelve the
+    operator has not reached yet stay exactly where the duck was placed."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+
+    commanded = []
+    hwi.set_position_all = lambda positions: commanded.append(dict(positions))
+    r = client.post(
+        "/api/calibration/apply-offset", json={"jointName": "left_knee", "offset": 0.15}
+    )
+    assert r.status_code == 200
+
+    held = commanded[-1]
+    assert held["left_knee"] == 0.0  # goal 0 + offset 0.15 = the posed position
+    assert held["right_knee"] == pytest.approx(-0.9)
+    assert held["head_yaw"] == pytest.approx(0.2)
+
+
+def test_start_writes_every_goal_before_powering_and_never_ramps(client, hwi):
+    """turn_on() would have ramped every joint through kp 2 for a second — a loaded
+    knee sags under the body and is hauled back when the real kp lands — and driven
+    to hwi.init_pos on the way. Gains are written directly at the hold stiffness the
+    operator's own script was proven with, the goals land, and only then does each
+    joint get its explicit enable."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    stance = dict(hwi.init_pos)
+    order = []
+    hwi.set_position_all = lambda positions: order.append("goal")
+    hwi.set_joint_torque = lambda joint_name, enabled: order.append(
+        f"torque:{joint_name}:{enabled}"
+    )
+
+    r = client.post("/api/calibration/start")
+    assert r.status_code == 200
+    assert r.json()["mode"] == "hold"
+    assert order == ["goal"] + [f"torque:{j}:True" for j in JOINTS]
+    assert hwi.turned_on is False
+    assert hwi.kps == [tnkr_server.CALIBRATION_HOLD_KP] * len(JOINTS)
+    assert hwi.kds == [0] * len(JOINTS)
+    assert hwi.init_pos == stance  # the walking stance is not the session's to edit
 
 
 def test_begin_joint_reads_only_the_joint_it_is_releasing(client, hwi):
@@ -149,7 +276,33 @@ def test_begin_joint_resets_this_joints_offset_so_redos_do_not_compound(client, 
     hwi.readings["left_knee"] = 0.02
     client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
     assert hwi.joints_offsets["left_knee"] == 0
-    assert tnkr_server.calibration_baselines["left_knee"] == pytest.approx(0.02)
+    assert tnkr_server.calibration_baselines["left_knee"] == 0.0
+    # and its hold entry is re-read in the new (offset 0) space: the raw position
+    assert tnkr_server.calibration_hold["left_knee"] == pytest.approx(0.02)
+
+
+def test_redoing_a_calibrated_joint_holds_it_where_it_is(client, hwi):
+    """Found by review before it reached a robot. After apply-offset a joint's hold
+    entry is 0 in a space where its offset carries the whole correction. begin-joint
+    zeroes that offset for the redo, and re-asserting the entry as it stood would
+    write raw 0 — servo-zero, the mis-seated horn's shell — to a powered joint at full
+    stiffness. The entry has to be re-read in the new space first."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    hwi.readings["left_knee"] = 0.5  # posed straight: the horn is 0.5 rad off
+    m = client.post("/api/calibration/confirm-position", json={"jointName": "left_knee"}).json()
+    client.post(
+        "/api/calibration/apply-offset", json={"jointName": "left_knee", "offset": m["offset"]}
+    )
+    assert hwi.raw_goals[-1]["left_knee"] == pytest.approx(0.5)  # held straight
+
+    r = client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    assert r.status_code == 200
+    goals = hwi.raw_goals[-1]
+    assert goals["left_knee"] == pytest.approx(0.5)  # not 0.0
+    assert goals["right_knee"] == pytest.approx(-0.9)
+    assert goals["head_yaw"] == pytest.approx(0.2)
 
 
 def test_confirm_without_begin_is_a_state_error_not_a_wrong_number(client, hwi):
@@ -286,14 +439,18 @@ def _event(captured, name):
     return hits[-1]["properties"]
 
 
-def test_start_reports_the_droop_across_the_whole_robot(client, hwi, captured):
-    hwi.readings = {"left_knee": 0.02, "right_knee": -0.03, "head_yaw": 0.0}
+def test_start_reports_the_pose_the_duck_was_placed_in(client, hwi, captured):
+    """Was droop-at-zero, which no longer exists: nothing is commanded to zero, so
+    there is no sag against a commanded zero to measure. What arming can report now is
+    the pose operators actually leave the duck in, which is what says whether the
+    on-screen straight reference matches the robot in front of them."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.03, "head_yaw": 0.0}
     client.post("/api/calibration/start")
     props = _event(captured, "joint_calibration_started")
     assert props["joint_count"] == 3
-    assert props["baselines_rad"]["right_knee"] == pytest.approx(-0.03)
-    # the outlier is what makes an outlier joint recognisable fleet-wide
-    assert props["max_abs_droop_rad"] == pytest.approx(0.03)
+    assert props["placed_pose_rad"]["right_knee"] == pytest.approx(-0.03)
+    # the joint furthest from straight: how much hand-posing this session will cost
+    assert props["max_abs_placed_rad"] == pytest.approx(1.3)
 
 
 def test_measuring_reports_the_offset_and_its_seam_headroom(client, hwi, captured):
@@ -533,3 +690,317 @@ def test_finish_on_a_session_that_never_opened_is_a_no_op(client, monkeypatch):
     r = client.post("/api/calibration/finish")
     assert r.status_code == 200
     assert r.json() == {"success": True, "repowered": [], "failed": []}
+
+
+def test_finish_re_powers_each_joint_where_it_is_and_frees_the_bus(client, hwi):
+    """A released joint's goal register still says where it was before the operator's
+    hands took it, so enabling torque against it is a drive. The goal is rewritten to
+    the present position first. Then the singleton is dropped bus-only: it is carrying
+    the session's zeroed offsets, and the next route to reuse it (head puppet turns
+    the robot on through it) would command its stance through them."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})
+    hwi.readings["left_knee"] = 0.9  # let go of, and sagged
+
+    order = []
+    hwi.set_position_all = lambda positions: order.append(("goal", dict(positions)))
+    hwi.set_joint_torque = lambda joint_name, enabled: order.append(
+        ("torque", joint_name, enabled)
+    )
+    r = client.post("/api/calibration/finish")
+    assert r.status_code == 200
+    assert order[0] == ("goal", {"left_knee": pytest.approx(0.9)})
+    assert order[1] == ("torque", "left_knee", True)
+    assert tnkr_server.hwi_instance is None  # bus freed...
+    assert hwi.turned_off is False  # ...torque kept
+    assert tnkr_server.calibration_hold == {}
+
+
+def test_save_clears_the_hold_so_a_later_release_cannot_replay_it(client, hwi):
+    """After a save the next HWI loads the saved offsets, and the placed pose was
+    recorded against zeros: re-asserting it would move every skipped joint by its
+    on-disk offset. The accepted offsets stay, because a failed save retries on them."""
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/accept", json={"jointName": "left_knee", "offset": 0.15})
+    r = client.post("/api/calibration/save")
+    assert r.status_code == 200
+    assert tnkr_server.calibration_hold == {}
+    assert tnkr_server.calibration_baselines == {}
+    assert tnkr_server.calibration_offsets == {"left_knee": pytest.approx(0.15)}
+
+
+def test_wiggle_rocks_the_joint_about_its_held_pose_and_puts_it_back(client, hwi, monkeypatch):
+    """The identity check: which physical joint answers to this name? A few degrees
+    either side of where the joint is held, then back, and nothing else moves."""
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+
+    r = client.post("/api/calibration/wiggle", json={"jointName": "right_knee"})
+    assert r.status_code == 200
+    assert r.json()["jointName"] == "right_knee"
+    assert all(j == "right_knee" for j, _ in hwi.single_writes)
+    goals = [g for _, g in hwi.single_writes]
+    assert max(goals) == pytest.approx(-0.9 + tnkr_server.CALIBRATION_WIGGLE_RAD)
+    assert min(goals) == pytest.approx(-0.9 - tnkr_server.CALIBRATION_WIGGLE_RAD)
+    assert goals[-1] == pytest.approx(-0.9)  # back where it was held
+
+
+def test_wiggle_needs_a_held_pose_and_a_powered_joint(client, hwi, monkeypatch):
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    r = client.post("/api/calibration/wiggle", json={"jointName": "right_knee"})
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "INVALID_STATE"
+
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/begin-joint", json={"jointName": "right_knee"})
+    # a released joint is limp: a goal write would re-power it under a hand
+    r = client.post("/api/calibration/wiggle", json={"jointName": "right_knee"})
+    assert r.status_code == 409
+    assert hwi.single_writes == []
+
+
+def test_swap_legs_writes_the_config_and_ends_the_hold_for_a_re_arm(client, hwi, tmp_path):
+    """The held pose was read per NAME under the old naming, so it cannot be patched:
+    the session ends, the bus is freed (torque kept), and the screen arms again."""
+    import json
+
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    r = client.post("/api/calibration/swap-legs", json={"swapped": True})
+    assert r.status_code == 200
+    assert r.json()["legsSwapped"] is True
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["servo_ids"] == {"left_knee": 13, "right_knee": 23}
+    assert tnkr_server.hwi_instance is None
+    assert hwi.turned_off is False
+    assert tnkr_server.calibration_hold == {}
+
+
+def test_start_reports_which_pairs_are_swapped(client, hwi):
+    """Derived from the ids the HWI drives, never from a flag: a pair is swapped when
+    each side drives the id the table gives the other side."""
+    body = client.post("/api/calibration/start").json()
+    assert body["swappedPairs"] == [] and body["legsSwapped"] is False
+    assert body["servoIds"] == {"left_knee": 23, "right_knee": 13, "head_yaw": 32}
+    hwi.joints["left_knee"], hwi.joints["right_knee"] = 13, 23
+    body = client.post("/api/calibration/start").json()
+    assert body["swappedPairs"] == ["knee"]
+    # every pair this HWI has is crossed: the whole-leg answer
+    assert body["legsSwapped"] is True
+    # a leg whose ids are shuffled some other way is not a swapped pair
+    hwi.joints["left_knee"], hwi.joints["right_knee"] = 32, 23
+    body = client.post("/api/calibration/start").json()
+    assert body["swappedPairs"] == [] and body["legsSwapped"] is False
+
+def test_swap_pair_swaps_one_pair_and_holds_again_without_losing_the_session(
+    client, hwi, tmp_path, monkeypatch
+):
+    """Found on a real build: releasing left_hip_yaw went limp on the RIGHT hip while
+    the knees answered to their names. The pair's ids swap on the duck, the other
+    joints' accepted offsets survive, the pair's own are dropped, and every joint is
+    held where it is — the limp one re-powered in place."""
+    import json
+
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    hwi.readings = {"left_knee": 1.3, "right_knee": -0.9, "head_yaw": 0.2}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/accept", json={"jointName": "head_yaw", "offset": 0.11})
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})  # limp now
+
+    # the HWI the agent rebuilds after dropping the old one reads the saved ids, as
+    # the real one does from duck_config.json
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: _rebuilt(tmp_path, hwi))
+
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "left_knee"})
+    assert r.status_code == 200, r.text
+    rebuilt = _BUILT[-1]
+    assert r.json()["swappedPairs"] == ["knee"]
+    assert r.json()["servoIds"] == {"left_knee": 13, "right_knee": 23, "head_yaw": 32}
+    # the knees are the only pair this HWI has, so crossing them is the whole leg
+    assert r.json()["legsSwapped"] is True
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["servo_ids"] == {"left_knee": 13, "right_knee": 23}
+    assert saved["swapped_pairs"] == [] and saved["legs_swapped"] is False
+
+    # the other joint's accepted offset survives, in the session and on the new HWI;
+    # the pair's session state is gone
+    assert tnkr_server.calibration_offsets == {"head_yaw": pytest.approx(0.11)}
+    assert rebuilt.joints_offsets["head_yaw"] == pytest.approx(0.11)
+    assert "left_knee" not in tnkr_server.calibration_baselines
+    # held again where every joint is, the limp one included, torque on
+    assert rebuilt.raw_goals[-1]["left_knee"] == pytest.approx(1.3)
+    assert ("left_knee", True) in rebuilt.torque_calls
+    assert tnkr_server.calibration_hold["head_yaw"] == pytest.approx(0.2 - 0.11)
+
+    # a second swap of the same pair puts it back
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "right_knee"})
+    assert r.json()["swappedPairs"] == []
+
+
+def test_swap_pair_refuses_a_joint_without_a_twin_and_needs_a_held_pose(client, hwi):
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "left_knee"})
+    assert r.status_code == 409
+    client.post("/api/calibration/start")
+    r = client.post("/api/calibration/swap-pair", json={"jointName": "head_yaw"})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "UNKNOWN_JOINT"
+
+
+def test_health_advertises_the_hold_so_studio_can_refuse_an_older_agent(client):
+    """Studio checks this at connect and refuses to arm without it. It cannot wait for
+    /start's reply: an older agent has driven every joint to servo-zero by then."""
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["calibrationMode"] == "hold"
+
+
+_BUILT: list = []
+
+
+def _rebuilt(tmp_path, old):
+    """What get_hwi hands back after a swap: a fresh HWI on the saved ids, reading the
+    same bus positions as the one that was dropped. Kept in _BUILT for the assertions."""
+    import json
+
+    path = tmp_path / "duck_config.json"
+    saved = json.loads(path.read_text()) if path.exists() else {}
+    h = FakeHWI()
+    h.readings = dict(old.readings)
+    h.joints.update(saved.get("servo_ids", {}))
+    _BUILT.append(h)
+    return h
+
+
+def test_swap_ids_swaps_any_two_joints_and_keeps_the_session(
+    client, hwi, tmp_path, monkeypatch
+):
+    """A real build had one leg's hip yaw and hip roll ids programmed onto each other's
+    servos: releasing "hip yaw" went limp at the roll, and the leg check (a knee wiggle)
+    said nothing. No left/right swap can say that; naming the joint that went limp can."""
+    import json
+
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    hwi.readings = {"left_knee": 0.4, "right_knee": -0.2, "head_yaw": 0.1}
+    client.post("/api/calibration/start")
+    client.post("/api/calibration/accept", json={"jointName": "right_knee", "offset": 0.05})
+    client.post("/api/calibration/begin-joint", json={"jointName": "left_knee"})  # limp now
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: _rebuilt(tmp_path, hwi))
+
+    r = client.post(
+        "/api/calibration/swap-ids", json={"jointName": "left_knee", "otherJointName": "head_yaw"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 32, "right_knee": 13, "head_yaw": 23}
+    assert r.json()["swappedPairs"] == []
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["servo_ids"] == {"left_knee": 32, "head_yaw": 23}
+    # both start over; the third joint keeps its accepted offset, on the new HWI too
+    assert tnkr_server.calibration_offsets == {"right_knee": pytest.approx(0.05)}
+    assert "left_knee" not in tnkr_server.calibration_baselines
+    rebuilt = _BUILT[-1]
+    assert rebuilt.joints["left_knee"] == 32
+    assert rebuilt.joints_offsets["right_knee"] == pytest.approx(0.05)
+    # held again where every joint is, the limp one re-powered in place
+    assert rebuilt.raw_goals[-1]["left_knee"] == pytest.approx(0.4)
+    assert ("left_knee", True) in rebuilt.torque_calls
+
+    # the same two again puts them back, and the file no longer lists them
+    r = client.post(
+        "/api/calibration/swap-ids", json={"jointName": "head_yaw", "otherJointName": "left_knee"}
+    )
+    assert r.json()["servoIds"] == {"left_knee": 23, "right_knee": 13, "head_yaw": 32}
+    assert json.loads((tmp_path / "duck_config.json").read_text())["servo_ids"] == {}
+
+
+def test_swap_ids_refuses_itself_an_unknown_joint_and_no_held_pose(client, hwi):
+    body = {"jointName": "left_knee", "otherJointName": "head_yaw"}
+    assert client.post("/api/calibration/swap-ids", json=body).status_code == 409
+    client.post("/api/calibration/start")
+    body["otherJointName"] = "left_knee"
+    assert client.post("/api/calibration/swap-ids", json=body).status_code == 400
+    body["otherJointName"] = "nope"
+    assert client.post("/api/calibration/swap-ids", json=body).status_code == 400
+
+
+def test_identify_watches_the_bus_for_the_servo_that_moved(client, hwi, tmp_path, monkeypatch):
+    """The operator moves one named joint by hand; whichever servo travelled IS that
+    joint. The watch is fed here as the sampler thread feeds it, sample by sample."""
+    import json
+
+    monkeypatch.setattr(tnkr_server, "_identify_sampler", lambda watch: None)
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    r = client.post("/api/identify/start")
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 23, "right_knee": 13, "head_yaw": 32}
+    # every joint let go, in place
+    assert {j for j, on in hwi.torque_calls if on is False} == set(JOINTS)
+
+    r = client.post("/api/identify/watch", json={"jointName": "right_knee"})
+    assert r.status_code == 200 and r.json()["watching"] is True
+    w = tnkr_server.identify_watch
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 0.0)
+    assert client.get("/api/identify/status").json()["done"] is False
+    # the servo the duck calls left_knee is the one that travels
+    w.feed({"left_knee": 0.3, "right_knee": 0.0, "head_yaw": 0.01}, w.started_at + 0.2)
+    w.feed({"left_knee": 0.3, "right_knee": 0.0, "head_yaw": 0.01}, w.started_at + 0.5)
+    assert client.get("/api/identify/status").json()["done"] is False  # not still long enough
+    w.feed({"left_knee": 0.3, "right_knee": 0.0, "head_yaw": 0.01}, w.started_at + 1.2)
+    status = client.get("/api/identify/status").json()
+    assert status["done"] is True and status["timedOut"] is False
+    assert status["moved"] == {"servoId": 23, "name": "left_knee", "range": pytest.approx(0.3)}
+    assert status["runnerUp"] is None
+
+    # the answer: right_knee is servo 23; the joint that had 23 takes right_knee's 13
+    r = client.post("/api/identify/assign", json={"jointName": "right_knee", "servoId": 23})
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 13, "right_knee": 23, "head_yaw": 32}
+
+    # finish: written, rebuilt on it, every joint powered back on where it is
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: _rebuilt(tmp_path, hwi))
+    r = client.post("/api/identify/finish", json={"save": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["servoIds"] == {"left_knee": 13, "right_knee": 23, "head_yaw": 32}
+    assert r.json()["changed"] == ["left_knee", "right_knee"]
+    saved = json.loads((tmp_path / "duck_config.json").read_text())
+    assert saved["servo_ids"] == {"left_knee": 13, "right_knee": 23}
+    rebuilt = _BUILT[-1]
+    assert rebuilt.joints["right_knee"] == 23
+    assert ("right_knee", True) in rebuilt.torque_calls
+    assert tnkr_server.identify_open is False
+
+
+def test_identify_reports_a_second_mover_a_timeout_and_refuses_out_of_session(
+    client, hwi, monkeypatch
+):
+    monkeypatch.setattr(tnkr_server, "_identify_sampler", lambda watch: None)
+    assert client.post("/api/identify/watch", json={"jointName": "right_knee"}).status_code == 409
+    client.post("/api/identify/start")
+    client.post("/api/identify/watch", json={"jointName": "right_knee"})
+    w = tnkr_server.identify_watch
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 0.0)
+    w.feed({"left_knee": 0.2, "right_knee": 0.4, "head_yaw": 0.0}, w.started_at + 0.3)
+    w.feed({"left_knee": 0.2, "right_knee": 0.4, "head_yaw": 0.0}, w.started_at + 0.4)
+    w.feed({"left_knee": 0.2, "right_knee": 0.4, "head_yaw": 0.0}, w.started_at + 1.5)
+    status = client.get("/api/identify/status").json()
+    assert status["moved"]["name"] == "right_knee"
+    assert status["runnerUp"]["name"] == "left_knee"
+
+    # nothing moved for the whole watch: done, and said so
+    client.post("/api/identify/watch", json={"jointName": "head_yaw"})
+    w = tnkr_server.identify_watch
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 0.0)
+    w.feed({"left_knee": 0.0, "right_knee": 0.0, "head_yaw": 0.0}, w.started_at + 30.0)
+    status = client.get("/api/identify/status").json()
+    assert status["done"] is True and status["timedOut"] is True and status["moved"] is None
+
+    # a servo id the duck does not have
+    r = client.post("/api/identify/assign", json={"jointName": "head_yaw", "servoId": 99})
+    assert r.status_code == 400
+    # finish without saving: powered back on, nothing written
+    monkeypatch.setattr(tnkr_server.time, "sleep", lambda s: None)
+    r = client.post("/api/identify/finish", json={"save": False})
+    assert r.status_code == 200 and r.json()["changed"] == []
+    assert ("head_yaw", True) in hwi.torque_calls

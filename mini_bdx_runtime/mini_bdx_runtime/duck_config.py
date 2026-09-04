@@ -4,6 +4,26 @@ import os
 
 HOME_DIR = os.path.expanduser("~")
 
+# the left/right pairs of the legs, by the part of the name after the side
+LEG_PAIRS = ("hip_yaw", "hip_roll", "hip_pitch", "knee", "ankle")
+
+JOINT_NAMES = [
+    "left_hip_yaw",
+    "left_hip_roll",
+    "left_hip_pitch",
+    "left_knee",
+    "left_ankle",
+    "neck_pitch",
+    "head_pitch",
+    "head_yaw",
+    "head_roll",
+    "right_hip_yaw",
+    "right_hip_roll",
+    "right_hip_pitch",
+    "right_knee",
+    "right_ankle",
+]
+
 
 class DuckConfig:
 
@@ -81,3 +101,44 @@ class DuckConfig:
                 "right_ankle": 0.0,
             },
         )
+
+        # Per-joint direction, +1 or -1 (see rustypot_position_hwi.joints_signs).
+        # Only the inverted joints need listing; every other joint is +1. A value
+        # that is not exactly -1 is treated as +1 rather than silently scaling a
+        # joint by whatever a hand edit left there.
+        signs = self.json_config.get("joints_signs", {}) or {}
+        self.joints_signs = {
+            name: -1 if _is_minus_one(signs.get(name)) else 1 for name in JOINT_NAMES
+        }
+
+        # Left/right pairs whose servo ids this build programmed the other way round:
+        # "swapped_pairs": ["hip_yaw", ...]. The HWI swaps those ids by name, so each
+        # left_* name drives the physical left joint. Found during the joint
+        # calibration, where a released joint going loose on the wrong side names the
+        # pair. "legs_swapped": true is the older whole-leg form and means all five.
+        pairs = self.json_config.get("swapped_pairs")
+        if not pairs and self.json_config.get("legs_swapped"):
+            pairs = list(LEG_PAIRS)
+        self.swapped_pairs = sorted({str(p) for p in (pairs or []) if str(p) in LEG_PAIRS})
+        self.legs_swapped = set(self.swapped_pairs) == set(LEG_PAIRS)
+
+        # "servo_ids": {"left_hip_yaw": 21, ...}: the joints whose servo id differs from
+        # the HWI's table, by name. Written by the calibration when a released joint
+        # went loose somewhere else: a real build had one leg's hip yaw and hip roll
+        # ids programmed onto each other's servos, which no left/right swap can say.
+        # Applied after swapped_pairs, and wins over it.
+        raw_ids = self.json_config.get("servo_ids") or {}
+        self.servo_ids = {}
+        for name, servo_id in (raw_ids.items() if isinstance(raw_ids, dict) else []):
+            try:
+                if str(name) in JOINT_NAMES:
+                    self.servo_ids[str(name)] = int(servo_id)
+            except (TypeError, ValueError):
+                continue
+
+
+def _is_minus_one(value) -> bool:
+    try:
+        return int(value) == -1
+    except (TypeError, ValueError):
+        return False

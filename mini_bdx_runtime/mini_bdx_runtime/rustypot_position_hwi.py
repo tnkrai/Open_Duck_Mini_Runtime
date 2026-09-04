@@ -78,6 +78,29 @@ def _with_bus_lock(fn):
     return wrapped
 
 
+# Which servo id each joint name drives on a duck built to the guide. A build can
+# differ (see duck_config: swapped_pairs and servo_ids); the walk, the gains and the
+# policy index by the ORDER of this table, never by the ids.
+DEFAULT_SERVO_IDS = {
+    "left_hip_yaw": 20,
+    "left_hip_roll": 21,
+    "left_hip_pitch": 22,
+    "left_knee": 23,
+    "left_ankle": 24,
+    "neck_pitch": 30,
+    "head_pitch": 31,
+    "head_yaw": 32,
+    "head_roll": 33,
+    # "left_antenna": None,
+    # "right_antenna": None,
+    "right_hip_yaw": 10,
+    "right_hip_roll": 11,
+    "right_hip_pitch": 12,
+    "right_knee": 13,
+    "right_ankle": 14,
+}
+
+
 class HWI:
     def __init__(self, duck_config: DuckConfig, usb_port: str | None = None):
 
@@ -102,6 +125,26 @@ class HWI:
             "right_knee": 13,
             "right_ankle": 14,
         }
+
+        # Left and right by NAME, whichever ids the build gave the servos. A build that
+        # programmed a pair's ids the other way round (a real one had the hip yaws
+        # crossed and nothing else) would otherwise have that left_* name drive the
+        # physical right joint: the walk still walks (the gait is mirror-symmetric)
+        # but the joint turns the wrong way, and no per-joint sign can undo a crossed
+        # pair. The ids are swapped IN PLACE so the dict order stays as declared: the
+        # policy's vectors and the gain arrays index by it.
+        for pair in getattr(self.duck_config, "swapped_pairs", []) or []:
+            left, right = f"left_{pair}", f"right_{pair}"
+            if left in self.joints and right in self.joints:
+                self.joints[left], self.joints[right] = self.joints[right], self.joints[left]
+
+        # Any joint by NAME, whichever id the build gave its servo: "servo_ids" lists the
+        # joints that differ from the table (a real build had one leg's hip yaw and hip
+        # roll ids on each other's servos, on top of the whole leg swapped). Set in
+        # place, after the pairs, and wins over them.
+        for name, servo_id in (getattr(self.duck_config, "servo_ids", {}) or {}).items():
+            if name in self.joints:
+                self.joints[name] = int(servo_id)
 
         self.zero_pos = {
             "left_hip_yaw": 0,
@@ -142,6 +185,22 @@ class HWI:
         }
 
         self.joints_offsets = self.duck_config.joints_offset
+
+        # Per-joint direction, +1 or -1, from duck_config.json "joints_signs". A servo
+        # mounted mirrored to the model turns the wrong way for every command and
+        # reports the wrong way for every read, and a walk on it stalls that joint
+        # into its shell. The sign is applied at this boundary and nowhere else, so
+        # the policy, the calibration routes and the walk loop all work in model
+        # space:
+        #
+        #     raw = sign * position + offset        position = sign * (raw - offset)
+        #
+        # The offset stays in raw servo space, which is why it is measured at the
+        # straight pose (raw = sign * 0 + offset) and survives a later sign flip.
+        self.joints_signs = {
+            name: int(getattr(self.duck_config, "joints_signs", {}).get(name, 1))
+            for name in self.joints
+        }
 
         self.kps = np.ones(len(self.joints)) * 32  # default kp
         self.kds = np.ones(len(self.joints)) * 0  # default kd
@@ -276,7 +335,7 @@ class HWI:
         pos is in radians
         """
         id = self.joints[joint_name]
-        pos = pos + self.joints_offsets[joint_name]
+        pos = self.joints_signs.get(joint_name, 1) * pos + self.joints_offsets[joint_name]
         self._io_retry(
             lambda: self.io.write_goal_position([id], [pos]),
             joint_name,
@@ -292,7 +351,7 @@ class HWI:
         # Per-servo: cdc_acm can't do a bulk sync transaction (see _write_kps).
         for joint, position in joints_positions.items():
             id = self.joints[joint]
-            target = position + self.joints_offsets[joint]
+            target = self.joints_signs.get(joint, 1) * position + self.joints_offsets[joint]
             self._io_retry(
                 lambda i=id, p=target: self.io.write_goal_position([i], [p]),
                 joint,
@@ -320,7 +379,7 @@ class HWI:
             return None
 
         present_positions = [
-            pos - self.joints_offsets[joint]
+            self.joints_signs.get(joint, 1) * (pos - self.joints_offsets[joint])
             for joint, pos in zip(self.joints.keys(), present_positions)
             if joint not in ignore
         ]
@@ -338,10 +397,10 @@ class HWI:
         and lets `_io_retry`'s OSError through — that message names the joint and its
         id. Callers turn it into a message about that joint.
 
-        Offset-corrected like the plural version, so the two cannot disagree about what
-        "position" means. `.get(..., 0.0)` rather than `[...]` because a hand-edited
-        duck_config.json can carry a partial joints_offsets dict, and a KeyError here
-        would read as a dead servo.
+        Offset- and sign-corrected like the plural version, so the two cannot disagree
+        about what "position" means. `.get(..., 0.0)` rather than `[...]` because a
+        hand-edited duck_config.json can carry a partial joints_offsets dict, and a
+        KeyError here would read as a dead servo.
         """
         joint_id = self.joints[joint_name]
         raw = self._io_retry(
@@ -349,7 +408,8 @@ class HWI:
             joint_name,
             "read_present_position",
         )
-        return round(float(raw) - self.joints_offsets.get(joint_name, 0.0), 3)
+        sign = self.joints_signs.get(joint_name, 1)
+        return round(sign * (float(raw) - self.joints_offsets.get(joint_name, 0.0)), 3)
 
     @_with_bus_lock
     def set_joint_torque(self, joint_name, enabled):
@@ -390,7 +450,7 @@ class HWI:
             return None
 
         present_velocities = [
-            vel
+            self.joints_signs.get(joint, 1) * vel
             for joint, vel in zip(self.joints.keys(), present_velocities)
             if joint not in ignore
         ]

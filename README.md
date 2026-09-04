@@ -180,6 +180,25 @@ Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_M
 - left and right triggers to control the left and right antennas
 - LB (new!) press and hold to increase the walking frequency, kind of a sprint mode 🙂
 ```
+## Setting up from Tnkr Studio
+
+Tnkr Studio runs the whole setup against the robot server (`scripts/tnkr_server.py`)
+and writes the results into `duck_config.json`, so `find_soft_offsets.py` above is no
+longer the only way to the offsets:
+
+1. **Which servo is which.** The duck goes loose, you move one joint at a time on the
+   real duck, and the server watches the bus for the servo that moved. A build that
+   programmed ids onto the wrong servos is corrected in `servo_ids`.
+2. **Joint zeros.** The duck holds the pose it was placed in; one joint at a time is
+   freed, posed straight by hand, and its zero read. Written to `joints_offsets`.
+3. **Joint directions.** Each left/right pair moves a little, you say whether it
+   moved like the model, and the check ends in the walking crouch so you confirm the
+   pose the walk starts from. Written to `joints_signs`.
+
+The walk reads the same file through the same servo interface, so what the steps
+write is what `v2_rl_walk_mujoco.py` uses. The routes, keys and the rules they follow
+are in [`CALIBRATION.md`](CALIBRATION.md).
+
 ## Telemetry
 
 The robot sends anonymous usage data so we can find and fix the setup steps and

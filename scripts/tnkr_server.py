@@ -1647,7 +1647,7 @@ DIRECTION_PAIRS = [
         "leftTarget": 0.5,
         "right": "right_knee",
         "rightTarget": 0.5,
-        "expect": "Both feet swing forward and the knees poke backward, like a bird's.",
+        "expect": "Both feet swing forward and the knees poke backward.",
     },
     {
         "id": "ankle",

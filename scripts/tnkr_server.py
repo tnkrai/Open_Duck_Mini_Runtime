@@ -20,7 +20,7 @@ import time
 import traceback
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -116,6 +116,92 @@ JOINTS = {
 hwi_instance: HWI | None = None
 
 
+def _finite(x) -> float:
+    """float(x), or 0.0 for NaN/inf — the only values pydantic's float lets through
+    that JSON and a running max cannot carry."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) else 0.0
+
+
+class CommandStats:
+    """What one walk's steering stream looked like, folded into a few numbers.
+
+    /api/commands itself is never captured: at 10-50 Hz it would spend the whole
+    rate cap on itself (it is in TELEMETRY_EXCLUDED_PATHS). But "did steering ever
+    reach this walk, when, and at what magnitude" is exactly the question when a
+    duck stands in its crouch and ignores the keyboard, so every write folds in
+    here and walk_ended carries the summary. Velocity magnitudes only, never the
+    stream: the max on each axis says whether a client sent values the policy was
+    trained on (vx 0.15, vy 0.2, wz 1.0 at full deflection).
+    """
+
+    def __init__(self):
+        self._lock = Lock()
+        self.received = 0
+        self.nonzero = 0
+        self.non_finite = 0  # writes carrying NaN/inf on any channel
+        self.first_at: float | None = None  # monotonic
+        self.first_nonzero_at: float | None = None
+        self.last_at: float | None = None
+        self.longest_gap_s = 0.0
+        self.max_abs = [0.0, 0.0, 0.0]
+        self.head_used = False
+
+    def record(self, commands: list[float], now: float) -> bool:
+        """Fold one write in. True the first time a nonzero command arrives.
+
+        NaN and inf pass pydantic's list[float] and JSON's parser both. They are
+        counted, then treated as zero: `inf` in a max would pin the column for the
+        rest of the walk, and a NaN in an event body is a batch PostHog rejects.
+        """
+        finite = [_finite(c) for c in commands[:7]]
+        vel = [abs(c) for c in finite[:3]]
+        head = any(c != 0.0 for c in finite[3:7])
+        moving = any(v > 0.0 for v in vel) or head
+        with self._lock:
+            self.received += 1
+            if any(not math.isfinite(float(c)) for c in commands[:7]):
+                self.non_finite += 1
+            if self.first_at is None:
+                self.first_at = now
+            if self.last_at is not None:
+                self.longest_gap_s = max(self.longest_gap_s, now - self.last_at)
+            self.last_at = now
+            for i, v in enumerate(vel):
+                if v > self.max_abs[i]:
+                    self.max_abs[i] = v
+            if head:
+                self.head_used = True
+            if not moving:
+                return False
+            self.nonzero += 1
+            if self.first_nonzero_at is not None:
+                return False
+            self.first_nonzero_at = now
+            return True
+
+    def properties(self, started_at: float) -> dict:
+        def since(t: float | None):
+            return None if t is None else round(t - started_at, 2)
+
+        with self._lock:
+            return {
+                "commands_received": self.received,
+                "commands_nonzero": self.nonzero,
+                "commands_non_finite": self.non_finite,
+                "first_command_after_s": since(self.first_at),
+                "first_nonzero_command_after_s": since(self.first_nonzero_at),
+                "longest_command_gap_s": round(self.longest_gap_s, 2),
+                "max_abs_vx": round(self.max_abs[0], 3),
+                "max_abs_vy": round(self.max_abs[1], 3),
+                "max_abs_wz": round(self.max_abs[2], 3),
+                "head_commands_used": self.head_used,
+            }
+
+
 @dataclass
 class WalkSession:
     """One walk-script launch. Each launch gets its own session object so a
@@ -127,6 +213,17 @@ class WalkSession:
     cloud_streaming: bool
     started_at: float
     stop_requested: bool = False
+    # Who steers, and how the walk was told to listen: "pad" reads the Pi's
+    # joystick; anything else launches with --remote and reads the command file.
+    walk_input: str = "keyboard"
+    remote: bool = True
+    # duck_config.json's start_paused as read at launch. True means the loop
+    # skips every tick until the pad's A button, which no keyboard can press.
+    # None when the config could not be read.
+    start_paused: bool | None = None
+    commands: CommandStats = field(default_factory=CommandStats)
+    # time.time() at launch: snapshot timestamps are wall clock, started_at is not
+    started_wall: float = field(default_factory=time.time)
 
 
 walk_session: WalkSession | None = None
@@ -2727,9 +2824,45 @@ def stop_walk_process():
     walk_telemetry.clear()
 
 
+# How often the monitor looks at the walk while it runs. Coarser than the
+# snapshot's 1 s freshness window so a live loop always reads as fresh.
+MONITOR_POLL_S = 0.5
+
+
 def _monitor_walk(session: WalkSession):
-    """Wait for one walk launch to exit and report how it ended."""
-    rc = session.proc.wait()
+    """Wait for one walk launch to exit and report how it ended.
+
+    Polls instead of blocking in wait(): each poll checks for the walk's own
+    telemetry snapshot, which the loop writes on every tick it actually runs the
+    policy. A process that is alive but never writes one is standing frozen in
+    the crouch (start_paused, or every observation read failing), and one that
+    stops writing mid-walk has stalled. Until now neither left a trace anywhere.
+    Polling the file is the only way to see it: the walk owns the bus, and the
+    plan's rule stands that telemetry never touches the 50 Hz loop itself.
+    """
+    first_tick_wall: float | None = None  # the first snapshot's own timestamp
+    silent_polls = 0  # alive, ticked before, but nothing written for over 1 s
+    while True:
+        try:
+            rc = session.proc.wait(timeout=MONITOR_POLL_S)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        # Every read here is of a file another process writes. A shape the reader
+        # does not expect must cost this poll, never the walk_ended row.
+        try:
+            snap = walk_telemetry.read_snapshot(max_age_s=math.inf)
+            ts = float(snap["timestamp"]) if snap else None
+        except Exception:
+            ts = None
+        if ts is None:
+            continue
+        if first_tick_wall is None:
+            first_tick_wall = ts
+        elif time.time() - ts > walk_telemetry.FRESH_S:
+            # The loop skips the write while paused (A button) and while every
+            # observation read fails, so this is "not ticking", whatever the cause.
+            silent_polls += 1
     # Any nonzero exit we didn't ask for is a crash — including -SIGKILL,
     # which is how the kernel OOM killer ends walks on a 512MB Pi. Exempting
     # signals wholesale would blind the crash-rate dashboard to OOM.
@@ -2742,8 +2875,32 @@ def _monitor_walk(session: WalkSession):
             "crashed": crashed,
             "stop_requested": session.stop_requested,
             "cloud_streaming": session.cloud_streaming,
+            "walk_input": session.walk_input,
+            "remote": session.remote,
+            "start_paused": session.start_paused,
+            # None: the loop never ran a tick (start_paused, or every observation
+            # read failing). A number: seconds from spawn to the first policy step
+            # (python + onnxruntime imports + turn_on's settle), from the snapshot's
+            # own timestamp so the poll interval does not blur it.
+            "first_tick_after_s": (
+                None
+                if first_tick_wall is None
+                else round(max(0.0, first_tick_wall - session.started_wall), 1)
+            ),
+            # Time alive, after the first tick, with no snapshot written for over
+            # 1 s: a stall, or the pad's A-button pause. Poll-granular (0.5 s).
+            "loop_silent_s": round(silent_polls * MONITOR_POLL_S, 1),
+            **session.commands.properties(session.started_at),
         },
     )
+
+
+def _start_paused_from_config() -> bool | None:
+    """duck_config.json's start_paused, or None if the file can't be read."""
+    try:
+        return bool(_read_config().get("start_paused", False))
+    except Exception:
+        return None
 
 
 class WalkStartRequest(BaseModel):
@@ -2799,6 +2956,10 @@ def _walk_start_locked(body: WalkStartRequest):
 
     venv_python = sys.executable
     is_pi = platform.machine() in ("aarch64", "armv7l")
+    # Who steers this walk. Omitted (old Studio / dashboard) means keyboard, and so
+    # does anything that is not "pad" (walk_flags treats it the same way) — the
+    # value lands in telemetry, so it is one of two strings, never a client's.
+    walk_input = "pad" if body.input == "pad" else "keyboard"
 
     if is_pi:
         # Find the ONNX model — look for any .onnx file in scripts/
@@ -2810,7 +2971,6 @@ def _walk_start_locked(body: WalkStartRequest):
             )
         onnx_path = str(onnx_files[0])
         walk_script = str(SCRIPTS_DIR / "v2_rl_walk_mujoco.py")
-        walk_input = body.input or "keyboard"
         # Which device is driving. Absent until now, which meant the one
         # question worth asking about the controller -- did anyone ever manage
         # to drive with it -- could not be answered from the data at all.
@@ -2881,6 +3041,9 @@ def _walk_start_locked(body: WalkStartRequest):
         session_token=body.sessionToken,
         cloud_streaming=cloud_streaming,
         started_at=time.monotonic(),
+        walk_input=walk_input,
+        remote="--remote" in walk_flags(walk_input),
+        start_paused=_start_paused_from_config(),
     )
     Thread(target=_monitor_walk, args=(walk_session,), daemon=True).start()
 
@@ -3309,6 +3472,32 @@ def send_commands(req: CommandRequest):
         with open(tmp_path, "w") as f:
             json.dump(data, f)
         os.replace(tmp_path, COMMAND_FILE)
+    # The stream is excluded from request telemetry (see TELEMETRY_EXCLUDED_PATHS);
+    # the walk's session keeps the summary instead. One event when steering first
+    # actually asks for movement, so "did the keyboard ever reach the loop" is a
+    # single row rather than an absence.
+    # A crashed walk leaves walk_session set until the next start or stop, and
+    # Studio keeps streaming at it; poll() keeps those writes out of a walk whose
+    # walk_ended has already gone out (non-blocking, no lock).
+    session = walk_session
+    if (
+        session is not None
+        and session.proc.poll() is None
+        and session.commands.record(req.commands, time.monotonic())
+    ):
+        c = [_finite(x) for x in req.commands[:3]] + [0.0] * max(0, 3 - len(req.commands))
+        telemetry.capture(
+            "walk_first_command",
+            {
+                "after_s": round(time.monotonic() - session.started_at, 2),
+                "vx": round(c[0], 3),
+                "vy": round(c[1], 3),
+                "wz": round(c[2], 3),
+                "head_used": any(_finite(x) != 0.0 for x in req.commands[3:7]),
+                "walk_input": session.walk_input,
+                "remote": session.remote,
+            },
+        )
     return {"success": True}
 
 

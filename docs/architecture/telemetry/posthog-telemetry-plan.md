@@ -132,9 +132,10 @@ distinct_id = device uuid. Base props everywhere: `source`, `runtime_version`, `
 | `api_request_completed` | middleware | `endpoint`, `method`, `status_code`, `duration_ms`, enrichments |
 | `api_request_failed` | middleware | + `error_type`, `error_message` (≤500 chars) |
 | `imu_calibration_{completed,failed,stopped}` | IMU worker | `duration_s`, error fields / `calibration_status` |
-| `walk_ended` | monitor thread | `duration_s`, `exit_code`, `crashed`, `stop_requested`, `cloud_streaming` |
+| `walk_ended` | monitor thread | `duration_s`, `exit_code`, `crashed`, `stop_requested`, `cloud_streaming`, `walk_input`, `remote`, `start_paused`, `first_tick_after_s`, `loop_silent_s`, `commands_received`, `commands_nonzero`, `commands_non_finite`, `first_command_after_s`, `first_nonzero_command_after_s`, `longest_command_gap_s`, `max_abs_vx/vy/wz`, `head_commands_used` |
+| `walk_first_command` | `/api/commands` | once per walk, on the first nonzero command: `after_s`, `vx`, `vy`, `wz`, `head_used`, `walk_input`, `remote` |
 
-Excluded entirely: `/api/commands` (50Hz), `/api/health`, `/api/imu/calibrate/status` (polling), OPTIONS. Never sent: joint data, sessionToken, supabase creds.
+Excluded entirely: `/api/commands` (50Hz), `/api/health`, `/api/imu/calibrate/status` (polling), OPTIONS. Never sent: joint data, sessionToken, supabase creds. `/api/commands` stays excluded as a request event; its writes fold into the session's `CommandStats`, which `walk_ended` carries as a summary (magnitude maxima and timing only, never the stream). The monitor thread polls the walk's `/dev/shm` snapshot every 0.5 s so a walk that is alive but never runs a policy tick (`start_paused`, or every observation read failing) reports `first_tick_after_s: null` instead of leaving no trace, and one that stops writing while alive accrues `loop_silent_s`. The pause file is deliberately not reported: the walk process does not read it (see the /api/walk/pause gap), so its state says nothing about the duck.
 
 ## Implementation order
 1. Branch reset onto v3 → 2. MCP: create project + key → 3. `telemetry.py` + `setup.cfg` → 4. chip exposure in `rustypot_position_hwi.py` → 5. `tnkr_server.py` → 6. `setup.sh` → 7. tests + CI workflow → 8. README → 9. MCP dashboard → 10. verify → PR to `v3`.

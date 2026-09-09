@@ -8,6 +8,7 @@ to production.
 """
 
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -63,9 +64,16 @@ def isolated_telemetry(tmp_path, monkeypatch):
     monkeypatch.setattr(telemetry, "_get_client", lambda: telemetry._client)
     telemetry._reset_state_for_tests()
     yield
-    # Never leak a walk subprocess (or its monitor thread) past a test.
+    # Never leak a walk subprocess (or its monitor thread) past a test. The join
+    # matters: the monitor emits walk_ended a few ms after the process exits, and
+    # without it that row landed in the NEXT test's capture list (an
+    # order-dependent failure in test_walk_commands whenever test_walk_monitor
+    # ran first).
     with tnkr_server._walk_lock:
         tnkr_server.stop_walk_process()
+    for t in threading.enumerate():
+        if t.name.startswith("walk-monitor-"):
+            t.join(timeout=3.0)
     telemetry._reset_state_for_tests()
 
 
@@ -102,11 +110,30 @@ def fake_walk_dir(tmp_path, monkeypatch):
     # non-Pi path spawns the mock fake_broadcaster, which needs cloud creds).
     monkeypatch.setattr(tnkr_server.platform, "machine", lambda: "aarch64")
     (tmp_path / "model.onnx").write_bytes(b"")
+    # The walk pre-flight asks the bus and the IMU before spawning. A healthy fake
+    # of each, so a test about the walk itself is not also a test of the hardware;
+    # tests about the pre-flight install their own faulty ones over these.
+    from fakes import FakeHWI, FakeStateImu
+
+    monkeypatch.setattr(tnkr_server, "get_hwi", lambda: FakeHWI())
+    monkeypatch.setattr(tnkr_server, "get_state_imu", lambda: FakeStateImu())
     return tmp_path
 
 
 def write_walk_script(d, body):
     (d / "v2_rl_walk_mujoco.py").write_text(body)
+
+
+def wait_for_walk_ended_where(captured, pred, timeout=10.0):
+    """The walk_ended whose properties satisfy `pred`. For tests that must pick
+    their own row rather than the first one."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for e in captured:
+            if e["event"] == "walk_ended" and pred(e["properties"]):
+                return e["properties"]
+        time.sleep(0.02)
+    raise AssertionError(f"no matching walk_ended within {timeout}s")
 
 
 def wait_for_walk_ended(captured, count=1, timeout=10.0):

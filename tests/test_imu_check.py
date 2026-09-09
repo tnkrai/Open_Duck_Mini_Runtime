@@ -5,7 +5,7 @@ waits on a sample."""
 
 import tnkr_server
 from conftest import write_walk_script
-from test_imu_calibrate import FakeStateImu
+from fakes import FakeStateImu
 
 
 def _failed(captured):

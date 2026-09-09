@@ -8,29 +8,14 @@ import tnkr_server
 from conftest import write_walk_script
 
 
-class FakeIO:
-    """Stub servo bus: joints 22 and 13 are unresponsive."""
-
-    DEAD = {22, 13}
-
-    def set_kps(self, ids, kps):
-        if set(ids) & self.DEAD:
-            raise OSError("timeout")
-
-    def read_present_position(self, ids):
-        if set(ids) & self.DEAD:
-            raise OSError("timeout")
-        return [0.0]
-
-    def disable_torque(self, ids):
-        pass
+from fakes import FakeHWI as _SharedFakeHWI
 
 
-class FakeHWI:
+class FakeHWI(_SharedFakeHWI):
+    """Three joints, two of them (22 and 13) unresponsive."""
+
     def __init__(self):
-        self.joints = {"left_hip_pitch": 22, "right_knee": 13, "head_yaw": 32}
-        self.low_torque_kps = [2]
-        self.io = FakeIO()
+        super().__init__({"left_hip_pitch": 22, "right_knee": 13, "head_yaw": 32}, dead={22, 13})
 
 
 def events_named(captured, name):

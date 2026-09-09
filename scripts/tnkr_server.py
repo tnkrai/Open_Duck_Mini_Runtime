@@ -2964,6 +2964,83 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
         return _walk_start_locked(body)
 
 
+# ── Walk pre-flight ──────────────────────────────────────────────────────────
+# Before the walk process spawns: does every servo answer, does the IMU answer.
+# The walk's own constructor used to be the first code that asked, from inside a
+# subprocess whose traceback went to the journal; a silent servo or an unplugged
+# IMU came back as `walk_ended {exit_code: 1}` and a duck rigid in its crouch.
+# Now the server asks first, with the handles it already holds, and refuses with
+# a coded error that names the part. Read-only by design: the duck may be
+# standing in its stance when Walk is pressed, so no gain, position or torque
+# write happens here. Runs BEFORE release_hwi/release_state_imu so it reuses the
+# server's handles (a second BNO055_I2C would soft-reset the chip). Guardrails
+# and the rest of the design: docs/plans/walk-preflight/_architecture.md.
+
+
+@dataclass
+class PreflightReport:
+    servos_responding: int
+    servos_total: int
+    silent_joints: list[str]
+    imu_present: bool
+    duration_ms: int
+
+
+def _preflight_servos(hwi) -> list[str]:
+    """Names of the joints that did not answer one position read.
+
+    One read per servo through HWI.get_present_position: public, bus-locked,
+    read-only, and its OSError already names the joint and id after the retry
+    wrapper gives up. Nothing here copies /api/motors/check's gain write or its
+    trailing disable_torque; both are wrong for a duck about to walk."""
+    silent: list[str] = []
+    for name in hwi.joints:
+        try:
+            hwi.get_present_position(name)
+        except Exception:
+            silent.append(name)
+    return silent
+
+
+def _walk_preflight() -> PreflightReport:
+    """Refuse a walk the hardware cannot run, before anything is released or spawned.
+
+    Servos first: a bus that will not open makes the IMU question moot, and the
+    operator's next move is different. Every refusal goes through _agent_error
+    with the dict detail Studio maps by code name; every path records
+    `preflight_ms` on the request's telemetry event."""
+    started = time.monotonic()
+    try:
+        try:
+            hwi = get_hwi()
+        except Exception as exc:
+            add_telemetry_props(error_code="SERVO_BUS_UNAVAILABLE")
+            _agent_error(503, "SERVO_BUS_UNAVAILABLE", str(exc))
+        with BUS_LOCK:
+            silent = _preflight_servos(hwi)
+        total = len(hwi.joints)
+        if silent:
+            add_telemetry_props(
+                error_code="MOTORS_SILENT", joint_name=silent[0], silent_joints=silent
+            )
+            _agent_error(
+                502,
+                "MOTORS_SILENT",
+                f"{len(silent)} of {total} servos did not answer: {', '.join(silent)}",
+                joint=silent[0],
+            )
+        _probe_imu()  # 502 IMU_NOT_FOUND, with its own telemetry props
+        return PreflightReport(
+            servos_responding=total,
+            servos_total=total,
+            silent_joints=[],
+            imu_present=True,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+    finally:
+        add_telemetry_props(preflight_ms=int((time.monotonic() - started) * 1000))
+
+
 def _walk_start_locked(body: WalkStartRequest):
     global walk_session
 
@@ -2983,6 +3060,18 @@ def _walk_start_locked(body: WalkStartRequest):
             add_telemetry_props(already_running=True)
             return {"success": True, "message": "Walk is already running"}
         stop_walk_process()
+
+    # Pre-flight, on the real-walk path only, and before either handle is released
+    # (see _walk_preflight). TNKR_SKIP_PREFLIGHT=1 is the one deliberate override,
+    # for a duck in the field that is being refused wrongly; nothing else skips it.
+    if platform.machine() in ("aarch64", "armv7l"):
+        if os.environ.get("TNKR_SKIP_PREFLIGHT") == "1":
+            print("[walk_start] pre-flight skipped: TNKR_SKIP_PREFLIGHT=1")
+        else:
+            report = _walk_preflight()
+            add_telemetry_props(
+                servos_responding=report.servos_responding, imu_present=report.imu_present
+            )
 
     # Release HWI + BNO055 so the walk script owns both buses (serial + I2C);
     # /api/state serves the walk's telemetry snapshot while it runs.
@@ -3089,7 +3178,12 @@ def _walk_start_locked(body: WalkStartRequest):
         remote="--remote" in walk_flags(walk_input),
         start_paused=_start_paused_from_config(),
     )
-    Thread(target=_monitor_walk, args=(walk_session,), daemon=True).start()
+    # Named, so a thread dump says which walk it watches and a test teardown can
+    # wait for every monitor still alive: the walk_ended row lands a few ms after
+    # the process exits, and unjoined it landed in the NEXT test's capture list.
+    Thread(
+        target=_monitor_walk, args=(walk_session,), daemon=True, name=f"walk-monitor-{proc.pid}"
+    ).start()
 
     return {"success": True, "pid": proc.pid}
 

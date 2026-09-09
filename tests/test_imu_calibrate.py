@@ -13,19 +13,7 @@ import time
 import tnkr_server
 
 
-class FakeBNO055:
-    """The already-calibrated chip behind the state IMU's handle."""
-
-    calibration_status = (3, 3, 3, 3)
-    calibrated = True
-    offsets_accelerometer = (1, 2, 3)
-    offsets_gyroscope = (4, 5, 6)
-    offsets_magnetometer = (7, 8, 9)
-
-
-class FakeStateImu:
-    def __init__(self):
-        self.imu = FakeBNO055()
+from fakes import FakeBNO055, FakeStateImu  # noqa: F401  (shared with test_imu_check)
 
 
 def wait_until(pred, timeout=2.0):

@@ -2928,6 +2928,11 @@ def walk_start(body: WalkStartRequest = WalkStartRequest()):
 def _walk_start_locked(body: WalkStartRequest):
     global walk_session
 
+    # The battery the duck had when Walk was pressed, on this request's event
+    # whatever the outcome (started, refused, crashed later): a brown-out then
+    # sits in the same PostHog row as the failure. See _voltage_props.
+    add_telemetry_props(**_voltage_props())
+
     if rehome_io is not None:
         raise HTTPException(
             status_code=409,
@@ -3399,6 +3404,42 @@ VOLTAGE_CRITICAL = 7.0
 TEMP_WARM = 55
 TEMP_HOT = 65
 
+# The last successful /api/voltage read, kept so a walk start can carry the
+# battery it had without touching the bus. Studio polls the route about every
+# 30 s while connected, so in practice this is fresh; `volts_age_s` says when it
+# is not. A fresh read at walk start was rejected: rustypot 0.1.0 has no voltage
+# call, and the pypot path closes rustypot and opens a second stack on the same
+# adapter (up to 2.5 s on a flaky bus in the Sep 2026 incident data). Voltage
+# never gates a walk (decision 2026-09-09: Studio already warns on the band).
+_last_voltage: dict | None = None  # {"volts", "health", "max_temp_c", "temp_health", "at"}
+
+
+def _remember_voltage(volts: float, health: str, max_temp_c: int, temp_health: str) -> None:
+    """Called by /api/voltage on a successful read; a failed read leaves it alone."""
+    global _last_voltage
+    _last_voltage = {
+        "volts": volts,
+        "health": health,
+        "max_temp_c": max_temp_c,
+        "temp_health": temp_health,
+        "at": time.monotonic(),
+    }
+
+
+def _voltage_props() -> dict:
+    """The cached battery reading as request-telemetry props, or {} before any read.
+
+    Omitted rather than null when nothing has been read, so the absence of a
+    reading and a reading of unknown value never look alike in PostHog."""
+    v = _last_voltage
+    if v is None:
+        return {}
+    return {
+        "volts_last": v["volts"],
+        "volts_health_last": v["health"],
+        "volts_age_s": round(time.monotonic() - v["at"], 1),
+    }
+
 
 @app.get("/api/voltage")
 def voltage():
@@ -3445,6 +3486,10 @@ def voltage():
     hottest = max(temps, key=temps.get) if temps else None
     max_temp = temps[hottest] if hottest is not None else 0
     temp_band = "ok" if max_temp < TEMP_WARM else ("warm" if max_temp < TEMP_HOT else "hot")
+    # The reading reaches telemetry (it never did: the fleet had no voltage data
+    # at all during the Sep 2026 incident) and the cache a walk start reports from.
+    add_telemetry_props(volts=volts, health=health_band, max_temp_c=max_temp, temp_health=temp_band)
+    _remember_voltage(volts, health_band, max_temp, temp_band)
     return {
         "volts": volts,
         "perMotor": per_motor,

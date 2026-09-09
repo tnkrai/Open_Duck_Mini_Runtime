@@ -2654,6 +2654,45 @@ def _imu_calibrate_worker(status: dict):
         )
 
 
+def _probe_imu() -> None:
+    """Confirm the BNO055 answers, by constructing or reusing the state IMU handle.
+
+    The constructor is the whole test: Blinka's probe raises ValueError when nothing
+    acknowledges at the chip's address, and the adafruit driver raises RuntimeError
+    when something that is not a BNO055 does. Either becomes IMU_NOT_FOUND, with the
+    exception class and text in `message` for the developer.
+
+    Reuses `get_state_imu()` deliberately. A second BNO055_I2C would soft-reset the
+    chip and wipe the axis remap (see get_state_imu and _imu_calibrate_worker). And
+    it does not wait on a sample: a freshly constructed sensor legitimately returns
+    None for its first second, and a chip that answers its identity check but never
+    reads is a separate, deferred code (docs/plans/walk-preflight).
+
+    Shared by POST /api/imu/check (Studio's connect-time step) and, once it lands,
+    the walk pre-flight in /api/walk/start.
+    """
+    try:
+        get_state_imu()
+    except Exception as exc:
+        # `imu_error_type`, not `error_type`: the exception handler stamps that one
+        # with HTTPException on every coded refusal, and the class that named the
+        # fault (ValueError: nothing at 0x28; RuntimeError: wrong chip) is the part
+        # worth grouping on.
+        add_telemetry_props(error_code="IMU_NOT_FOUND", imu_error_type=type(exc).__name__)
+        _agent_error(502, "IMU_NOT_FOUND", f"{type(exc).__name__}: {exc}")
+
+
+@app.post("/api/imu/check")
+def imu_check() -> dict:
+    """Does the BNO055 answer? The IMU half of the walk pre-flight, on its own route
+    so Studio's setup steps can ask before anyone presses Walk. Shaped like
+    /api/motors/check: 200 with a small body, or the coded 502."""
+    refuse_while_walking()  # the walk owns the I2C while it runs
+    _probe_imu()
+    add_telemetry_props(imu_present=True)
+    return {"present": True}
+
+
 @app.post("/api/imu/calibrate/start")
 def imu_calibrate_start():
     """Start IMU calibration in a background thread."""
